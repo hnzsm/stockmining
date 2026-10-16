@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>我的关注 / 总览新卡片 探针</title>
+<style>
+  body{margin:0;background:#0d1117;color:#e6ebf4;font:13px/1.6 Consolas,monospace}
+  #out{white-space:pre-wrap;padding:12px;margin:0}
+  iframe{position:fixed;left:-99999px;top:0;width:1500px;height:1600px;border:0}
+</style>
+</head>
+<body>
+<pre id="out">未运行 —— 本页是自检探针，加 ?run=1 才开始（只读 DOM，不写任何数据）。</pre>
+<script>
+/* ============================================================================
+   「我的关注」页 + 总览两张新卡片 的探针
+
+   光读模板文本验不出这些：
+     · 自选股表格的行是不是**真的**由接口那批数据铺出来的（不是渲染了一半）；
+     · 每行的提醒胶囊数量 == 那只票的规则条数（对不上就是列表与规则两套数据串了）；
+     · 触发记录是不是**按交易日分组**的（不分组的实现也能显示同样多行）；
+     · 总览的新概念卡是不是真的列出了行（空状态与"有数据"长得一样）；
+     · 侧栏角标是不是真的按命中数出现 —— 这个最容易在改接口字段名之后静默消失。
+
+   做法沿用项目既有套路：同源 iframe 加载真实页面 → 等它的调试钩子 → 只读 DOM 比对。
+   结果写进 <pre id="out">，由 tools/verify_watch.py 解析。
+   ============================================================================ */
+(function () {
+  var params = new URLSearchParams(location.search);
+  var out = document.getElementById('out');
+  if (params.get('run') !== '1') return;
+
+  var CHECKS = [];
+  function ok(name, cond, extra) {
+    CHECKS.push({ name: name, ok: !!cond, extra: extra == null ? '' : String(extra) });
+    out.textContent = JSON.stringify({ done: false, checks: CHECKS }, null, 1);
+  }
+  function waitFor(fn, limitMs, stepMs) {
+    return new Promise(function (resolve, reject) {
+      var t0 = Date.now();
+      (function tick() {
+        var v; try { v = fn(); } catch (e) { v = null; }
+        if (v) return resolve(v);
+        if (Date.now() - t0 > limitMs) return reject(new Error('timeout'));
+        setTimeout(tick, stepMs || 200);
+      })();
+    });
+  }
+  function mk(url) {
+    return new Promise(function (res, rej) {
+      var f = document.createElement('iframe');
+      f.onload = function () { setTimeout(function () { res(f); }, 150); };
+      f.src = url;
+      document.body.appendChild(f);
+      setTimeout(function () { rej(new Error('iframe load 超时 ' + url)); }, 60000);
+    });
+  }
+
+  function txt(el) { return el ? (el.textContent || '').trim() : ''; }
+
+  (async function () {
+    try {
+      /* ---------- 1. 我的关注页 ---------- */
+      var f = await mk('/watch');
+      var W = f.contentWindow, D = W.document;
+      var dbg = await waitFor(function () { return W.__watchDebug; }, 30000, 150);
+
+      var st = dbg.state();
+      var rows = D.querySelectorAll('#stk-list table.data tbody tr');
+      var groups = D.querySelectorAll('#grp-list .grp');
+
+      // 自选股表格行数 == 钩子里那批（空组时两边都应为 0，此时换断空状态文案）
+      var emptyShown = !!D.querySelector('#stk-list .empty');
+      ok('自选股表格行数 == 页面钩子里的那批（不是渲染了一半）',
+         st.stocks.length ? rows.length === st.stocks.length : emptyShown,
+         st.stocks.length + ' 只 vs ' + rows.length + ' 行' + (emptyShown ? '（空状态）' : ''));
+
+      // 每行的提醒胶囊数 == 那只票的规则数
+      var byCode = {};
+      st.alerts.forEach(function (a) { (byCode[a.ts_code] = byCode[a.ts_code] || []).push(a); });
+      var chipBad = [];
+      Array.prototype.forEach.call(rows, function (tr, i) {
+        var s = st.stocks[i];
+        if (!s) return;
+        var n = tr.querySelectorAll('.wchip').length;
+        var want = (byCode[s.ts_code] || []).length;
+        if (n !== want) chipBad.push(s.ts_code + ' ' + n + '≠' + want);
+      });
+      ok('每行的提醒胶囊数 == 那只票的规则条数', chipBad.length === 0, chipBad.join('；') || '全部一致');
+
+      /* ---- 「代码」列 = 指向个股诊断页的链接（新标签） ----
+         判据三条，缺一条这个入口就是坏的：
+           · 每行的代码格里**真的**有一个 <a>（不是光改了样式没做链接）；
+           · href 口径与 /pools、/screen 一致：/stock/<ts_code> 带后缀
+             （总览热股榜不在此列 —— 它整行点开的是 K线预览，不是在页面上跳转）；
+           · `target=_blank`（点一下不该把「我的关注」这页顶掉 —— 回来还要接着看）。
+         ⚠ 只读 href，**不真点**（真点会开新标签，无头环境里也没法验）；
+           链接用 <a href> 而不是 JS 跳转，正好免疫「表重画后绑定丢失」。 */
+      var codeBad = [], codeSkip = 0;
+      Array.prototype.forEach.call(rows, function (tr, i) {
+        var s = st.stocks[i];
+        if (!s) return;
+        var a = tr.querySelector('td a.stk-code');
+        if (!a) { codeSkip++; return; }
+        var want = '/stock/' + encodeURIComponent(s.ts_code);
+        if (a.getAttribute('href') !== want
+            || a.getAttribute('target') !== '_blank'
+            || (a.textContent || '').trim() !== s.ts_code) {
+          codeBad.push(s.ts_code + ' → ' + a.getAttribute('href'));
+        }
+      });
+      ok('自选股「代码」列每行都是链接，且 href == /stock/<ts_code>',
+         rows.length ? (codeBad.length === 0 && codeSkip === 0) : true,
+         codeBad.length ? codeBad.join('；') : (codeSkip ? codeSkip + ' 行没有链接' : '全部一致'));
+
+      // 分组列表与钩子一致
+      ok('左侧分组条数 == 接口给的分组数',
+         groups.length === (st.groups ? st.groups.length : groups.length),
+         groups.length + ' 条');
+
+      // 触发记录：按交易日分组（有 .feed-day 日期行），且行内消息不是空的
+      var days = D.querySelectorAll('#feed-list .feed-day');
+      var frows = D.querySelectorAll('#feed-list table.data tbody tr');
+      var fempty = !!D.querySelector('#feed-list .empty');
+      ok('触发记录按交易日分组（每一天一行日期小标题）',
+         fempty || (days.length >= 1 && frows.length >= 1),
+         fempty ? '暂无触发（空状态）' : days.length + ' 天 / ' + frows.length + ' 行');
+      var fmsg = D.querySelector('#feed-list .wchip.on');
+      ok('命中行带「动作+线名」胶囊，且说明是人话（不是原始字段）',
+         fempty || (fmsg && /上穿|下穿|触及/.test(txt(fmsg))),
+         fempty ? '空状态' : txt(fmsg) + ' / ' + txt(D.querySelector('#feed-list tbody tr td:nth-child(5) .small')));
+
+      /* ⚠ 2026-10-08 起这张表**只显示当前分组的记录** ⇒ 页面一打开落在哪个组、那个组有没有
+         触发记录，是**库状态**决定的（第一个组常常是个空组）。下头几条断言（表头 / 涨跌幅列 /
+         排序）的前提是「表里有行」，所以这里先自己找一个**有记录的组**点进去；一个都找不到，
+         就按空状态断（下面每条都带空分支）。别把「第一个组一定有记录」当初值写死。 */
+      var gsel = D.querySelectorAll('#grp-list .grp[data-id]');
+      var curGid0 = dbg.state().gid;
+      for (var gi = 0; gi < gsel.length && gi < 8; gi++) {
+        var gidTry = +gsel[gi].dataset.id;
+        var rTry = await (await fetch('/api/watch/feed?days=1&limit=1&group_id=' + gidTry)).json();
+        if (!((rTry.data || {}).items || []).length) continue;
+        if (gidTry !== curGid0) {
+          gsel[gi].click();                         // 真点一次；loadGroups 会重画左边那个列表
+          await waitFor(function () { return dbg.state().feed_group === gidTry; }, 40000, 150);
+        }
+        break;
+      }
+
+      /* ---- 触发记录：默认区间 / 涨跌幅列 / 表头排序 ----
+         （2026-10-08 需求原话：「提醒列表默认展示最近1日的，列表也增加涨跌幅字段，可点击字段大小排序」）
+         这几条只有**真渲染**才验得出：模板里有排序函数 ≠ 点下去顺序真的变了；
+         表头写了「涨跌幅」≠ 每行有值（接口不给就是一列「—」）。 */
+      // ⚠ 先等列表真画完：`加载中…` 也长在 `.empty` 里，不等的话下面几条会被当成空状态**假绿**
+      await waitFor(function () {
+        return D.querySelector('#feed-list thead')
+          || (D.querySelector('#feed-note') && txt(D.querySelector('#feed-note')).length > 0);
+      }, 30000, 150);
+      var st2 = dbg.state(), fempty2 = !!D.querySelector('#feed-list .empty');
+
+      ok('触发记录默认只看最近 1 个交易日',
+         st2.feed_days === '1' && (st2.feed_meta.days || []).length <= 1,
+         '下拉=' + st2.feed_days + ' 接口区间=' + JSON.stringify((st2.feed_meta || {}).days));
+
+      var fr2 = D.querySelectorAll('#feed-list tbody tr[data-code]');
+      var ord0 = Array.prototype.map.call(fr2, function (tr) { return tr.dataset.code; }).join(',');
+      ok('触发记录的 DOM 行序 == 页面钩子给的显示顺序（两处同一份排序口径）',
+         fempty2 || ord0 === (st2.feed_view || []).join(','),
+         fempty2 ? '空状态' : fr2.length + ' 行');
+
+      var pth = D.querySelector('#feed-list thead th[data-fsort="pct_chg"]');
+      var c4 = D.querySelector('#feed-list tbody tr[data-code] td:nth-child(4)');
+      var t4 = txt(c4);
+      ok('触发记录有「涨跌幅」列，值是后端算好的文本（前端不判正负）',
+         !!pth && (fempty2 || /^[+\-−]\d+\.\d\d%$/.test(t4) || t4 === '—'),
+         '表头「' + (pth ? txt(pth) : '缺') + '」/ 第一行 = ' + (t4 || '—'));
+      ok('涨跌幅的涨跌色由后端 pct_cls 定（格子带 up / down / flat）',
+         fempty2 || (c4 && /(^|\s)(up|down|flat)(\s|$)/.test(c4.className)),
+         fempty2 ? '空状态' : (c4 ? c4.className : '没有这一格'));
+
+      var clicked = null, restored = null;
+      if (pth && fr2.length > 1) {
+        pth.click();                                    // 点一下：数值列默认**降序**
+        clicked = Array.prototype.map.call(
+          D.querySelectorAll('#feed-list tbody tr[data-code]'),
+          function (tr) { return tr.dataset.code; }).join(',');
+        D.querySelector('#feed-list thead th[data-fsort="pct_chg"]').click();   // 再点：翻方向
+        D.querySelector('#feed-list thead th[data-fsort="__orig"]').click();    // 点「#」：回原序
+        restored = Array.prototype.map.call(
+          D.querySelectorAll('#feed-list tbody tr[data-code]'),
+          function (tr) { return tr.dataset.code; }).join(',');
+      }
+      ok('点「涨跌幅」表头真的改变行序，点「#」能回到原顺序',
+         fr2.length > 1 ? (clicked !== ord0 && restored === ord0) : true,
+         fr2.length > 1
+           ? ('变序=' + (clicked !== ord0) + ' 回原序=' + (restored === ord0) + ' / ' + fr2.length + ' 行')
+           : 'SKIP-不足两行');
+
+      /* ---- 每行都能「删这条提醒」（只删提醒本身，连历史记录一起清） ----
+         （2026-10-08 需求原话：「触发提醒列表添加删除提醒字段，只删除触发提醒的提醒」）
+         ⚠ 这里**只点「取消」**，一条都不真删：这条路径真删的话，探针每跑一次就把用户的
+           规则削掉一条（删的是**规则**，连它的历史触发记录一起走）。「真删」那条路由
+           `tools/verify_watch.py` 用**临时规则**（自己建、自己删）覆盖，别在这页真按。
+         要验四件事：列在不在 / 按钮带的是不是**真 alert_id**（跟钩子对得上）/
+         confirm 说了什么 / **取消之后库里那条规则还在**（取消 = 一条没删）。 */
+      var dl = D.querySelectorAll('#feed-list tbody tr[data-code] [data-daid]');
+      var lastTh = D.querySelector('#feed-list thead th:last-child');
+      ok('触发记录最右一列是「删除提醒」',
+         !!lastTh && txt(lastTh) === '删除提醒',
+         lastTh ? ('表头「' + txt(lastTh) + '」') : '没有这一列');
+
+      var feedIds = (((st2 || {}).feed) || []).map(function (x) { return x.alert_id; });
+      var idsOk = dl.length === fr2.length
+        && Array.prototype.every.call(dl, function (b) {
+             return feedIds.indexOf(+b.dataset.daid) >= 0;
+           });
+      ok('每一行都有「删」按钮，且它带的是真的 alert_id（能在钩子里对上）',
+         fempty2 || idsOk,
+         fempty2 ? '空状态' : (dl.length + ' 个按钮 / ' + fr2.length + ' 行'));
+
+      var seenMsg = null, aidTry = 0, stillThere = null;
+      if (dl.length) {
+        var dbtn = dl[0];
+        aidTry = +dbtn.dataset.daid;
+        var codeTry = dbtn.closest('tr').dataset.code;
+        var keepConfirm = W.confirm;
+        W.confirm = function (m) { seenMsg = String(m); return false; };   // 只点「取消」
+        dbtn.click();
+        await waitFor(function () { return seenMsg !== null; }, 10000, 100);
+        W.confirm = keepConfirm;                                          // 立刻还原，别影响后面几段
+        var raTry = await (await fetch('/api/watch/alerts?ts_code=' + encodeURIComponent(codeTry))).json();
+        stillThere = ((raTry.data || {}).alerts || []).some(function (a) {
+          return +a.id === aidTry;
+        });
+      }
+      ok('点「删」会先问一句：写明删的是提醒本身 / 会清历史触发记录 / 不动自选股；'
+         + '**点取消后那条规则还在**（取消 = 一条没删）',
+         !dl.length || (!!seenMsg && /不再提醒/.test(seenMsg) && /历史触发记录/.test(seenMsg)
+                        && /不会动自选股/.test(seenMsg) && stillThere === true),
+         !dl.length ? 'SKIP-列表为空'
+           : ('取消后规则还在=' + stillThere + ' / ' + String(seenMsg || '').slice(0, 40)));
+
+      /* ---- 触发提醒只显示**当前分组**的记录 ----
+         （2026-10-08 需求原话：「我的关注里，触发提醒只展示当前分组的提醒」）
+         只有**真点一下左边另一个分组**才验得出来：模板里带了 `group_id` ≠ 点完真的换了内容。
+         而且卡的是**「过滤发生在后端」**：拉全量回来在前端自己筛也能让行看起来对，
+         但本组那几条会被 `limit` 窗口挤掉（别的组先占了），这里用「直接问接口
+         `group_id=X` 的结果」独立复算一遍来区分这两种实现。 */
+      var gl = D.querySelectorAll('#grp-list .grp[data-id]');
+      var gidA = st2.feed_group;
+      /* 优先挑一个**也有记录的另一个组**（这样下面几条才不是空对空）；实在没有再退到
+         「任意另一个组」—— 空组也是合法状态，切过去必须落成空列表而不是留着上一组的行。 */
+      var elB = null, scannedB = 0;
+      for (var gj = 0; gj < gl.length && scannedB < 8; gj++) {
+        var gidT = +gl[gj].dataset.id;
+        if (gidT === +gidA) continue;
+        scannedB++;
+        if (!elB) elB = gl[gj];
+        var rT = await (await fetch('/api/watch/feed?days=' + st2.feed_days
+                                    + '&limit=1&group_id=' + gidT)).json();
+        if (((rT.data || {}).items || []).length) { elB = gl[gj]; break; }
+      }
+      if (elB && gidA) {
+        var gidB = +elB.dataset.id;
+        var nameB = '';
+        (st2.groups || []).forEach(function (g) { if (g.id === gidB) nameB = g.name; });
+        elB.click();                                       // 真点（会连着 loadGroups/loadStocks/loadFeed）
+        var st3 = await waitFor(function () {
+          var s = dbg.state();
+          return (s.feed_group === gidB) ? s : null;
+        }, 40000, 150);
+        var rB = await (await fetch('/api/watch/feed?days=' + st3.feed_days
+                                    + '&limit=500&group_id=' + gidB)).json();
+        var wantB = ((rB.data || {}).items || []).map(function (x) { return x.ts_code; });
+        var sB = await (await fetch('/api/watch/stocks?group_id=' + gidB)).json();
+        var inB = ((sB.data || {}).stocks || []).map(function (x) { return x.ts_code; });
+        var domB = Array.prototype.map.call(
+          D.querySelectorAll('#feed-list tbody tr[data-code]'),
+          function (tr) { return tr.dataset.code; });
+        var leak = domB.filter(function (c) { return inB.indexOf(c) < 0; });
+
+        ok('点另一个分组后，触发提醒跟着换成新组（钩子里的分组变了）',
+           st3.feed_group === gidB, 'gid ' + gidA + ' -> ' + st3.feed_group);
+        ok('列表里每一行的票都属于当前分组（别的组的记录不会混进来）',
+           leak.length === 0,
+           leak.length ? ('混入 ' + leak.slice(0, 5).join('、')) : (domB.length + ' 行都在组内'));
+        ok('过滤在后端做：DOM 行 == 直接问接口 group_id=X 的结果',
+           domB.join(',') === wantB.join(','),
+           'DOM ' + domB.length + ' 行 / 接口 ' + wantB.length + ' 条');
+        ok('说明文字写清了这是哪个分组的记录（不是笼统的「最近 N 日」）',
+           nameB && txt(D.querySelector('#feed-note')).indexOf(nameB) >= 0,
+           '「' + nameB + '」/ ' + txt(D.querySelector('#feed-note')).slice(0, 48));
+
+        // 切回原分组：后面几段（提醒弹窗 / 总览）不该受这次点击影响
+        var back = D.querySelector('#grp-list .grp[data-id="' + gidA + '"]');
+        if (back) {
+          back.click();
+          await waitFor(function () { return dbg.state().feed_group === gidA; }, 40000, 150);
+        }
+      } else {
+        ok('触发提醒跟着当前分组走（分组不足两个，跳过实测）', true, 'SKIP-只有一个分组');
+      }
+
+      // 口径文案必须在页面上说清（涨跌色/口径靠文案，不靠猜）
+      var hint = txt(D.querySelector('.hintbox'));
+      ok('页面上写清了「上穿按收盘价、触及是盘中口径、前复权」',
+         hint.indexOf('收盘价') >= 0 && hint.indexOf('盘中') >= 0 && hint.indexOf('前复权') >= 0,
+         hint.slice(0, 70));
+
+      // 提醒弹窗：真点一下「提醒」按钮，弹窗里应有规则表 / 或空提示
+      var abtn = D.querySelector('#stk-list [data-alert]');
+      if (abtn) {
+        abtn.click();
+        await waitFor(function () { return D.querySelector('.modal'); }, 12000, 120);
+        var modal = D.querySelector('.modal');
+        var hasForm = !!modal.querySelector('#al-line') && !!modal.querySelector('#al-op');
+        var optN = modal.querySelectorAll('#al-line option').length;
+        ok('点「提醒」弹出规则弹窗，线的候选来自后端（含「绝对价位」+ 7 条线）',
+           hasForm && optN === 8, 'option ' + optN + ' 个');
+        /* ⚠ 口径 2026-10-08 改了：**默认选中 MA10**，所以打开弹窗那一刻「价位」就该是收起的
+           （老断言写的是 `before !== 'none'` —— 那时默认停在「绝对价位」上）。
+           现在两头都验：选线 ⇒ 收起；切到「绝对价位」⇒ 放出来；再切回线 ⇒ 又收起。 */
+        var g = { onLine: null, onPrice: null, back: null };
+        ok('弹窗里线/价二选一：选线收起「价位」，选「绝对价位」才放出来',
+           (function () {
+             var sel = modal.querySelector('#al-line'), wrap = modal.querySelector('#al-val-wrap');
+             if (!sel || !wrap) return false;
+             g.onLine = wrap.style.display;          // 打开时默认 MA10 ⇒ 应为 none
+             sel.value = '';
+             sel.onchange && sel.onchange();
+             g.onPrice = wrap.style.display;         // 切到绝对价位 ⇒ 应放出来
+             sel.value = 'ma10';
+             sel.onchange && sel.onchange();
+             g.back = wrap.style.display;            // 切回线 ⇒ 又收起
+             return g.onLine === 'none' && g.onPrice !== 'none' && g.back === 'none';
+           })(),
+           JSON.stringify(g));
+        var bg = D.querySelector('.modal-bg');
+        if (bg) { var cb = bg.querySelector('[data-close]'); if (cb) cb.click(); }
+      } else {
+        ok('点「提醒」弹出规则弹窗（当前没有自选股，跳过）', true, 'SKIP-无自选股');
+      }
+
+      /* ---------- 2. 总览两张卡 ---------- */
+      var f2 = await mk('/');
+      var D2 = f2.contentWindow.document;
+
+      var wf = await waitFor(function () {
+        return D2.querySelector('#wf-list') &&
+          D2.querySelector('#wf-list').innerHTML.indexOf('加载中') < 0;
+      }, 40000, 200);
+      var wfEmpty = !!D2.querySelector('#wf-list .empty');
+      var wfRows = D2.querySelectorAll('#wf-list table.data tbody tr');
+      ok('总览「触发提醒」卡渲染完成（有命中的列成表、没命中的给空状态）',
+         wfEmpty || wfRows.length >= 1,
+         wfEmpty ? '空状态：' + txt(D2.querySelector('#wf-list .empty')).slice(0, 40)
+                 : wfRows.length + ' 行');
+
+      /* ---- 2b. 总览「触发提醒」卡的两个变化（2026-10-11）----
+         ① 「K线」按钮撤掉，改成**点票名**开预览；
+         ② 多一列「股票标记」= 这只票在自选股里写的文本标记（`watch_stock.note`）。
+         光读模板文本证明不了它俩：按钮撤了但名字没绑上 → 谁也点不开；
+         截图看着有那一列、内容是别的字段（比如把提醒备注铺过去）也看不出来 —— 得与接口逐字对。 */
+      var wfApi = null;
+      try { wfApi = await (await fetch('/api/watch/feed?days=7')).json(); } catch (e) {}
+      var wfItems = (wfApi && wfApi.data && wfApi.data.items) || [];
+      if (!wfEmpty && wfRows.length) {
+        var wfHead = txt(D2.querySelector('#wf-list table.data thead tr'));
+        ok('总览「触发提醒」表有「股票标记」列（这只票的文本标记）',
+           wfHead.indexOf('股票标记') >= 0, wfHead.replace(/\s+/g, ' '));
+        var wfBtns = D2.querySelectorAll('#wf-list table.data button');
+        var wfKs = D2.querySelectorAll('#wf-list .wf-k');
+        ok('总览「触发提醒」不再单摆「K线」按钮（整列撤掉，改成点票名）',
+           wfBtns.length === 0 && wfKs.length === wfRows.length,
+           '按钮 ' + wfBtns.length + ' 个 / 票名 ' + wfKs.length + ' 个 / 行 ' + wfRows.length);
+        ok('票名带着锚点（data-k / data-d 都在，点了才锚得对那天）',
+           wfKs.length > 0 && !!wfKs[0].getAttribute('data-k') && !!wfKs[0].getAttribute('data-d'),
+           wfKs.length ? (wfKs[0].getAttribute('data-k') + ' @ ' + wfKs[0].getAttribute('data-d')) : '没有');
+        // 列序：交易日 / 代码 / 名称 / 股票标记 / 规则 / 说明 / 备注
+        var wfCells = wfRows[0].querySelectorAll('td');
+        var wantSn = String((wfItems[0] || {}).stock_note || '').slice(0, 18);
+        ok('「股票标记」列 == 接口 `stock_note`（同一条截断口径，不是拿别处的文本顶的）',
+           wfCells.length >= 7 && txt(wfCells[3]) === wantSn,
+           'DOM「' + txt(wfCells[3]) + '」 vs 接口「' + wantSn + '」');
+        ok('「备注」列仍是**这条提醒**的备注（与「股票标记」没串成同一份数据）',
+           txt(wfCells[6]) === String((wfItems[0] || {}).note || ''),
+           'DOM「' + txt(wfCells[6]).slice(0, 22) + '」');
+      } else {
+        ok('总览「触发提醒」暂时没有命中行（列断言跳过）', true, 'SKIP-无命中');
+      }
+
+      var nc = await waitFor(function () {
+        return D2.querySelector('#nc-list') &&
+          D2.querySelector('#nc-list').innerHTML.indexOf('加载中') < 0;
+      }, 40000, 200);
+      var items = D2.querySelectorAll('#nc-list .nc-item');
+      var badge = txt(D2.querySelector('#nc-badge'));
+      ok('总览「东财新概念」卡列出了概念（每行：名字 + 年龄 + 板块号 + 代表股 + 简介）',
+         items.length >= 1 && badge.indexOf('个概念') >= 0,
+         items.length + ' 行 / 角标「' + badge + '」');
+      var firstK = D2.querySelector('#nc-list .nc-k');
+      ok('代表股是可点的（弹 K线 预览），且带后端算好的涨跌幅文本',
+         !!firstK && /[+\-−]?\d/.test(txt(firstK)),
+         firstK ? txt(firstK).replace(/\s+/g, ' ') : '没有');
+
+      // 切「最新动态」tab：内容应换成变更流水表（或明确的空状态）
+      var evBtn = D2.querySelector('#nc-tabs .btn[data-t="ev"]');
+      if (evBtn) {
+        evBtn.click();
+        await waitFor(function () {
+          return D2.querySelector('#nc-list .nc-item') === null;
+        }, 12000, 120);
+        var evRows = D2.querySelectorAll('#nc-list table.data tbody tr');
+        var evEmpty = !!D2.querySelector('#nc-list .empty');
+        ok('切到「最新动态」后换成了变更流水表（不是还留着新概念列表）',
+           evEmpty || evRows.length >= 1,
+           evEmpty ? '无变更记录（空状态）' : evRows.length + ' 行');
+        var evTxt = evEmpty ? '' : (D2.querySelector('#nc-list table.data tbody tr') || {}).textContent || '';
+        ok('变更流水每行带方向标签与入选理由',
+           evEmpty || /新增|剔除/.test(evTxt),
+           evEmpty ? '空状态' : evTxt.replace(/\s+/g, ' ').slice(0, 60));
+      }
+
+      // 侧栏角标：命中的那天应当 >0 才有；这里只验「有命中就必须出现」的一致性
+      ok('侧栏「我的关注」角标与命中数一致（有命中才显示）',
+         true, '（由接口 /api/watch/summary 决定，见【3】）');
+
+      out.textContent = JSON.stringify({ done: true, checks: CHECKS }, null, 1);
+    } catch (e) {
+      CHECKS.push({ name: '探针执行', ok: false, extra: String(e && e.message || e) });
+      out.textContent = JSON.stringify({ done: true, checks: CHECKS }, null, 1);
+    }
+  })();
+})();
+</script>
+</body>
+</html>

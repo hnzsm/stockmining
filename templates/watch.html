@@ -1,0 +1,1100 @@
+{% extends "base.html" %}
+{% block title %}我的关注 · 短线选股{% endblock %}
+{% block pagetitle %}我的关注{% endblock %}
+{% block pagedesc %}自选股分组 + 均线 / 布林提醒（上穿 MA10、触及布林中轨 …），日K / 周K 都能判，也能设固定价位提醒，还能绑定选股策略「入池即提醒」（同样分日K / 周K） · 命中结果也摆在总览页{% endblock %}
+
+{% block content %}
+<div class="hintbox" style="margin-bottom:14px">
+  <b>能判什么</b>：默认判<b>均线</b>（MA5 / MA10 / MA20 / MA60）和<b>布林</b>（中 / 上 / 下轨）——
+  最常用的是「股价<b>上穿 MA10</b>」这种；也可以不判线，改判一个<b>固定价位</b>（「跌到 10.50 提醒我」）。
+  每条规则还能选<b>周期</b>：<b>日K</b>（判当天那根）或<b>周K</b>（判周线那一根）。
+  <br>
+  <b>怎么判</b>（口径唯一来源 <code>core/watch.py</code>，下面是同一份话）：
+  <b>上穿 / 下穿</b>按<b>收盘价</b> —— 前一根在线的下方、这一根跑到上方才算，盘中一碰不算；
+  <b>触及</b>是<b>盘中口径</b> —— 当日最低价与最高价之间碰到那条线就算。
+  均线与布林走的是<b>前复权</b>数据，与选股 / 回测 / 个股诊断页<b>同一个来源</b>。
+  检测只在<b>最新那根</b>上判（日K = 最新交易日、周K = 最近一个<b>已收盘的完整周</b>；
+  不是全历史回放），同一条规则同一天<b>只记一条</b>。
+  <b>周K 要等这周走完才判</b>（数据里只存已收盘的完整周），所以一周最多出一次结果。
+  <br><br>
+  <b>还能绑定选股策略</b>：提醒的类型除了「指标 / 价位」，还有<b>选股命中</b> —— 挑一条你在
+  「选股策略」页建好的规则，这只票<b>哪天入了那个池子就提醒</b>。判定与选股页<b>同一套</b>：
+  同样的条件、同样的静态过滤（剔 ST / 板块 / 上市天数 / 最小成交额）、同样的基础池（全部A股 / 指数 / 行业）、
+  同样的<b>前复权</b>数据；差别只是范围 —— 选股页是「全市场里挑出命中的」，这里是「我关注的这几只里哪些命中」。
+  池子条件改了，已经挂着的提醒<b>跟着一起变</b>（每次检测都重新按当前条件算，不存快照）。
+  <br><br>
+  选股命中也有<b>日K / 周K</b> 两个周期，但它只决定<b>多久判一次</b>：<b>日K</b> = 每个交易日判（哪天入池哪天提醒）；
+  <b>周K</b> = 只判<b>「这周走完后那一天」的收盘状态</b> —— 一周最多一条，要等这周走完（周线收盘）才出结果；
+  周中入池、周五又出池的票，周K 这一档<b>不算命中</b>。
+  ⚠ <b>条件在哪条 K 线上算，由「选股策略自己的周期」决定</b>（建策略时选的那个）：
+  策略选了<b>周K</b>，它的 <code>close</code> 就是<b>周收盘</b>、<code>MA5</code> 就是<b>5 周均线</b>，
+  与选股页 / 回测<b>完全一致</b>（整条链按周线跑）；策略是日K 则一切按日线。绑定时这里的下拉
+  <b>默认跟着策略走</b>，也可手动改 —— 只改「多久判一次」，不改条件口径。
+  <br><br>
+  另外：这一页只管「我自己挑的票 + 我自己设的规则」，<b>不影响选股策略与买卖策略本身</b>
+  （删掉一条选股命中提醒，只是不再盯着这只票，选股策略本身一行不动）。
+</div>
+
+<div class="grid" style="grid-template-columns:270px minmax(0,1fr);align-items:start">
+  <div class="card" style="margin-bottom:0">
+    <div class="card-head">
+      <div class="card-title">分组 <span class="tag" id="grp-badge">—</span></div>
+      <button class="btn sm primary" id="btn-new-group">新建</button>
+    </div>
+      <div class="card-body tight">
+        <div id="grp-list"><div class="empty">加载中…</div></div>
+        <div class="hr"></div>
+        <div class="small muted" id="grp-note">选中一个分组，右边就是它的自选股。</div>
+        <div class="small muted" style="margin-top:6px">
+          把右边的股票<b>拖到某一行</b>就能换组 —— 落在行<b>左半</b>是「移动到」、<b>右半</b>是「复制到」。
+        </div>
+      </div>
+  </div>
+
+  <div style="display:flex;flex-direction:column;gap:16px;min-width:0">
+    <div class="card" style="margin-bottom:0">
+      <div class="card-head">
+        <div class="card-title">自选股 <span class="tag" id="stk-badge">—</span></div>
+        <div class="flex">
+          <input type="text" id="add-code" placeholder="代码或名称，逗号分隔" style="width:210px">
+          <button class="btn sm primary" id="btn-add-stock">加入</button>
+          <button class="btn sm" id="btn-check" title="在最新交易日那根 K 线上重判一遍，命中写进下面的记录">立即检测</button>
+          <button class="btn sm" id="btn-boll-lower"
+                  title="扫一遍全部自选股，给日K 落在布林下轨的票各加一条「触及布林下轨」提醒（先预演、确认了才写）">布林下轨加提醒</button>
+        </div>
+      </div>
+      <div class="card-body tight">
+        <div class="stk-sel" id="stk-sel"></div>
+        <div id="stk-list"><div class="empty">加载中…</div></div>
+        <div class="hr"></div>
+        <div class="small muted" id="stk-note">
+          收盘价与本库<b>最近交易日</b>同一个数（库里没有当日盘中价）。点「提醒」给这只票设规则。
+          <br><b>换组不用删了重加</b>：按住某一行往左边分组上拖 —— 落在分组<b>左半</b>是「移动到」、
+          <b>右半</b>是「复制到」；首列勾上多行可一次拖一整批（勾选只在当前这一组里有效）。
+          <br><b>表头都能点</b>：代码 / 名称 / 收盘 / 涨跌幅 / 提醒规则 / 备注，点一下升序、
+          再点一下降序；点最左那格「<b>#</b>」回到加入时的原顺序。只换看法，不动数据。
+          <br><b>布林下轨加提醒</b>：一键扫<b>全部自选股</b>（跨组去重），给日K 落在布林下轨的票
+          各加一条「触及布林下轨」提醒 —— 点按钮会<b>先预演</b>给你看有多少只、要加多少条，
+          你确认了才真写。已经有这条规则的会跳过，不会重复加。
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:0">
+      <div class="card-head">
+        <div class="card-title">触发提醒 <span class="tag b" id="feed-badge">—</span></div>
+        <div class="flex">
+          <select id="feed-days" class="sm">
+            <option value="1" selected>最近 1 个交易日</option>
+            <option value="3">最近 3 个交易日</option>
+            <option value="7">最近 7 个交易日</option>
+            <option value="20">最近 20 个交易日</option>
+          </select>
+        </div>
+      </div>
+      <div class="card-body tight">
+        <div class="small muted" style="margin-bottom:6px">
+          只显示<b>左边选中分组</b>里那些票的触发记录（换分组，这张表跟着换）。
+          默认只看<b>最近 1 个交易日</b>（右上可换区间）。<b>表头都能点</b>：代码 / 名称 / 涨跌幅 ——
+          点一下升序、再点一下降序；点最左那格「<b>#</b>」回到原顺序。
+          排序<b>只在每个交易日内部</b>做（不跨天）。只换看法，不动数据。
+          <b>涨跌幅</b>取的是<b>该行触发那天</b>的日涨跌幅（与上面自选股表同一个来源；
+          周K 的触发日 = 该周最后那个交易日）。
+          最右那列<b>「删」删的是这条提醒本身</b>（这只票这个条件以后不再提醒），
+          它的历史触发记录一起清掉 —— 不动自选股，也不动这只票的其他提醒。
+        </div>
+        <div id="feed-list"><div class="empty">加载中…</div></div>
+        <div class="hr"></div>
+        <div class="small muted" id="feed-note"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 拖动中的浮标：跟着鼠标走，明说「左半移动 / 右半复制」。
+     不放它的话，用户拖起来看不到还有别的选项，只能盲猜。 -->
+<div id="drag-tip"></div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+/* 线名 / 动作 / **分组顺序** / 表单默认值 / 常用快捷键 —— 全部**从后端来**
+   （`core/watch.py` 的 LINES / OPS / LINE_GROUPS / DEFAULT_LINE / QUICK_RULES 是唯一来源），
+   页面不写死 —— 以后加一条线（比如 MA120）只改后端那一处。 */
+const LINES = {{ lines|tojson }};               // {key: [展示名, 指标字段, 分组标签]}
+const OPS = {{ ops|tojson }};
+/* ⚠ 顺序得用后端给的这两份清单一 —— Flask 的 `tojson` 会把 dict 的键**按字典序**输出，
+   用 `Object.keys(LINES)` 排会把 MA5 甩到 MA10/MA20 后面去（实测踩过）。 */
+const LINE_ORDER = {{ line_order|tojson }};    // ["ma5","ma10","ma20","ma60","boll_mid",...]
+const OP_ORDER = {{ op_order|tojson }};         // ["cross_up","cross_down","touch"]
+const LINE_GROUPS = {{ line_groups|tojson }};   // 下拉里各分组的先后
+/* 周期：判哪张图。和线名一样**不能写死在前端** —— 以后加一条周期只改 core/watch.py 一处。 */
+const FREQS = {{ freqs|tojson }};               // {daily: 日K, weekly: 周K}
+const FREQ_ORDER = {{ freq_order|tojson }};     // ["daily","weekly"]
+const DEF_FREQ = {{ default_freq|tojson }};     // 表单默认周期（日K）
+const QUICK = {{ quick|tojson }};               // [[线, 动作, 按钮文案], ...]
+const DEF_LINE = {{ default_line|tojson }};     // 表单默认判哪条线（MA10）
+const DEF_OP = {{ default_op|tojson }};         // 表单默认动作（上穿）
+/* 「日K 在布林下轨」的阈值 / 批量备注 —— 也**从后端来**（`watch.BOLL_LOWER_POS`）。
+   确认框里那句「布林位置 ≤ …」跟着它走：写死 0.1 的话，哪天口径一改，
+   页面上说的和后端判的就分了家（而用户只会照着页面上那句话理解）。 */
+const BOLL_POS = {{ boll_pos|tojson }};         // 0.1
+const BOLL_NOTE = {{ boll_note|tojson }};       // "布林下轨批量"
+/* 规则类型（`watch_alert.kind`）：`price` 指标/价位 · `pool` 选股命中。
+   和后端 `watch.KINDS` 同一份 —— 页面上的类型切换按钮按它铺，别写死两个按钮。 */
+const KINDS = {{ kinds|tojson }};               // {price: "指标 / 价位", pool: "选股命中"}
+const KIND_ORDER = {{ kind_order|tojson }};     // ["price","pool"]
+const DEF_KIND = {{ default_kind|tojson }};     // "price"
+let GID = null;             // 当前分组
+let GROUPS = [];            // 分组列表（当前选中 / 探针要比对）
+let STOCKS = [];            // 当前分组的自选股
+let STK_DATE = '';          // 上表「收盘/涨跌幅」取的是哪一天（后端给，= 本库最近交易日）
+let ALERTS = [];            // 全部提醒规则（按 ts_code 归组在前端做）
+let PICK = new Set();       // 勾上的自选股（多选一次拖一批用；只在当前分组内有效）
+let DRAG = null;            // 拖动进行中的状态 {codes:[...], fromGid:n}，见 endDrag()
+let STK_SORT = { key: '', dir: -1 };   // 自选股表排序：key='' = 后端原序（ORDER BY sort, id）
+/* ⚠ `loadFeed()` 每次刷新都用 innerHTML **覆盖** `#stk-note`，把 HTML 里那段用法说明
+   （换组怎么拖 / 表头怎么点 / 布林下轨批量）整个抹掉 —— 结果是「有没有触发记录」决定了
+   用法说明在不在（有记录就没了），最容易当成「我写的说明没生效」。这里把原文先存一份，
+   刷新时「说明 + 最近一次检测」一起写回去。惰性缓存：第一次 `loadFeed()` 时元素早已渲染。 */
+let STK_NOTE0 = null;
+
+function lineLabel(k){ return (LINES[k] && LINES[k][0]) || '绝对价位'; }
+function opLabel(k){ return OPS[k] || k; }
+function freqLabel(k){ return FREQS[k] || ''; }
+function grpName(id){ return (GROUPS.find(g => g.id === id) || {}).name || ('' + id); }
+
+/* apiGet/apiPost **失败是抛异常**的（见 app.js 的 api()）。这一页几乎每个动作都要请求，
+   散落 try/catch 太容易漏 —— 统一包成「失败 toast 一句 + 返回 null」，下面每处只用判 null。
+   `failBox` / `failTitle` 可选：传了就往那个容器里**留一块错误**再返回 null。
+   ⚠ 只 toast 是不够的：列表卡会永远停在首屏那句「加载中…」，用户看到的是「页面卡住了」，
+     而那行提示 6 秒后就没了 —— 这就是「点了没反应、也没报错」的来源。 */
+async function get(url, failBox, failTitle){
+  try { return await window.apiGet(url); }
+  catch (e) {
+    toast('取数失败：' + (e.message || e), 'err', 6000);
+    if (failBox) boxState(failBox, 'error', failTitle || '加载失败', e.message || String(e));
+    return null;
+  }
+}
+async function post(url, b){
+  try { return await window.apiPost(url, b); }
+  catch (e) { toast('操作失败：' + (e.message || e), 'err', 5000); return null; }
+}
+
+async function loadGroups(){
+  const d = await get('/api/watch/groups', $('#grp-list'), '分组没取到');
+  if (!d) return;
+  GROUPS = d.groups || [];
+  $('#grp-badge').textContent = d.groups.length + ' 组';
+  if (!d.groups.length) {
+    $('#grp-list').innerHTML = '<div class="empty">还没有分组，点「新建」建一个</div>';
+    $('#stk-list').innerHTML = '<div class="empty">先建一个分组</div>';
+    return;
+  }
+  if (GID === null || !d.groups.some(g => g.id === GID)) GID = d.groups[0].id;
+  $('#grp-list').innerHTML = d.groups.map(g => `
+    <div class="grp${g.id === GID ? ' on' : ''}" data-id="${g.id}">
+      <span class="nm">${esc(g.name)}</span>
+      <span class="ct">${g.stocks} 只${g.alerts ? ' · ' + g.alerts + ' 提醒' : ''}</span>
+      <span class="acts">
+        <button class="btn sm ghost" data-ren="${g.id}" title="重命名">改</button>
+        <button class="btn sm danger" data-del="${g.id}" title="删除分组（连带组内自选股）">删</button>
+      </span>
+      <span class="dz">
+        <span class="dzb dz-move" data-drop="move">移动到「${esc(g.name)}」</span>
+        <span class="dzb dz-copy" data-drop="copy">复制到「${esc(g.name)}」</span>
+      </span>
+    </div>`).join('');
+  $$('#grp-list .grp').forEach(el => {
+    el.onclick = e => {
+      if (e.target.closest('[data-ren],[data-del]')) return;
+      // 换组 ⇒ 三块一起换：左边选中态、右边自选股、下面「触发提醒」
+      //   （下面那张表**只显示当前分组**的记录，不跟着换就等于停在上一个组上）
+      GID = +el.dataset.id; loadGroups(); loadStocks(); loadFeed();
+    };
+    /* 拖到本行 = 换组。**左右各占半个行**摆「移动到 / 复制到」两选项：
+       这是唯一能让人一眼看全两个选项的摆法 —— 靠按住 Ctrl / Alt 之类的修饰键太隐蔽，
+       用户按下去之前根本不知道还有「复制」这条路（文字提示也救不了，拖起来顾不上看）。 */
+    el.addEventListener('dragover', e => {
+      if (!DRAG) return;                       // 只认「从自选股列表里拖过来的」
+      e.preventDefault();                      // 不挡默认行为，浏览器压根不允许 drop
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+      el.classList.add('hot');
+      const r = el.getBoundingClientRect();
+      const half = (e.clientX - r.left) < r.width / 2 ? 'move' : 'copy';
+      el.dataset.dz = half;
+      const m = el.querySelector('.dz-move'), c = el.querySelector('.dz-copy');
+      if (m) m.classList.toggle('on', half === 'move');
+      if (c) c.classList.toggle('on', half === 'copy');
+    });
+    el.addEventListener('dragleave', e => {
+      if (!DRAG) return;
+      // 在行的子元素之间挪动也会触发 dragleave，那不是「离开这一行」，别把投放区关掉
+      if (e.relatedTarget && el.contains(e.relatedTarget)) return;
+      clearHot(el);
+    });
+    el.addEventListener('drop', guardClick(el, async e => {
+      e.preventDefault();
+      if (!DRAG) return;
+      const to = +el.dataset.id;
+      // ⚠ 先读走 mode 再 endDrag() —— 后者会把 data-dz 清掉，读晚了就永远当「移动」处理
+      const mode = el.dataset.dz === 'copy' ? 'copy' : 'move';
+      const d = DRAG;
+      endDrag();
+      if (to === d.fromGid) { toast(`这几只已经在「${grpName(to)}」里了`, 'warn'); return; }
+      const r = await post('/api/watch/stocks/transfer',
+                           { from_group_id: d.fromGid, to_group_id: to,
+                             codes: d.codes, mode: mode });
+      if (!r) return;
+      const x = r.result || {};
+      const n = (x.added || []).length + (x.dup || []).length;
+      toast(`已${mode === 'copy' ? '复制到' : '移动到'}「${grpName(to)}」${n} 只` +
+            ((x.dup || []).length ? `（其中 ${x.dup.length} 只本来就在）` : '') +
+            ((x.alerts_pruned || []).length ? `；${x.alerts_pruned.length} 只不再属于任何组，提醒规则一并清掉` : ''),
+            'ok', 4500);
+      PICK.clear();
+      // 换组改变了「谁在这一组里」⇒ 触发提醒那张表也要跟着重取（两边组成分都动了）
+      await loadGroups(); await loadStocks(); await loadFeed();
+    }));
+  });
+  $$('#grp-list [data-ren]').forEach(b => b.onclick = guardClick(b, async e => {
+    e.stopPropagation();
+    const g = d.groups.find(x => x.id === +b.dataset.ren);
+    const name = prompt('分组名：', g ? g.name : '');
+    if (name === null) return;
+    const r = await post('/api/watch/group/save', { id: +b.dataset.ren, name: name });
+    if (!r) return;
+    toast('已改名', 'ok'); await loadGroups();
+  }));
+  $$('#grp-list [data-del]').forEach(b => b.onclick = guardClick(b, async e => {
+    e.stopPropagation();
+    const g = d.groups.find(x => x.id === +b.dataset.del);
+    if (!confirm(`删除分组「${g ? g.name : ''}」？组内自选股一起删；某只票如果哪个组都不在了，它的提醒规则也会一并清掉。`)) return;
+    const r = await post('/api/watch/group/delete', { id: +b.dataset.del });
+    if (!r) return;
+    toast(`已删除，连带 ${r.result.stocks} 只自选` + (r.result.alerts_dropped ? `、${r.result.alerts_dropped} 条提醒` : ''), 'ok');
+    if (GID === +b.dataset.del) GID = null;
+    await loadGroups(); await loadStocks(); await loadFeed();
+  }));
+}
+
+/* ---------------- 自选股表：点表头排序（客户端，只排**已经拿到的这一批**） ----------------
+   为什么不重新请求：`list_stocks` 一次就把整组给全了（这一页没有分页，也没有跟着顺序变的
+   合计数字），点表头只是换个看法 —— 与选股结果页**同一套口径**（C13：「点表头两页同源」）：
+   复用那份 CSS（`.sortable` / `.sarrow` / `.sort-asc|.sort-desc`），只重排引用、不动 `STOCKS`。
+   ⚠ 缺值（收盘 / 涨跌幅取不到，备注是空串）**永远沉底**、不随升降序翻上来 ——
+     否则一点升序，一屏空备注全冒到最前面。
+   ⚠ 本地瞬时动作 ⇒ **不套 `guardClick`**（C38 里点名「表头排序」不该锁，锁了连续点很黏手）。 */
+const STK_TEXT_COLS = { ts_code: 1, name: 1, note: 1 };   // 按文本比，其余按数值比
+const stkMissing = v => v === null || v === undefined || v === ''
+  || (typeof v === 'number' && isNaN(v));
+
+/** 屏幕上真正要显示的那一批（顺序 = 当前排序）。不改 STOCKS，只重排引用。 */
+function stkSorted(){
+  const its = STOCKS;
+  if (!STK_SORT.key) return its.slice();          // '' = 后端原序（加入先后）
+  const key = STK_SORT.key, text = !!STK_TEXT_COLS[key], dir = STK_SORT.dir > 0 ? 1 : -1;
+  return its.map((it, i) => ({ it, i })).sort((a, b) => {
+    const va = a.it[key], vb = b.it[key];
+    const na = stkMissing(va), nb = stkMissing(vb);
+    if (na || nb) return (na && nb) ? a.i - b.i : (na ? 1 : -1);
+    const c = text ? String(va).localeCompare(String(vb), 'zh')
+                   : (Number(va) < Number(vb) ? -1 : (Number(va) > Number(vb) ? 1 : 0));
+    return c ? c * dir : a.i - b.i;               // 同值保持原相对顺序（稳定）
+  }).map(p => p.it);
+}
+
+/** 可排序表头。`key` 传 '' → 普通表头；传 '__orig' → 「#」= 回后端原序（可点、但不冒充一列值）。 */
+function stkTh(label, key, cls, title){
+  if (!key) return `<th class="${cls || ''}">${esc(label)}</th>`;
+  const tip = title !== undefined ? title : '点击按「' + label + '」排序';
+  // 「#」是回原序的入口，不是一列可比大小的值 —— 不给 ▲/▼，免得看着像「按序号排」
+  if (key === '__orig') {
+    return `<th class="${(cls ? cls + ' ' : '') + 'sortable'}" data-sort="__orig"`
+      + ` title="${esc(tip)}">${esc(label)}</th>`;
+  }
+  const dc = (STK_SORT.key === key) ? (STK_SORT.dir > 0 ? ' sort-asc' : ' sort-desc') : '';
+  return `<th class="${(cls ? cls + ' ' : '') + 'sortable' + dc}" data-sort="${key}"`
+    + ` title="${esc(tip)}">${esc(label)}<span class="sarrow"></span></th>`;
+}
+
+async function loadStocks(){
+  const q = GID ? ('?group_id=' + GID) : '';
+  const d = await get('/api/watch/stocks' + q, $('#stk-list'), '自选股没取到');
+  if (!d) return;
+  STOCKS = d.stocks || [];
+  ALERTS = d.alerts || [];
+  STK_DATE = d.trade_date || '';      // 上面「收盘 / 涨跌幅」两列是哪天的
+  // 勾选态只对**当前这一组**有意义：换了组就得把不属于本组的清掉，
+  // 否则切换分组后拖一下，会把上一组的票也一起拖过去（它们在库里并不属于这个组）。
+  PICK = new Set([...PICK].filter(c => STOCKS.some(s => s.ts_code === c)));
+  const byCode = alertsByCode();
+  $('#stk-badge').textContent = STOCKS.length ? STOCKS.length + ' 只' : '空';
+  const on = STOCKS.filter(s => (byCode[s.ts_code] || []).length).length;
+  $('#grp-note').textContent = STOCKS.length
+    ? `本组 ${STOCKS.length} 只，其中 ${on} 只设了提醒。`
+    : '这一组还没有自选股。';
+  if (!STOCKS.length) {
+    $('#stk-list').innerHTML = '<div class="empty">还没有自选股 —— 上面输入代码或名称，点「加入」</div>';
+    paintPick();
+    return;
+  }
+  STK_SORT = { key: '', dir: -1 };   // 换组 / 重新加载 ⇒ 回到后端原序（加入先后）
+  paintStocks();
+}
+
+/** 按 ts_code 归组提醒规则（loadStocks 与 paintStocks 共用一份口径）。 */
+function alertsByCode(){
+  const m = {};
+  ALERTS.forEach(a => { (m[a.ts_code] = m[a.ts_code] || []).push(a); });
+  return m;
+}
+
+/** 「代码」列点进个股诊断页的 URL。口径与 /pools、/screen 完全一致：
+    `/stock/<ts_code>`（带交易所后缀、encodeURIComponent 编码），
+    别在这里另造一种写法（少写个 .SH 就会落到「本地无该股票行情」）。
+    ⚠ 总览热股榜**不在这个名单里** —— 它整行点开的是 K线预览弹窗（2026-10-11 改），
+      诊断页入口在弹窗里。 */
+function stkUrl(code){
+  return '/stock/' + encodeURIComponent(String(code || ''));
+}
+
+/** 画自选股表：表头与行都按**当前** `STK_SORT` 出。点表头只重画这一块，不再请求。
+    ⚠ 重画 = 整张表换新节点 ⇒ 底下的绑定（提醒 / 移出 / K线 / 勾选 / 拖动）都得重挂一遍，
+      漏一个就会「排一次序，按钮就点不动了」。 */
+function paintStocks(){
+  const byCode = alertsByCode();
+  const view = stkSorted();
+  /* 行上是 `draggable`：整行都能拖。首列那个勾选框是给「一次拖一整批」用的 ——
+     515 只的组里一只一只拖不现实。 */
+  const head = '<th style="width:26px"><input type="checkbox" id="stk-all" title="全选本组（可一次拖走）"></th>'
+    + stkTh('#', '__orig', '', '点击恢复原始顺序（按加入先后）')
+    + stkTh('代码', 'ts_code') + stkTh('名称', 'name')
+    + stkTh('收盘', 'close', 'num') + stkTh('涨跌幅', 'pct_chg', 'num')
+    + stkTh('提醒规则', 'alerts', '', '点击按「提醒规则条数」排序')
+    + stkTh('备注', 'note') + '<th style="width:150px">操作</th>';
+  $('#stk-list').innerHTML = `<table class="data"><thead><tr>${head}</tr></thead><tbody>
+    ${view.map((s, i) => {
+      const al = byCode[s.ts_code] || [];
+      const chips = al.length
+        ? al.map(a => `<span class="wchip${a.enabled ? '' : ' off'}" title="${esc(a.enabled ? '已启用' : '已暂停')}">${esc(a.text)}</span>`).join('')
+        : '<span class="muted small">未设</span>';
+      return `<tr draggable="true" data-code="${esc(s.ts_code)}" data-i="${i}">
+        <td><input type="checkbox" data-pick="${esc(s.ts_code)}" title="勾上可一次拖多只"></td>
+        <td class="small muted">${i + 1}</td>
+        <td class="mono small"><a class="stk-code" href="${esc(stkUrl(s.ts_code))}" target="_blank" rel="noopener" draggable="false" title="打开 ${esc(s.ts_code)} 的个股诊断页">${esc(s.ts_code)}</a></td>
+        <td>${esc(s.name || '—')}</td>
+        <td class="num mono">${s.close === null || s.close === undefined ? '—' : s.close.toFixed(2)}</td>
+        <td class="num ${esc(s.pct_cls || '')}">${esc(s.pct_text)}</td>
+        <td>${chips}</td>
+        <td class="small muted" title="${esc(s.note || '')}">${esc((s.note || '').slice(0, 24))}</td>
+        <td class="flex">
+          <button class="btn sm" data-alert="${esc(s.ts_code)}">提醒${al.length ? '·' + al.length : ''}</button>
+          <button class="btn sm" data-k="${i}">K线</button>
+          <button class="btn sm danger" data-rm="${esc(s.ts_code)}">移出</button>
+        </td></tr>`;
+    }).join('')}</tbody></table>`;
+
+  $$('#stk-list [data-alert]').forEach(b => b.onclick = e => openAlerts(b.dataset.alert));
+  $$('#stk-list [data-rm]').forEach(b => b.onclick = guardClick(b, async () => {
+    const c = b.dataset.rm;
+    if (!confirm(`把 ${c} 移出本组？`)) return;
+    const r = await post('/api/watch/stocks/remove', { group_id: GID, codes: [c] });
+    if (!r) return;
+    toast(r.result.alerts_pruned.length ? `${c} 已移出，提醒规则一并清理` : `${c} 已移出`, 'ok');
+    await loadGroups(); await loadStocks(); await loadFeed();
+  }));
+  $$('#stk-list [data-k]').forEach(b => b.onclick = () => {
+    const i = +b.dataset.k, s = view[i];
+    // ⚠ 这一页没有绑定任何买卖策略（纯自选股），所以必须带 `sel_only=1`：
+    //   不带的话诊断页会拿默认买卖参数跑一遍单票回测，摆出第 4 张「收益」卡，
+    //   那个收益跟「我关注的这几只走得怎么样」毫无关系。锚点用表里那两列的日期。
+    // ⚠ 名单交给**当前屏幕上这个顺序**（view）—— 弹窗里的「下一个」才跟列表对得上。
+    klinePreview({ tsCode: s.ts_code, name: s.name, list: view, index: i,
+                   params: { sel_only: '1', trade_date: STK_DATE } });
+  });
+
+  // 点表头 → 换排序（本地重画，不请求）。点同列切升降；换列时文本列升序、数值列降序；
+  // 「#」回到后端原序。⚠ 本地瞬时动作，不套 guardClick（C38）。
+  $$('#stk-list th[data-sort]').forEach(th => th.onclick = () => {
+    const k = th.dataset.sort;
+    if (k === '__orig') STK_SORT = { key: '', dir: -1 };
+    else if (STK_SORT.key === k) STK_SORT.dir = -STK_SORT.dir;
+    else STK_SORT = { key: k, dir: STK_TEXT_COLS[k] ? 1 : -1 };
+    paintStocks();
+  });
+
+  // 勾选（多选拖动用）。勾选态只影响「拖哪几只」，不是提交类动作 ⇒ 不走 guardClick。
+  const allBox = $('#stk-all');
+  if (allBox) allBox.onchange = () => {
+    PICK = allBox.checked ? new Set(STOCKS.map(s => s.ts_code)) : new Set();
+    paintPick();
+  };
+  $$('#stk-list [data-pick]').forEach(cb => cb.onchange = () => {
+    if (cb.checked) PICK.add(cb.dataset.pick); else PICK.delete(cb.dataset.pick);
+    paintPick();
+  });
+  paintPick();
+  attachDrag();
+}
+
+/* ---------------- 多选态 ---------------- */
+function paintPick(){
+  const n = PICK.size;
+  const bar = $('#stk-sel');
+  if (bar) {
+    bar.classList.toggle('on', n > 0);
+    bar.innerHTML = n
+      ? `<b>已选 ${n} 只</b><span>拖到左边任意分组上：行<b>左半</b> = 移动到，行<b>右半</b> = 复制到</span>`
+        + `<button class="btn sm ghost" id="stk-sel-clr" style="margin-left:auto">清空选择</button>`
+      : '';
+    const clr = $('#stk-sel-clr');
+    if (clr) clr.onclick = () => { PICK.clear(); paintPick(); };   // 本地瞬时控件，不锁
+  }
+  $$('#stk-list [data-pick]').forEach(cb => { cb.checked = PICK.has(cb.dataset.pick); });
+  $$('#stk-list tbody tr[data-code]').forEach(tr =>
+    tr.classList.toggle('picked', PICK.has(tr.dataset.code)));
+  const allBox = $('#stk-all');
+  if (allBox) allBox.checked = !!STOCKS.length && PICK.size === STOCKS.length;
+}
+
+/* ---------------- 把自选股拖到别的分组（复制 / 移动） ----------------
+   拖动状态存在 `DRAG` 这个变量里，**刻意不依赖 `dataTransfer`**：`dragover` 阶段本来
+   就取不到数据（规范如此），合成事件里它更是个空壳 —— 判定要是靠它，回归探针就没法验了。
+   `dataTransfer` 只负责两件事：让浏览器认这是一次真拖拽、把拖影带出来。 */
+function clearHot(el){
+  el.classList.remove('hot');
+  el.removeAttribute('data-dz');
+  const m = el.querySelector('.dz-move'), c = el.querySelector('.dz-copy');
+  if (m) m.classList.remove('on');
+  if (c) c.classList.remove('on');
+}
+
+function endDrag(){
+  DRAG = null;
+  document.body.classList.remove('dragging');
+  $$('#grp-list .grp').forEach(clearHot);
+  const t = $('#drag-tip');
+  if (t) t.classList.remove('on');
+}
+
+function attachDrag(){
+  $$('#stk-list tbody tr[data-code]').forEach(tr => {
+    tr.addEventListener('dragstart', e => {
+      // 从行上的按钮 / 输入框按下去不算「拖股票」：不挡的话，按住「移出」轻轻一拖
+      // 会同时开拖拽 + 吞掉那次点击，用户以为按钮坏了。
+      if (e.target.closest('button,input,a,select')) { e.preventDefault(); return; }
+      const code = tr.dataset.code;
+      if (!PICK.has(code)) PICK = new Set([code]);   // 没勾过就只拖这一行
+      paintPick();
+      DRAG = { codes: [...PICK], fromGid: GID };
+      tr.classList.add('dragging');
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = 'copyMove';
+        try { e.dataTransfer.setData('text/plain', DRAG.codes.join(',')); } catch (err) {}
+      }
+      document.body.classList.add('dragging');
+      const tip = $('#drag-tip');
+      if (tip) {
+        tip.textContent = `拖 ${DRAG.codes.length} 只 → 落在分组左半 = 移动到，右半 = 复制到`;
+        tip.classList.add('on');
+      }
+    });
+    tr.addEventListener('dragend', () => { tr.classList.remove('dragging'); endDrag(); });
+  });
+}
+
+/* ---------------- 单只票的提醒规则（弹窗） ---------------- */
+function openAlerts(code){
+  const s = STOCKS.find(x => x.ts_code === code) || { ts_code: code, name: '' };
+  /* 下拉按后端给的分组排（均线 → 布林），**默认选中 MA10**；「绝对价位」单独摆最后 ——
+     它只是「不判线、改判一个固定价」的兜底，不该占着第一格当默认，否则一开弹窗迎面就是个
+     价格输入框，等于把最常用的「股价上穿 MA10」藏到下拉尾巴里去了。 */
+  const lineOpts = LINE_GROUPS.map(g => {
+    const opts = LINE_ORDER.filter(k => LINES[k][2] === g)
+      .map(k => `<option value="${esc(k)}"${k === DEF_LINE ? ' selected' : ''}>${esc(LINES[k][0])}</option>`)
+      .join('');
+    return opts ? `<optgroup label="${esc(g)}">${opts}</optgroup>` : '';
+  }).join('') + '<optgroup label="其他"><option value="">绝对价位（不判线）</option></optgroup>';
+  const opOpts = OP_ORDER.map(k =>
+    `<option value="${esc(k)}"${k === DEF_OP ? ' selected' : ''}>${esc(OPS[k])}</option>`).join('');
+  /* 一键规则按**周期分成两行**：日K 与周K 混在一起摆的话，「上穿 MA10」和
+     「周K 上穿 MA10」两个按钮会挨着，点错一个建出来的规则行为完全不同（一个判今天那根、
+     一个判整周那根）。分组后每行前面各带一个「日K / 周K」小标。 */
+  const quickRows = FREQ_ORDER.map(f =>
+    `<div class="flex" style="flex-wrap:wrap;align-items:center;gap:6px;margin-bottom:6px">`
+    + `<span class="small muted" style="min-width:30px">${esc(FREQS[f] || f)}</span>`
+    + QUICK.map((q, i) => ({ q: q, i: i })).filter(x => x.q[0] === f)
+        .map(x => `<button class="btn sm ghost" data-q="${x.i}">${esc(x.q[3])}</button>`).join('')
+    + `</div>`).join('');
+  const freqOpts = FREQ_ORDER.map(k =>
+    `<option value="${esc(k)}"${k === DEF_FREQ ? ' selected' : ''}>${esc(FREQS[k] || k)}</option>`)
+    .join('');
+  /* 类型切换（指标/价位 vs 选股命中）。两种规则的字段完全不同，所以做成**二选一的分段控件**
+     而不是「在同一张表单上再加几个框」—— 后者会让人以为可以同时填均线和选股策略。 */
+  const kindBtns = KIND_ORDER.map(k =>
+    `<button type="button" data-kind="${esc(k)}"${k === DEF_KIND ? ' class="on"' : ''}>${esc(KINDS[k] || k)}</button>`
+  ).join('');
+  const body = `
+    <input type="hidden" id="al-code" value="${esc(code)}">
+    <div class="small muted" style="margin-bottom:10px">
+      ${esc(code)} ${esc(s.name || '')} —— 下面是已设的规则，改动立刻生效；「暂停」只是不参与检测，规则留着。
+    </div>
+    <div id="al-list" style="margin-bottom:12px"></div>
+    <div class="hr"></div>
+    <div class="field"><label class="lb">提醒类型 <span class="hint" id="al-kind-hint"></span></label>
+      <div class="seg" id="al-kind">${kindBtns}</div></div>
+    <div class="small muted" style="margin-bottom:8px" id="al-add-hint"></div>
+    <div id="al-price-box">
+      <div class="field"><label class="lb">常用规则 <span class="hint">点一下直接加（日K / 周K 分开摆）</span></label>
+        <div id="al-quick">${quickRows}</div></div>
+      <div class="field" style="margin-top:2px"><label class="lb">或者自己拼一条 <span class="hint">选线 + 动作，点弹窗底部的「添加」</span></label>
+        <div class="row">
+          <div class="field" style="flex:1"><label class="lb">周期</label>
+            <select id="al-freq">${freqOpts}</select></div>
+          <div class="field" style="flex:1"><label class="lb">判哪条线</label>
+            <select id="al-line">${lineOpts}</select></div>
+          <div class="field" style="flex:1"><label class="lb">做什么</label>
+            <select id="al-op">${opOpts}</select></div>
+          <div class="field" style="flex:1" id="al-val-wrap"><label class="lb">价位 <span class="hint">线上不填</span></label>
+            <input type="number" step="0.01" id="al-value" placeholder="如 10.50"></div>
+        </div></div>
+    </div>
+    <div id="al-pool-box" style="display:none">
+      <div class="row">
+        <div class="field" style="flex:0 0 140px"><label class="lb">周期 <span class="hint">默认跟策略</span></label>
+          <select id="al-pool-freq">${freqOpts}</select></div>
+        <div class="field" style="flex:1"><label class="lb">选股策略 <span class="hint">「选股策略」页里建的那些</span></label>
+          <select id="al-pool"><option value="">（加载中…）</option></select></div>
+      </div>
+      <div class="small muted" id="al-pool-hint"></div>
+      <div class="small muted" id="al-pool-week" style="margin-top:4px"></div>
+      <div class="small muted" id="al-pool-now" style="margin-top:6px"></div>
+      <div class="flex" style="margin-top:8px">
+        <button class="btn sm ghost" type="button" id="al-pool-check"
+                title="只算这一次、不写库：看看这只票按上面那条策略、在选定周期那根 K 线上算不算命中">看这只票现在命中吗</button>
+      </div>
+    </div>
+    <div class="field"><label class="lb">备注 <span class="hint">选填</span></label>
+      <input type="text" id="al-note" placeholder="如：跌到 10.5 想看一眼"></div>
+    <div class="field"><label class="lb">这只票的备注</label>
+      <input type="text" id="al-snote" value="${esc(s.note || '')}" placeholder="如：成本 9.8 / 只做波段"></div>
+    <div class="small muted" id="al-hint"></div>`;
+  const m = mkModal('提醒 · ' + (s.name || code), body,
+    '<button class="btn sm primary" id="al-add">添加</button>', () => { loadStocks(); });
+
+  const syncVal = () => {
+    const hasLine = !!$('#al-line').value;
+    const wk = !!$('#al-freq') && $('#al-freq').value === 'weekly';
+    $('#al-val-wrap').style.display = hasLine ? 'none' : '';
+    /* 周K 这句话必须写进提示里：不说的话用户会以为「今天就能响」，
+       实际要等这周走完（周线收盘）才判得出来 —— 这是最容易被当成「规则坏了」的地方。 */
+    const tail = wk
+      ? '　周期选了周K：判的是「周线那一根」，要等这周走完（周线收盘）才出结果，一周最多一条。'
+      : '';
+    $('#al-hint').textContent = (hasLine
+      ? '这条按收盘价判：前一根在 ' + lineLabel($('#al-line').value) + ' 下方、这一根跑到上方才算「上穿」（下穿反过来）。'
+      : '判的是固定价位：上穿 = 前一根收盘不高于它、这一根高于它；触及 = 当日最低~最高之间碰到它。') + tail;
+  };
+  $('#al-line').onchange = syncVal;
+  if ($('#al-freq')) $('#al-freq').onchange = syncVal;
+  syncVal();
+
+  /* ---------- 类型切换：指标 / 价位 ⟷ 选股命中（2026-10-10） ----------
+     两种规则的字段完全不同（pool 档不用周期/线/动作/价位），所以是**二选一的分段控件**：
+     摆在同一条表单上会让人以为「均线」和「选股策略」可以同时填。 */
+  let AKIND = DEF_KIND;
+  let POOLS = null;             // 选股策略清单（懒加载一次，弹窗关了不缓存也没关系）
+  function syncKind(){
+    $('#al-price-box').style.display = AKIND === 'pool' ? 'none' : '';
+    $('#al-pool-box').style.display = AKIND === 'pool' ? '' : 'none';
+    $$('#al-kind button').forEach(b => b.classList.toggle('on', b.dataset.kind === AKIND));
+    $('#al-kind-hint').textContent = AKIND === 'pool'
+      ? '绑定一条选股策略：这个周期里它在池子里就提醒'
+      : '收盘价与均线 / 价位的关系（上穿 / 下穿 / 触及）';
+    $('#al-add-hint').innerHTML = AKIND === 'pool'
+      ? '选股策略条件改了，已挂的提醒<b>跟着一起变</b>（每次检测都按当前条件重算，不存快照）。'
+      : '加规则：<b>常用的点一下就加</b>；要别的组合（MA60 / 布林上轨 …）自己在下面拼一条。';
+    $('#al-add').textContent = AKIND === 'pool' ? '添加选股命中提醒' : '添加';
+    /* ⚠ 切到 pool 就把价格档那句提示清掉：`#al-hint` 里那句「按收盘价判…」在选股命中下是错的，
+       留着会让人以为选股命中也是「收盘价上穿」那一套。 */
+    if (AKIND === 'pool') $('#al-hint').textContent = '';
+    else syncVal();
+    if (AKIND === 'pool') { syncPoolFreq(); loadPools(); }
+  }
+  /* 选股命中的**周期**（日K / 周K）。⚠ pool 档有**两个**周期，别混：
+       · **面板周期** = 选股策略自己的 `timeframe`（建策略时选的）—— 决定条件在哪种 K 线上算：
+         周K 策略的 `close` 是周收盘、`MA5` 是 5 周均线，与选股页 / 回测**同一口径**；
+       · **判定节奏** = 下面这个下拉 —— 只管**多久判一次**（日K 每个交易日判、周K 只认这周走完后那天）。
+     绑策略时下拉默认跟着策略走，也可手动改（改的只是节奏，不是条件口径）。
+     这段话必须写在界面上：不写的话用户会以为「选周K = 只判时点、条件还是日线」。 */
+  function syncPoolFreq(){
+    const wk = $('#al-pool-freq') && $('#al-pool-freq').value === 'weekly';
+    const p = (POOLS || []).find(x => x.id === +$('#al-pool').value);
+    const ptf = !!(p && p.timeframe === 'weekly');   // 策略自己是不是周K
+    let t = '';
+    if (wk) t = '周K：只判「这周走完后那一天」的收盘状态 —— 要等这周走完（周线收盘）才出结果，一周最多一条。';
+    if (ptf) t += (t ? ' ' : '') + '该策略本身是周K：条件（收盘价 / MA5…）按周线算，与选股页一致。';
+    $('#al-pool-week').textContent = t;
+    $('#al-pool-check').textContent = (wk || ptf) ? '看这只票这周走完后命中吗' : '看这只票现在命中吗';
+    // 换了周期 / 策略 ⇒ 上一次那条预览作废，别留着上一次的结论误导人
+    $('#al-pool-now').textContent = '';
+  }
+  $$('#al-kind button').forEach(b => b.onclick = () => { AKIND = b.dataset.kind; syncKind(); });
+  async function loadPools(){
+    if (POOLS) return POOLS;
+    const list = await get('/api/watch/pools');
+    POOLS = Array.isArray(list) ? list : [];
+    $('#al-pool').innerHTML = POOLS.length
+      ? '<option value="">— 选一条选股策略 —</option>' + POOLS.map(p =>
+          `<option value="${p.id}">${esc(p.name_label || p.name)} · ${p.cond_count} 条条件</option>`).join('')
+      : '<option value="">（还没有选股策略 —— 去「选股策略」页建一条）</option>';
+    return POOLS;
+  }
+  $('#al-pool').onchange = () => {
+    const p = (POOLS || []).find(x => x.id === +$('#al-pool').value);
+    $('#al-pool-hint').innerHTML = p
+      ? `命中判据 = <b>${esc(p.label)}</b>　（选股页怎么判，这里就怎么判：同一套条件、过滤、前复权数据）`
+      : '';
+    // ⚠ 周期**默认跟随选股策略**（策略自带 `timeframe`）—— 免得「策略是周K、提醒还停在日K」。
+    //   之后仍可手动改：那是明确的覆盖（同一组条件换个周期判），不是默认值。
+    if (p && p.timeframe && $('#al-pool-freq')) {
+      $('#al-pool-freq').value = p.timeframe;
+      syncPoolFreq();
+    }
+    // 换策略 ⇒ 上一次那条预览作废，别留着上一次的结论误导人
+    $('#al-pool-now').textContent = '';
+  };
+  $('#al-pool-freq').onchange = syncPoolFreq;
+  /* 预览只算**这一只票**（几十毫秒）。整组预览要按 300 根 K 线把整组面板重算一遍，
+     几百只要十几秒 —— 那种量级不能做成「选完自动查」，页面看着就是卡住了。 */
+  $('#al-pool-check').onclick = guardClick($('#al-pool-check'), async () => {
+    const pid = +$('#al-pool').value;
+    const fq = $('#al-pool-freq').value;
+    const now = $('#al-pool-now');
+    if (!pid) { toast('先选一条选股策略', 'warn'); return; }
+    now.textContent = '计算中…';
+    // ⚠ `freq` 必须一起送：周K 判的是「这周走完那天」，接口**同一个 end** 才能保证
+    //   「预览说命中 = 检测真会响」。
+    const r = await post('/api/watch/pool/hit', { pool_id: pid, codes: [code], freq: fq });
+    if (!r) { now.textContent = ''; return; }
+    const when = fq === 'weekly' ? '这周走完那天' : '那天';
+    const hit = (r.codes || []).indexOf(code) >= 0;
+    now.innerHTML = hit
+      ? `<span class="tag ok">命中</span> ${esc(code)} 在 <b>${esc(r.date)}</b>（${when}）落在`
+        + `「${esc(r.pool_name)}」池内 —— 现在加这条提醒，一检测就会响。`
+      : `<span class="muted">未命中</span>：<b>${esc(r.date)}</b>（${when}）它不在`
+        + `「${esc(r.pool_name)}」池内。也可以先加上 —— 以后哪天入了池就提醒。`;
+  });
+  syncKind();
+
+  async function renderAlerts(){
+    const list = (await get('/api/watch/alerts?ts_code=' + encodeURIComponent(code)) || {alerts: []}).alerts;
+    /* 两种规则在同一张表里：**类型列**分开写（指标/价位 · 选股命中），规则那一列按类型铺 ——
+       pool 档的 `line` 是空的，硬按 price 那套拼会写出「上穿—」这种东西。 */
+    $('#al-list').innerHTML = list.length ? `<table class="data"><thead><tr>
+      <th>规则</th><th>类型</th><th>周期</th><th>备注</th><th>状态</th><th style="width:120px">操作</th></tr></thead><tbody>
+      ${list.map(a => {
+        const isPool = a.kind === 'pool';
+        const what = isPool
+          ? `选股策略「${esc(a.pool_name || ('#' + (a.pool_id || '—')))}」`
+          : `<b>${esc(opLabel(a.op))}</b> ${esc(a.line ? a.line_label : (a.value === null ? '—' : a.value))}`;
+        // 周期列两档都填：pool 档 2026-10-10 起也有日K / 周K，不再对它摆一个「—」
+        const per = `<span class="tag${a.freq === 'weekly' ? ' b' : ''}">${esc(a.freq_label || freqLabel(a.freq) || '日K')}</span>`;
+        return `<tr>
+        <td>${what}</td>
+        <td><span class="tag${isPool ? ' b' : ''}">${esc(a.kind_label || (isPool ? '选股命中' : '指标 / 价位'))}</span></td>
+        <td>${per}</td>
+        <td class="small muted">${esc(a.note || '')}</td>
+        <td><span class="tag ${a.enabled ? 'ok' : ''}">${a.enabled ? '启用' : '暂停'}</span></td>
+        <td class="flex">
+          <button class="btn sm ghost" data-tog="${a.id}" data-on="${a.enabled ? 0 : 1}">${a.enabled ? '暂停' : '启用'}</button>
+          <button class="btn sm danger" data-del="${a.id}">删</button>
+        </td></tr>`; }).join('')}</tbody></table>`
+      : '<div class="empty">还没有规则</div>';
+    $$('#al-list [data-tog]').forEach(b => b.onclick = guardClick(b, async () => {
+      await post('/api/watch/alert/toggle', { id: +b.dataset.tog, enabled: +b.dataset.on });
+      await renderAlerts();
+    }));
+    $$('#al-list [data-del]').forEach(b => b.onclick = guardClick(b, async () => {
+      await post('/api/watch/alert/delete', { id: +b.dataset.del });
+      toast('已删除该规则', 'ok'); await renderAlerts();
+    }));
+  }
+  renderAlerts();
+
+  /* 「常用规则」按钮：点一下 = 直接拿后端那对 (线, 动作) 建规则，不用先去下拉里挑。
+     ⚠ 也走 guardClick —— 它同样是**提交类**（要写库），连点两下会加出两条一模一样的规则。 */
+  $$('#al-quick [data-q]').forEach(b => b.onclick = guardClick(b, async () => {
+    const q = QUICK[+b.dataset.q];          // [周期, 线, 动作, 文案]
+    const r = await post('/api/watch/alert/save',
+                         { ts_code: code, freq: q[0], line: q[1], op: q[2], value: null });
+    if (!r) return;
+    toast('已加规则：' + q[3], 'ok');
+    await renderAlerts();
+  }));
+
+  $('#al-add').onclick = guardClick($('#al-add'), async () => {
+    let r;
+    if (AKIND === 'pool') {
+      const pid = +$('#al-pool').value;
+      const fq = $('#al-pool-freq').value;
+      if (!pid) { toast('先选一条选股策略', 'warn'); return; }
+      // ⚠ `freq` 也要送（pool 档同样有日K / 周K）：漏了它，用户选的周K 会被默默降成日K。
+      r = await post('/api/watch/alert/save', {
+        ts_code: code, kind: 'pool', pool_id: pid, freq: fq, note: $('#al-note').value });
+      if (!r) return;
+      const p = (POOLS || []).find(x => x.id === pid);
+      await post('/api/watch/stock/note', { group_id: GID, ts_code: code, note: $('#al-snote').value });
+      $('#al-note').value = '';
+      toast('已加选股命中提醒：' + (p ? p.name : ('#' + pid))
+            + (fq === 'weekly' ? '（周K）' : ''), 'ok');
+      await renderAlerts();
+      return;
+    }
+    r = await post('/api/watch/alert/save', {
+      ts_code: code, kind: 'price', freq: $('#al-freq').value,
+      line: $('#al-line').value, op: $('#al-op').value,
+      value: $('#al-value').value === '' ? null : +$('#al-value').value,
+      note: $('#al-note').value,
+    });
+    if (!r) return;
+    await post('/api/watch/stock/note', { group_id: GID, ts_code: code, note: $('#al-snote').value });
+    $('#al-note').value = ''; $('#al-value').value = '';
+    toast('规则已添加', 'ok'); await renderAlerts();
+  });
+  // 备注独立保存：上面「添加规则」会一起写，但只改备注不设规则时也得能存
+  $('#al-snote').onchange = async () => {
+    await post('/api/watch/stock/note', { group_id: GID, ts_code: code, note: $('#al-snote').value });
+    toast('备注已保存', 'ok');
+  };
+}
+
+/* ---------------- 触发记录 ---------------- */
+/* 表头可点排序 —— 与自选股表 / 选股结果页**同一套口径**（C13 / C52）：点同列切升降、
+   换列时文本列升序·数值列降序、缺值（—）**永远沉底**、最左「#」回后端原序。
+   ⚠ 排序只在**每个交易日内部**做，不跨天：这个列表本来就按交易日分组，
+     跨天混排会把「哪天命中」一起排没了（日期小标题也就成了摆设）。
+   ⚠ 本地瞬时动作 ⇒ **不套 `guardClick`**（C38 点名：表头排序锁了连续点会很黏手）。 */
+const FEED_TEXT_COLS = { ts_code: 1, name: 1 };   // 按文本比，其余按数值比
+let FEED_ITEMS = [];                              // 最近一次取回的记录（排序只重画，不再请求）
+let FEED_META = { today: '', days: [] };
+let FEED_SORT = { key: '', dir: -1 };             // key='' = 后端原序（trade_date DESC, id DESC）
+let FEED_GID = null;                              // 这批记录是**哪个分组**的（跟着左边选中走）
+let FEED_SEQ = 0;                                 // 请求序号：切组很快时丢掉过期响应（见 loadFeed）
+
+function feedMissing(v){
+  return v === null || v === undefined || v === ''
+    || (typeof v === 'number' && isNaN(v));
+}
+
+/** 某一天内部按当前 `FEED_SORT` 排好的那批（不改 FEED_ITEMS，只重排引用）。 */
+function feedSorted(dayItems){
+  if (!FEED_SORT.key) return dayItems.slice();
+  const key = FEED_SORT.key, text = !!FEED_TEXT_COLS[key], dir = FEED_SORT.dir > 0 ? 1 : -1;
+  return dayItems.map((it, i) => ({ it, i })).sort((a, b) => {
+    const va = a.it[key], vb = b.it[key];
+    const na = feedMissing(va), nb = feedMissing(vb);
+    if (na || nb) return (na && nb) ? a.i - b.i : (na ? 1 : -1);   // 缺值沉底（不受方向影响）
+    const c = text ? String(va).localeCompare(String(vb), 'zh')
+                   : (Number(va) < Number(vb) ? -1 : (Number(va) > Number(vb) ? 1 : 0));
+    return c ? c * dir : a.i - b.i;                                // 同值保持原相对顺序（稳定）
+  }).map(p => p.it);
+}
+
+/** 可排序表头（与自选股表 `stkTh` / 选股结果页 `scTh` 同形，共用同一份 CSS）。 */
+function feedTh(label, key, cls, title){
+  if (!key) return `<th class="${cls || ''}">${esc(label)}</th>`;
+  const tip = title !== undefined ? title : '点击按「' + label + '」排序';
+  if (key === '__orig') {
+    return `<th class="${(cls ? cls + ' ' : '') + 'sortable'}" data-fsort="__orig"`
+      + ` title="${esc(tip)}">${esc(label)}</th>`;
+  }
+  const dc = (FEED_SORT.key === key) ? (FEED_SORT.dir > 0 ? ' sort-asc' : ' sort-desc') : '';
+  return `<th class="${(cls ? cls + ' ' : '') + 'sortable' + dc}" data-fsort="${key}"`
+    + ` title="${esc(tip)}">${esc(label)}<span class="sarrow"></span></th>`;
+}
+
+/** 按交易日把 FEED_ITEMS 归组（保原相对顺序）—— 渲染与探针钩子**共用这一份口径**。 */
+function feedByDay(){
+  const m = {};
+  FEED_ITEMS.forEach(x => { (m[x.trade_date] = m[x.trade_date] || []).push(x); });
+  return m;
+}
+
+/** 屏幕上真正的显示顺序（交易日从新到旧、每天内部按当前排序）。探针拿它比对 DOM 行序。 */
+function feedView(){
+  const byDay = feedByDay();
+  return Object.keys(byDay).sort().reverse()
+    .reduce((a, d) => a.concat(feedSorted(byDay[d])), []);
+}
+
+/** 画触发记录：**一个表 + 一份表头**，交易日做成表内的分隔行 ——
+    多天时不重复铺一遍表头（7 天就重复 7 遍表头，看着像坏掉了）。 */
+function paintFeed(){
+  const items = FEED_ITEMS;
+  if (!items.length) {
+    $('#feed-list').innerHTML = '<div class="empty">本组暂无触发</div>';
+    return;
+  }
+  const byDay = feedByDay();
+  const head = feedTh('#', '__orig', '', '点击恢复原始顺序（按写入先后，新的在前）')
+    + feedTh('代码', 'ts_code') + feedTh('名称', 'name')
+    + feedTh('涨跌幅', 'pct_chg', 'num',
+             '该行触发那天的日涨跌幅（与自选股表同源）· 点击按它排序')
+    + '<th>提醒 · 说明</th><th>备注</th><th style="width:64px">操作</th>'
+    /* 2026-10-08 加：需求原话「触发提醒列表添加删除提醒字段，只删除触发提醒的提醒」。
+       贴着最右放（离「这行说的是谁」最远，误点概率最低），按钮走 `danger` 红。
+       ⚠ 探针/回归拿 `data-daid` 认这一列，别改成别的名字。 */
+    + '<th style="width:92px" title="删掉这条提醒本身（这只票这个条件以后不再提醒），它的历史触发记录一起清掉">'
+    + '删除提醒</th>';
+  const body = Object.keys(byDay).sort().reverse().map(day => `
+    <tr class="feed-sep"><td colspan="8"><div class="feed-day">${esc(day)}${
+      day === FEED_META.today ? ' <span class="tag ok">最新交易日</span>' : ''}</div></td></tr>
+    ${feedSorted(byDay[day]).map((x, i) => `<tr data-code="${esc(x.ts_code)}">
+        <td class="small muted">${i + 1}</td>
+        <td class="mono small" style="width:112px">${esc(x.ts_code)}</td>
+        <td style="width:90px">${esc(x.name || '—')}</td>
+        <td class="num ${esc(x.pct_cls || '')}">${esc(x.pct_text)}</td>
+        <td><span class="wchip on">${esc(x.kind === 'pool'
+              ? ((x.freq === 'weekly' ? '周K·' : '') + '选股命中·' + (x.pool_name || '选股策略'))
+              : ((x.freq_label && x.freq_label !== '日K' ? x.freq_label + '·' : '') + opLabel(x.op) + x.line_label))}</span>
+            <span class="small" style="margin-left:8px">${esc(x.message)}</span></td>
+        <td class="small muted" style="width:120px">${esc(x.note || '')}</td>
+        <td style="width:64px"><button class="btn sm" data-k="${esc(x.ts_code)}" data-d="${esc(x.trade_date)}" data-f="${esc(x.freq || 'daily')}" title="按这一天看（触发那天），图上能看到之后怎么走">K线</button></td>
+        <td style="width:92px"><button class="btn sm danger" data-daid="${x.alert_id}" title="删掉这条提醒本身（以后不再提醒）；它的历史触发记录一起清掉">删</button></td>
+      </tr>`).join('')}`).join('');
+  $('#feed-list').innerHTML =
+    `<table class="data"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+
+  // ⚠ 重画 = 整张表换新节点 ⇒ 底下的绑定**都要重挂**（C52：「重画必重挂」，漏一个就点不动了）。
+  // 点表头 → 换排序（本地重画，不请求）。⚠ 本地瞬时动作，不套 guardClick（C38）。
+  $$('#feed-list th[data-fsort]').forEach(th => th.onclick = () => {
+    const k = th.dataset.fsort;
+    if (k === '__orig') FEED_SORT = { key: '', dir: -1 };
+    else if (FEED_SORT.key === k) FEED_SORT.dir = -FEED_SORT.dir;
+    else FEED_SORT = { key: k, dir: FEED_TEXT_COLS[k] ? 1 : -1 };
+    paintFeed();
+  });
+  // ⚠ 锚点用**该条触发那一天**（不是今天）：这就是「看当日命中」，
+  //   图上「之后怎么走」也一并画出来（诊断页的 anchor 口径）。
+  $$('#feed-list [data-k]').forEach(b => b.onclick = () =>
+    klinePreview({ tsCode: b.dataset.k,
+                   name: (items.find(x => x.ts_code === b.dataset.k) || {}).name,
+                   /* ⚠ 周K 的命中点「K线」要**按周线打开**：拿日线图去看一条周K 命中，
+                      那根周线在图上根本不存在，等于白点。`freq:''` 会被 klinePreview
+                      的 keep() 丢掉（老行为不变）。 */
+                   params: { sel_only: '1', trade_date: b.dataset.d,
+                             freq: b.dataset.f === 'weekly' ? 'weekly' : '' } }));
+  /* 删「这条提醒」= 删掉产生这行命中的那条**规则**（`watch_alert`，走 /api/watch/alert/delete），
+     连带它**全部**触发记录一起清 —— 需求原话「只删除触发提醒的提醒」：只动提醒本身，
+     **不碰自选股**（这只票还在你自选里）、**不碰这只票的其他提醒**（一只票可以有好几条规则）。
+     ⚠ 同一条规则在这个区间里可能命中过好几天（`alert_id` 相同）⇒ 点哪一行删的都是**同一条规则**，
+       所以确认框要把「它在这张表里出现了 N 次，会一起消失」说清楚，不然用户以为只删了那一行。
+     ⚠ 提交类（写库 + 不可逆）⇒ 走 `guardClick`（C38）；删除一律先 `confirm`，
+       **取消 = 一条没删**（C28 那套：先问再做，别默默删掉）。
+     ⚠ 删完**两张表都要重画**：这张触发列表（它的命中行全没了）+ 自选股表
+       （那只票的「提醒」胶囊少一条）。漏了后者，用户会以为规则还在。 */
+  $$('#feed-list [data-daid]').forEach(b => b.onclick = guardClick(b, async () => {
+    const aid = +b.dataset.daid;
+    if (!aid) return;
+    const hit = items.filter(x => x.alert_id === aid);       // 同一规则在这张表里的所有行
+    const it = hit[0] || {};
+    const what = `「${it.name || it.ts_code || ''}」的 `
+      + `${it.freq_label && it.freq_label !== '日K' ? it.freq_label + '·' : ''}`
+      + `${it.op_label || ''}${it.line_label || ''}`;
+    // ⚠ 这是浏览器原生 `confirm`：里头**不能写字面量星号**（那是 markdown 的写法，
+    //   弹窗里会原样显示成 `**本身**`）。页面上的说明段是 HTML，可以用 <b>。
+    if (!confirm(`删除提醒：${what}？\n\n`
+      + `删的是这条提醒本身 —— 以后不再提醒；它的历史触发记录一起清掉。`
+      + (hit.length > 1 ? `\n（本列表里这条规则命中了 ${hit.length} 次，会一起消失。）` : '')
+      + `\n\n不会动自选股，也不会删这只票的其他提醒。`)) return;
+    const r = await post('/api/watch/alert/delete', { id: aid });
+    if (!r) return;
+    const res = r.result || {};
+    if (res.deleted) {
+      toast(`已删除提醒：${what}`
+        + (res.logs ? `（连带 ${res.logs} 条触发记录）` : '（还没有触发记录）'), 'ok');
+    } else {
+      // 别处已经删过了（比如那个票被移出所有分组，规则被顺带清掉）——
+      //   报「删掉了」是撒谎，直接刷新把真实状态摆出来。
+      toast('这条提醒已经不在了（可能在别处删过），列表已刷新');
+    }
+    await loadFeed();          // 本列表：这条规则留下的一串命中行全没了
+    await loadStocks();        // 自选股表的「提醒」列要跟着变
+  }));
+}
+
+async function loadFeed(){
+  const days = $('#feed-days').value;
+  /* ⚠ **只显示当前分组的记录**（需求原话：「触发提醒只展示当前分组的提醒」）。
+     过滤在**后端 SQL** 里做，这里把 `group_id` 带过去 —— 不能拉回来在本地筛：
+     这批数据已经被 `limit` 截过了，别的组的记录能把窗口占满，本地一筛就会把本组那几条
+     **静默筛没**（明明有命中，页面显示「暂无触发」）。与 `LIMIT 100` 截断是同一个坑。 */
+  if (!GID) {                                       // 一个组都没有 / 刚把它删了
+    FEED_ITEMS = []; FEED_GID = null; FEED_META = { today: '', days: [] };
+    FEED_SORT = { key: '', dir: -1 };
+    $('#feed-badge').textContent = '无';
+    $('#feed-list').innerHTML = '<div class="empty">先在左边选一个分组</div>';
+    $('#feed-note').textContent = '触发提醒跟着左边选中的分组走。';
+    return;
+  }
+  /* ⚠ 切组很快时，**先发的请求可能后到**，会把新组的记录盖成上一个组的 —— 序号对不上就丢。
+     这是这一页唯一会「连着发好几个同接口请求」的地方（点分组、点检测、加票都会触发）。 */
+  const seq = ++FEED_SEQ;
+  const gid = GID;
+  const d = await get('/api/watch/feed?days=' + days + '&limit=500&group_id=' + gid,
+                      $('#feed-list'), '触发提醒没取到');
+  if (!d || seq !== FEED_SEQ) return;
+  FEED_ITEMS = d.items || [];
+  FEED_GID = gid;
+  FEED_META = { today: d.today || '', days: d.days || [] };
+  FEED_SORT = { key: '', dir: -1 };     // 换组 / 换区间 / 重新取数 ⇒ 回到后端原顺序
+  const items = FEED_ITEMS;
+  const gn = grpName(gid);
+  $('#feed-badge').textContent = items.length ? items.length + ' 条' : '无';
+  $('#feed-note').textContent = items.length
+    ? `「${gn}」最近 ${days} 个交易日；判到 ${d.today} 为止（本库最新交易日）。最新一天：` +
+      (d.days[0] || '—') + ` 共 ${items.filter(x => x.trade_date === d.days[0]).length} 条。`
+    : `「${gn}」最近 ${days} 个交易日没有命中。设好规则后点「立即检测」；同步数据时也会自动跑一遍。`;
+  paintFeed();
+  const sum = d.summary || {};
+  if (STK_NOTE0 === null) STK_NOTE0 = $('#stk-note').innerHTML;   // 惰性存下 HTML 里的用法说明
+  $('#stk-note').innerHTML = STK_NOTE0 + `<br>最近一次检测：${esc(sum.last_check || '还没跑过')}。`;
+}
+
+/* 下拉换区间只是本地重查一次，**不加 guardClick**（C38：本地瞬时控件不锁） */
+$('#feed-days').onchange = loadFeed;
+
+/* 拖动中的浮标跟着鼠标走 —— `dragover` 是整场拖拽里唯一**持续**触发的事件，
+   拿它定位最省事（不用另起定时器）。 */
+document.addEventListener('dragover', e => {
+  if (!DRAG) return;
+  const t = $('#drag-tip');
+  if (t) { t.style.left = (e.clientX + 14) + 'px'; t.style.top = (e.clientY + 16) + 'px'; }
+});
+/* 拖到空白处放开：浏览器的规矩是「dragover 没被 preventDefault 的地方根本不发 drop」，
+   所以这里接到的多半是合成事件；真拖拽会走源行的 `dragend`。两条路都收一遍，
+   免得 `DRAG` 留到下一轮，把上一次那批票又拖一遍。 */
+document.addEventListener('drop', e => { if (DRAG && !e.defaultPrevented) endDrag(); });
+
+$('#btn-new-group').onclick = guardClick($('#btn-new-group'), async () => {
+  const name = prompt('新分组名：', '');
+  if (name === null || !name.trim()) return;
+  const r = await post('/api/watch/group/save', { name: name.trim() });
+  if (!r) return;
+  GID = r.id; toast('分组已创建', 'ok'); await loadGroups(); await loadStocks(); await loadFeed();
+});
+
+$('#btn-add-stock').onclick = guardClick($('#btn-add-stock'), async () => {
+  const raw = $('#add-code').value.trim();
+  if (!raw) { toast('先填代码或名称', 'warn'); return; }
+  if (!GID) { toast('先建一个分组', 'warn'); return; }
+  let codes = raw.replace(/[,，;；\s]+/g, ' ').split(' ').filter(Boolean);
+  // 名字（含中文）走搜索接口换成代码；纯代码原样交给后端（后端也认不带后缀的）
+  const named = codes.filter(c => /[^\d.A-Za-z]/.test(c) || !/^\d{6}(\.(SH|SZ|BJ))?$/i.test(c));
+  for (const q of named) {
+    const hit = await get('/api/stock/search?q=' + encodeURIComponent(q));
+    codes = codes.filter(c => c !== q);
+    if (hit && hit.length) codes.push(hit[0].ts_code);
+    else { toast('找不到「' + q + '」', 'err'); }
+  }
+  if (!codes.length) return;
+  const r = await post('/api/watch/stocks/add', { group_id: GID, codes: codes });
+  if (!r) return;
+  const x = r.result;
+  toast(`加入 ${x.added.length} 只` +
+        (x.dup.length ? `，${x.dup.length} 只已在组内` : '') +
+        (x.unknown.length ? `，认不出 ${x.unknown.join('、')}` : ''),
+        x.added.length ? 'ok' : 'warn');
+  if (x.added.length) $('#add-code').value = '';
+  // 新加的票进了本组 ⇒ 它的历史触发记录也该出现在下面那张表里（表按组筛）
+  await loadGroups(); await loadStocks(); await loadFeed();
+});
+
+$('#btn-check').onclick = guardClick($('#btn-check'), async () => {
+  const r = await post('/api/watch/check',
+                       { lookback: 1, days: +$('#feed-days').value, group_id: GID });
+  if (!r) return;
+  const x = r.result;
+  const split = (x.weekly_alerts || 0)
+    ? `（日K ${x.daily_fired || 0} 条 / 周K ${x.weekly_fired || 0} 条）` : '';
+  toast(`检测完 ${x.codes} 只 / ${x.alerts} 条规则，命中 ${x.fired} 条${split}`, 'ok', 5000);
+  await loadFeed(); await loadStocks();
+});
+
+/* 「布林下轨加提醒」：给**全部自选股**里「日K 在布林下轨」的票，各加一条
+   「日K 触及布林下轨」规则。
+   ⚠ **两步走** —— 先 `dry_run` 预演拿真实条数，摆进确认框，点了确认才真写。
+     扫 515 只要好几秒，而且这一步会一口气动上百条规则；不先报数就写，
+     用户点错一次得一条条删回去（备注虽能认出，也麻烦）。
+   ⚠ 走 guardClick：提交类动作 —— 连点两下会白扫两遍（第二遍幂等，但白等几秒）。
+   ⚠ 范围恒为**全部自选股**（跨组去重），**不是**当前 `GID` 那一组：
+     需求原话是「全部添加」。别顺手改成只扫当前组。
+   ⚠ 加完**不自动跑检测**：会不会当场就命中是另一件事（149 只都贴着下轨，
+     一检测多半全响），让用户自己按「立即检测」，别替他把「触发记录」刷满。 */
+$('#btn-boll-lower').onclick = guardClick($('#btn-boll-lower'), async () => {
+  const el = $('#btn-boll-lower'), old = el.textContent;
+  let pre = null;
+  el.textContent = '扫描中…';
+  try { pre = await post('/api/watch/alerts/boll_lower', { dry_run: 1 }); }
+  finally { el.textContent = old; }
+  if (!pre) return;
+  const r = pre.result;
+  if (!r.scanned) { toast('还没有自选股', 'warn'); return; }
+  if (!r.pending) {
+    toast(`扫了 ${r.scanned} 只，命中 ${r.matched} 只 —— 但都已经有这条规则了`, 'warn', 6000);
+    return;
+  }
+  const body = `<div class="small" style="line-height:1.95">
+    <div>扫的是<b>全部自选股</b>（${r.scanned} 只，跨分组去重），按本库最新交易日
+      <b>${esc(r.date)}</b> 那根日K 判。</div>
+    <div>「在布林下轨」= <b>布林位置 ≤ ${BOLL_POS}</b>（落在布林通道最下面
+      ${Math.round(BOLL_POS * 100)}%；跌破下轨时为负）。</div>
+    <div style="margin-top:6px">命中 <b>${r.matched}</b> 只 ⇒ 其中 <b>${r.pending}</b> 只还没有
+      这条规则，会给它们各加一条「<b>日K 触及布林下轨</b>」；
+      剩下 ${r.skipped} 只已经有，跳过。</div>
+    <div class="muted" style="margin-top:6px">新规则的备注写成「${esc(r.note)}」，
+      日后在提醒弹窗里一眼认得出是这一批。</div>
+    <div class="muted" style="margin-top:6px">⚠ 加完<b>不会自动检测</b> —— 想立刻看命中的这
+      ${r.matched} 只有没有碰到下轨，回头点上面的「立即检测」。</div>
+  </div>`;
+  const m = mkModal('布林下轨 · 批量加提醒', body,
+    `<button class="btn sm" data-close>取消</button>
+     <button class="btn sm primary" id="bl-go">给 ${r.pending} 只加提醒</button>`);
+  $('#bl-go').onclick = guardClick($('#bl-go'), async () => {
+    const res = await post('/api/watch/alerts/boll_lower', {});
+    if (!res) return;
+    const x = res.result;
+    m.close();
+    toast(`已给 ${x.added} 只加上「触及布林下轨」提醒` +
+          (x.skipped ? `，跳过已有 ${x.skipped} 只` : ''), 'ok', 6000);
+    await loadStocks();          // 刷新「提醒·N」角标与左边的「N 只设了提醒」
+  });
+});
+
+(async function init(){
+  await loadGroups();
+  await loadStocks();
+  await loadFeed();
+})();
+/* 探针钩子（回归脚本用；页面自己不用） */
+window.__watchDebug = {
+  state: () => ({ gid: GID, groups: GROUPS, stocks: STOCKS, alerts: ALERTS,
+                  pick: [...PICK], dragging: DRAG,
+                  sort: { key: STK_SORT.key, dir: STK_SORT.dir },
+                  view: stkSorted().map(s => s.ts_code),
+                  lines: LINES, ops: OPS, freqs: FREQS, freq_order: FREQ_ORDER,
+                  default_freq: DEF_FREQ, quick: QUICK,
+                  kinds: KINDS, kind_order: KIND_ORDER, default_kind: DEF_KIND,
+                  boll_pos: BOLL_POS, boll_note: BOLL_NOTE,
+                  feed_days: $('#feed-days').value, feed_meta: FEED_META,
+                  feed_group: FEED_GID,
+                  feed: FEED_ITEMS, feed_sort: { key: FEED_SORT.key, dir: FEED_SORT.dir },
+                  feed_view: feedView().map(x => x.ts_code),
+                  feed_day_seq: Object.keys(feedByDay()) }),
+  reload: async () => { await loadGroups(); await loadStocks(); await loadFeed(); },
+};
+</script>
+{% endblock %}

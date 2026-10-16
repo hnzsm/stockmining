@@ -1,0 +1,918 @@
+/* ============================================================================
+   全局主题（深色系）
+   ----------------------------------------------------------------------------
+   颜色**只在这里定义一次**，页面里一律引用 var(--xxx)，别再写死 hex ——
+   否则改主题就得满项目找颜色。两类例外，是有意保留的字面量：
+     1) 涨跌色 --up/--down（#e5352b / #12a06a）：中国习惯「涨红跌绿」，
+        与 ECharts 蜡烛、回测成交标记、tools 里的报告同源，**改主题也不动**，
+        验证脚本（tools/verify_monitor.py）对它做了断言；
+     2) 指标线配色（MA/BOLL/跳空）：属于「图表语义色」，定义在各自的图表配置里。
+   另外 color-scheme:dark 是必须的 —— 它让原生控件（日期选择器、下拉箭头、
+   复选框、滚动条）跟着一起变深，不然深色底上会冒出白底的日历浮层。
+   ============================================================================ */
+:root{
+  color-scheme:dark;
+
+  /* --- 表面（由深到浅三层，够用且不泛滥） --- */
+  --bg:#0d1117;          /* 页面底 */
+  --panel:#151a22;       /* 卡片 / 侧栏 / 顶栏 / 弹窗 */
+  --panel-2:#1b222c;     /* 次级表面：输入框、表头、弹层行、代码块 */
+  --panel-3:#212a36;     /* 交互态：hover 底、进度槽 */
+  --line:#2a3444;        /* 主描边 */
+  --line-2:#1f2733;      /* 弱描边 / 分隔线 */
+  --line-hi:#3a4863;     /* hover 描边 */
+
+  /* --- 文字 --- */
+  /* --text-3 是「弱化标签」用的，深色底上不能压太暗：#6f7b8f 只有 4.1:1，
+     提到 #7b8ba3 才有 5.1:1（深色主题最容易踩的坑就是"灰字看不见"）。 */
+  --text:#e6ebf4; --text-2:#9aa6ba; --text-3:#7b8ba3;
+
+  /* --- 品牌 ---
+     --brand 是「深底上的强调色」，要**亮**（做文字、线、描边）；
+     实心按钮的底不能用它 —— 白字压在 #4b83ff 上只有 3.5:1，眼睛累，
+     所以**另给一档压暗的 --brand-solid 专门做填充**（白字 5.7:1）。
+     同一个蓝在深色系里必须分成两个角色，这是这次验收时实测出来的。 */
+  --brand:#4b83ff; --brand-2:#82aaff; --brand-soft:#17243d; --brand-line:#2a3f66;
+  --brand-solid:#2c60d2; --brand-solid-hi:#3568dd;
+
+  /* --- 涨跌 / 状态（值不动：与蜡烛、策略口径一致） --- */
+  --up:#e5352b; --down:#12a06a; --warn:#e0a13c; --danger:#ef5a5a;
+  /* 状态浅底：标签、提示条、异常格用它当背景（深色版"浅底"） */
+  --up-soft:#2c1b1a;   --up-line:#54302b;
+  --down-soft:#122720;  --down-line:#22493b;
+  --warn-soft:#2a2317;  --warn-line:#4d3d1f;
+
+  /* --- 其它 --- */
+  --terminal:#0a0e14;    /* 控制台 / 日志框底（比 --bg 还深一档） */
+  --overlay:rgba(3,6,11,.66);
+  --radius:10px; --radius-s:7px;
+  --shadow:0 1px 2px rgba(0,0,0,.5),0 8px 20px rgba(0,0,0,.32);
+  --mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;height:100%}
+body{
+  background:var(--bg); color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  font-size:13.5px; line-height:1.6; -webkit-font-smoothing:antialiased;
+}
+a{color:var(--brand);text-decoration:none}
+h1,h2,h3,h4{margin:0;font-weight:600}
+table{border-collapse:collapse;width:100%}
+::selection{background:rgba(75,131,255,.32)}
+/* 滚动条：默认的太亮，统一压暗（细、无按钮） */
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#2e3949;border-radius:5px;border:2px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-thumb:hover{background:#3c4a5e;background-clip:content-box}
+
+/* ---------- layout ---------- */
+.layout{display:flex;min-height:100vh}
+.sidebar{
+  width:212px;flex:0 0 212px;background:var(--panel);border-right:1px solid var(--line);
+  display:flex;flex-direction:column;position:sticky;top:0;height:100vh;
+}
+.brand{display:flex;gap:10px;align-items:center;padding:16px 14px 14px;border-bottom:1px solid var(--line-2)}
+.brand-mark{
+  width:34px;height:34px;border-radius:9px;flex:0 0 34px;
+  background:linear-gradient(135deg,#2c60d2,#7048e8);color:#fff;
+  display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;letter-spacing:.5px;
+  box-shadow:0 2px 10px rgba(61,123,255,.35);
+}
+.brand-name{font-size:13.5px;font-weight:600;line-height:1.3}
+.brand-sub{font-size:10.5px;color:var(--text-3);letter-spacing:.2px}
+.nav{padding:10px 8px;display:flex;flex-direction:column;gap:2px;flex:1}
+.nav-item{
+  display:flex;align-items:center;gap:9px;padding:8px 11px;border-radius:var(--radius-s);
+  color:var(--text-2);font-size:13px;transition:.13s;
+}
+.nav-item .ico{width:16px;text-align:center;font-size:13px;opacity:.75}
+.nav-item:hover{background:var(--panel-2);color:var(--text)}
+.nav-item.active{background:var(--brand-soft);color:var(--brand-2);font-weight:600}
+.nav-item.active .ico{opacity:1}
+.side-foot{padding:10px 14px 14px;border-top:1px solid var(--line-2);font-size:11.5px}
+.side-stat{display:flex;justify-content:space-between;padding:3px 0}
+.side-stat .k{color:var(--text-3)}
+.side-stat .v{color:var(--text-2);font-family:var(--mono);font-size:11px}
+
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.topbar{
+  background:var(--panel);border-bottom:1px solid var(--line);padding:13px 22px;
+  display:flex;justify-content:space-between;align-items:flex-end;gap:16px;
+  position:sticky;top:0;z-index:20;
+}
+.page-title{font-size:17px;letter-spacing:-.2px}
+.page-desc{margin:2px 0 0;font-size:12px;color:var(--text-3)}
+.topbar-right{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+.pill{
+  background:var(--panel-2);border:1px solid var(--line);border-radius:20px;
+  padding:3px 11px;font-size:11.5px;color:var(--text-2);white-space:nowrap;
+}
+.pill.ok{border-color:var(--down-line);background:var(--down-soft);color:#3fbc8a}
+.pill.bad{border-color:var(--up-line);background:var(--up-soft);color:#ff7b70}
+.content{padding:18px 22px 46px;flex:1}
+
+/* 预览模式（/stock/<代码>?embed=1）：被「K线预览弹窗」当同源 iframe 嵌进去时只留内容区。
+   这里**只改看不看得见**，不改取数与任何图表逻辑 —— 弹窗里必须是诊断页同一份实现。
+   另外三块卡片（查询条件 / 筹码两融 / 信号明细）由 stock.html 自己在 embed 下隐藏。 */
+.embed .sidebar, .embed .topbar{display:none}
+.embed .content{padding:0}
+
+/* K线预览弹窗：内嵌诊断页预览模式。高度按弹窗可用高度算（modal 是 88vh，
+   减掉标题栏/页脚/内边距），让 iframe 自己滚，别把弹窗顶出屏幕。 */
+.kl-frame{width:100%;height:calc(88vh - 132px);border:0;border-radius:var(--radius-s);background:var(--panel)}
+
+/* ---------- cards ---------- */
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);margin-bottom:16px;overflow:hidden}
+.card-head{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid var(--line-2);background:linear-gradient(#1a212c,#151a22)}
+.card-title{font-size:13.5px;font-weight:600;display:flex;align-items:center;gap:7px}
+.card-title .tag{font-weight:400;font-size:11px;color:var(--text-3)}
+.card-body{padding:16px}
+.card-body.tight{padding:10px 12px}
+/* 长列表分页条（表格下方一行：左边「第 x–y 条 · 共 N 条」，右边翻页按钮）。
+   只有一页时后端不渲染它（`pagerHtml` 直接返回空串），所以不用管「单页也占一行」的问题。 */
+.pager{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;
+  margin-top:10px;padding-top:10px;border-top:1px solid var(--line-2)}
+.pager-btns{display:flex;align-items:center;gap:6px}
+.pager-cur{min-width:54px;text-align:center;font:600 12px/1 var(--mono);color:var(--text-2)}
+
+/* 回测记录列表：状态格里的进度百分比（跟在 running 标签后面） */
+.st-pct{margin-left:6px;font:600 11.5px/1 var(--mono);color:var(--text-2)}
+
+/* 回测记录表：14 列（比别的表多两条），比 .data.sm 再挤一点内边距才放得下。
+   只给这张表加 .runs-tbl，**不动 .sm 本身** —— 那会连带改掉别页的表格密度。 */
+/* 6px 而不是 7px：跑着的那条状态格会多出「20%」这 27px，留够这点余量才不会一跑就横向滚 */
+table.data.sm.runs-tbl td,table.data.sm.runs-tbl th{padding:3px 6px}
+
+/* 策略列第二行（回测名）与股票池列：都可能 20+ 字 → 截断（回测名靠 title、池名靠浮层看全）。
+   不截它们，列会自己长到 230px，把「状态 / 操作」挤出卡片（按钮就点不到了）。
+   两列都截住，这张表的宽度才是**有上界**的 —— 将来池子改个更长的名字也不会哪天突然溢出。
+   2026-10-04：操作列多了个「重测」（2 个按钮 → 3 个），1500 视口下实测溢出 58px ⇒
+   这三处截断宽度一起收窄（144→122、140→106），收窄后溢出 0。改这几个数之前先量一次。 */
+.run-name{max-width:122px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* ⚠ 池名是 <span>，要 inline-block 才认 max-width；但策略列第二行是 <div>，**不能**给它
+   inline-block —— 那会跟上面那行策略名挤进同一个行盒，列宽反而涨到 237px（实测踩过）。 */
+.pool-name{display:inline-block;max-width:122px;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;vertical-align:bottom}
+
+/* 「回测配置」列：一行截断，悬浮看全部。截断靠 ellipsis（DOM 里仍是完整 JSON，
+   所以复制得走浮层/接口，别指望选中单元格文字 —— 这里只负责「一眼看不清就来这一手」） */
+.json-cell{display:inline-block;max-width:96px;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;vertical-align:bottom;
+  font-family:var(--mono);font-size:11.5px;color:var(--text-2)}
+/* 悬浮看全的单元格（回测配置的 JSON、股票池的选股条件）：装饰与 cursor 共用一套，
+   宽度和截断由各列自己定（.json-cell / .pool-name），浮层代码在 backtest.html 的 bindCellTips。
+   ⚠ 这里**只放不改布局宽度**的装饰（border/color）：这张表 14 列的宽度是掐着算收口的。 */
+.tip-cell{cursor:help;border-bottom:1px dotted var(--line)}
+.tip-cell:hover{color:var(--text)}
+/* 浮层：fixed + 视口坐标（表格所在的 .card 是 overflow:hidden，absolute 会被裁掉），
+   与自动补全弹层 .ac-pop 同一套做法 */
+.json-pop{position:fixed;z-index:9000;max-width:560px;max-height:340px;overflow:auto;
+  background:var(--panel-2);border:1px solid var(--line);border-radius:var(--radius-s);
+  box-shadow:0 10px 30px rgba(0,0,0,.6);padding:9px 11px;
+  font-family:var(--mono);font-size:11.5px;line-height:1.6;white-space:pre;color:var(--text-2)}
+.grid{display:grid;gap:14px}
+.g2{grid-template-columns:repeat(2,minmax(0,1fr))}
+.g3{grid-template-columns:repeat(3,minmax(0,1fr))}
+.g4{grid-template-columns:repeat(4,minmax(0,1fr))}
+.g5{grid-template-columns:repeat(5,minmax(0,1fr))}
+@media(max-width:1180px){.g4,.g5{grid-template-columns:repeat(2,minmax(0,1fr))}.g3{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:820px){.g2,.g3,.g4,.g5{grid-template-columns:1fr}.sidebar{display:none}}
+
+/* ---------- stat ---------- */
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:13px 15px;box-shadow:var(--shadow)}
+.stat .label{font-size:11.5px;color:var(--text-3);display:flex;justify-content:space-between;gap:6px}
+.stat .value{font-size:21px;font-weight:650;margin-top:5px;font-variant-numeric:tabular-nums;letter-spacing:-.4px}
+.stat .sub{font-size:11px;color:var(--text-3);margin-top:2px}
+.stat.accent .value{color:var(--brand-2)}
+/* 基本面卡片：6 个「标签 值」成对铺成两列（3 行），高度跟旁边的 stat 卡大致齐平。
+   标签/值都来自后端 fundamental.items，前端不挑字段、不算单位。 */
+.stat .fund{display:grid;grid-template-columns:auto 1fr auto 1fr;gap:2px 8px;margin-top:6px}
+.stat .fund span{font-size:11px;color:var(--text-3);white-space:nowrap}
+.stat .fund b{font-size:12.5px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap}
+.up{color:var(--up)!important} .down{color:var(--down)!important} .flat{color:var(--text-3)!important}
+
+/* 筹码卡片（股东户数 / 融资融券）：主数 + 4 个「标签 值」+ 趋势图。
+   和页头 .stat 同一套排版，但在 card 里**不能再套一层卡片底色**（会像卡中卡），
+   所以这里是同栅格、无边框的版本。文本全部来自后端 core/chips.py。 */
+.chip-hero{font-size:21px;font-weight:650;font-variant-numeric:tabular-nums;letter-spacing:-.4px}
+.chip-hero small{font-size:11px;color:var(--text-3);font-weight:400;margin-left:7px;letter-spacing:0}
+.chip-head{display:grid;grid-template-columns:auto 1fr auto 1fr;gap:3px 10px;margin-top:6px}
+.chip-head .lb{font-size:11px;color:var(--text-3);white-space:nowrap}
+.chip-head b{font-size:12.5px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap}
+/* 股东名称可以很长（含"XX创业投资合伙企业(有限合伙)"这种），别把表格撑爆 */
+.chip-holder{max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* 所属概念（个股诊断页，东财 F10 题材）：标签云 + 下方展开的入选理由。
+   与筹码卡片同一套规矩 —— 名字、涨跌幅文本、涨跌色都由后端 core/concept.py 算好，
+   这里只管排版（别在 JS 里判正负）。点标签**不弹浮层**：入选理由动辄两三百字，
+   浮层要么被卡片裁掉要么糊住整页，内联展开区最稳。 */
+.cpt-wrap{display:flex;flex-wrap:wrap;gap:6px;min-height:24px}
+.cpt{display:inline-flex;align-items:baseline;gap:6px;padding:2px 9px;border-radius:6px;
+     background:var(--panel-2);border:1px solid var(--line);color:var(--text-2);
+     font-size:12.5px;line-height:1.75;cursor:pointer;transition:.12s;user-select:none}
+.cpt:hover{border-color:var(--line-hi);color:var(--text)}
+.cpt.on{background:var(--brand-soft);border-color:var(--brand-line);color:var(--brand-2)}
+.cpt s{text-decoration:none;font-size:11.5px;font-variant-numeric:tabular-nums}
+.cpt-pop{margin-top:10px;padding:9px 11px;border-radius:var(--radius-s);
+         background:var(--panel-2);border:1px solid var(--line);
+         font-size:12.5px;line-height:1.75;color:var(--text-2)}
+.cpt-pop .rsn{margin-top:5px;color:var(--text-2)}
+.cpt-more{margin-top:9px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+
+/* 开盘形态概率（个股诊断页，core/openstat.py）：四格「标签 / 概率 / n-N 次数」。
+   ⚠ 2026-10-09 起它**顶替了「最新收盘」那一栏**（原读数已并进「股票」卡）。
+   2026-10-09 用户要求：四格**排成一行**（4 列 × 1 行），不再折成 2 列 × 2 行。
+   ⚠⚠ 一行只有 `.g4` 一栏（≈292px）÷ 4 = **每格 ≈56px**（扣内边距后内容区仅 ≈40px），
+      所以字号/内边距/字距都必须再收一档 —— 4 列一摆，「高开3%」「100.0%」「6 / 260 次」
+      里**最长的那条**（`6 / 260 次` ≈46px）会把格子挤破（实测溢出 `46>40`）。
+      三条一起收：`padding` 8→4px、`-val` 17→14px、`-sub` 10.5→9.5px + 负字距。
+   ⚠ 改这里必须同步探针那条「四格排成一行后没被挤爆」的几何断言（它量 scrollWidth）。
+   概率与颜色都由后端算好，前端只铺格子（同筹码、概念的做法）。 */
+.open-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin-top:6px}
+.open-cell{padding:4px 4px;border-radius:var(--radius-s);
+           background:var(--panel-2);border:1px solid var(--line);overflow:hidden}
+.open-cell .open-lab{font-size:10.5px;color:var(--text-3);white-space:nowrap;
+                     letter-spacing:-.2px}
+.open-cell .open-val{font-size:14px;font-weight:650;font-variant-numeric:tabular-nums;
+                     letter-spacing:-.5px;margin-top:1px}
+.open-cell .open-sub{font-size:9.5px;color:var(--text-3);font-variant-numeric:tabular-nums;
+                     margin-top:1px;white-space:nowrap;letter-spacing:-.3px}
+/* 成分股弹窗（双击概念标签）：顶部工具栏 = 口径小字 + 排序 / 显示全部。
+   ⚠ 排序是**回后端重排**，不是排已回的那 100 只 —— 否则「涨跌幅前 100」会被
+   误读成「全概念前 100」（总数与涨跌家数都在后端一起算）。 */
+.cpt-bar{display:flex;justify-content:space-between;align-items:center;gap:10px;
+         flex-wrap:wrap;margin-bottom:10px}
+.cpt-ord{display:flex;gap:6px;flex-wrap:wrap}
+
+/* ---------- 我的关注（自选分组 / 自选股 / 提醒） ---------- */
+/* 侧栏角标：新命中的提醒条数。压在图标行右侧，不占额外高度。 */
+.nav-badge{margin-left:auto;min-width:17px;height:17px;line-height:17px;text-align:center;
+  padding:0 5px;border-radius:9px;background:var(--up);color:#fff;font-size:10.5px;font-weight:600}
+/* 分组行（左栏）：名字 + 计数 + 悬停才出现的操作按钮，避免每行两个按钮把列表挤乱 */
+.grp{display:flex;align-items:center;gap:8px;padding:7px 9px;border-radius:var(--radius-s);
+  cursor:pointer;transition:.12s;font-size:12.5px;color:var(--text-2)}
+.grp:hover{background:var(--panel-2)}
+.grp.on{background:var(--brand-soft);color:var(--text);box-shadow:inset 0 0 0 1px var(--brand-line)}
+.grp .nm{font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.grp .ct{margin-left:auto;font-size:11px;color:var(--text-3);white-space:nowrap}
+.grp .acts{display:none;gap:2px}
+.grp:hover .acts{display:flex}
+.grp .acts .btn{padding:1px 6px;font-size:11px}
+/* ---------- 自选股拖到分组上换组（2026-10-08） ----------
+   拖动时**只在鼠标划过的那一行**展开左右两个投放区（「移动到 / 复制到」）——
+   31 个组全部展开会糊成一片，也看不出到底拖到了哪儿。
+   两半各占行宽 50%，判定用 `clientX` 与行左沿的距离，**不用 offsetX**：
+   offsetX 是相对**事件目标**算的，鼠标划过行里的 <span> 时它突然变小，判定会跳。 */
+.grp{position:relative}
+.grp .dz{position:absolute;inset:0;display:none;z-index:4;overflow:hidden;
+  border-radius:var(--radius-s);background:var(--panel-3);
+  box-shadow:inset 0 0 0 1px var(--brand-line)}
+.grp.hot .dz{display:flex}
+.grp .dz .dzb{flex:1;min-width:0;display:flex;align-items:center;justify-content:center;
+  padding:0 6px;font-size:11px;color:var(--text-3);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;transition:.08s}
+.grp .dz .dzb + .dzb{border-left:1px solid var(--line)}
+.grp .dz .dzb.on{background:var(--brand-soft);color:var(--brand-2);font-weight:600}
+.grp.hot,body.dragging .grp{cursor:copy}
+body.dragging{cursor:grabbing}
+/* 勾选态：整行浅底 + 左沿一条竖条，「这几只待会儿要一起拖」一眼可见 */
+table.data tbody tr.picked{background:var(--brand-soft)}
+table.data tbody tr.picked td:first-child{box-shadow:inset 3px 0 0 var(--brand)}
+table.data tbody tr.dragging{opacity:.42}
+/* 「已选 N 只」操作条 */
+.stk-sel{display:none;align-items:center;gap:10px;padding:6px 10px;margin:0 0 9px;
+  border:1px solid var(--brand-line);background:var(--brand-soft);border-radius:var(--radius-s);
+  font-size:11.5px;color:var(--text-2)}
+.stk-sel.on{display:flex}
+.stk-sel b{color:var(--brand-2)}
+/* 拖动中的浮标：fixed 跟鼠标；pointer-events:none —— 不然它会自己抢走 dragover */
+#drag-tip{position:fixed;left:0;top:0;z-index:9999;display:none;pointer-events:none;
+  padding:4px 9px;border-radius:6px;font-size:11.5px;white-space:nowrap;
+  background:var(--panel-3);color:var(--text);border:1px solid var(--brand-line);
+  box-shadow:0 8px 22px rgba(0,0,0,.5)}
+#drag-tip.on{display:block}
+/* 提醒规则的小胶囊：启用的正常色、暂停的压暗（带删除线的观感靠透明度就够，别真加线） */
+.wchip{display:inline-block;padding:1px 7px;margin:1px 3px 1px 0;border-radius:5px;
+  background:var(--panel-2);border:1px solid var(--line);color:var(--text-2);font-size:11.5px}
+.wchip.on{background:var(--brand-soft);border-color:var(--brand-line);color:#a9c3ff}
+.wchip.off{opacity:.42}
+/* 触发记录按交易日分组的日期行 */
+.feed-day{margin:9px 0 3px;font-size:11.5px;color:var(--text-3);font-family:var(--mono)}
+.feed-day:first-child{margin-top:2px}
+/* 自选股表「代码」列 → 点开个股诊断页（新标签）。
+   `table.data td.mono` 已经设了等宽字与 text-2 色，这里只做「可点」的观感：
+   悬停变品牌色 + 下划线。别用 <button>/JS 跳转 —— <a href> 才能新标签打开、
+   也天然免疫「表重画后绑定丢失」（C52 那条坑）。 */
+.stk-code{color:inherit;text-decoration:none;cursor:pointer;
+  border-bottom:1px dashed transparent;transition:.12s}
+.stk-code:hover{color:var(--brand-2);border-bottom-color:var(--brand-line)}
+/* 总览「触发提醒」表的**票名** → 点开 K线预览（2026-10-11 起不再单摆一个「K线」按钮：
+   名字本身就是入口，顺带省掉一列）。观感与上面 `.stk-code` 保持一致：悬停变品牌色 + 虚线下划线。 */
+.wf-k{cursor:pointer;border-bottom:1px dashed transparent;transition:.12s}
+.wf-k:hover{color:var(--brand-2);border-bottom-color:var(--brand-line)}
+/* 表内的「日期分隔行」：只是个标题，不参与行悬停高亮（否则鼠标一过整条变蓝很像一行数据） */
+table.data tr.feed-sep>td{padding:6px 10px 2px;border-bottom:0}
+table.data tr.feed-sep:hover>td{background:transparent}
+
+/* ---------- 总览 · 东财新概念卡片 ---------- */
+/* 一行一个概念：标题行（名字 + 年龄 + 板块号 + 创建时间）/ 代表股 / 简介。
+   简介用两行截断（-webkit-line-clamp），完整原文挂在 title 上 —— 卡片高度才可控。 */
+.nc-item{padding:9px 2px;border-bottom:1px solid var(--line)}
+.nc-item:last-child{border-bottom:0}
+.nc-h{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.nc-h b{font-size:13px;color:var(--text)}
+.nc-s{display:flex;flex-wrap:wrap;gap:5px;margin:5px 0 4px}
+.nc-k{display:inline-flex;align-items:baseline;gap:5px;padding:1px 8px;border-radius:5px;
+  background:var(--panel-2);border:1px solid var(--line);color:var(--text-2);
+  font-size:11.5px;cursor:pointer;transition:.12s}
+.nc-k:hover{border-color:var(--brand-line);color:var(--text)}
+.nc-k i{font-style:normal}
+.nc-p{font-size:11.5px;color:var(--text-3);line-height:1.65;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+
+/* ---------- form ---------- */
+.field:last-child{margin-bottom:0}
+label.lb{display:block;font-size:12px;color:var(--text-2);margin-bottom:5px;font-weight:500}
+label.lb .hint{color:var(--text-3);font-weight:400;font-size:11px;margin-left:5px}
+input[type=text],input[type=number],input[type=date],input[type=password],select,textarea{
+  width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:var(--radius-s);
+  background:var(--panel-2);color:var(--text);font-size:13px;font-family:inherit;outline:none;transition:.13s;
+}
+input::placeholder,textarea::placeholder{color:var(--text-3)}
+input:hover,select:hover,textarea:hover{border-color:var(--line-hi)}
+input:focus,select:focus,textarea:focus{border-color:var(--brand);box-shadow:0 0 0 3px rgba(75,131,255,.18)}
+select option{background:var(--panel-2);color:var(--text)}
+textarea{font-family:var(--mono);font-size:12.5px;line-height:1.7;resize:vertical;min-height:64px}
+input[type=number]{font-variant-numeric:tabular-nums}
+.row{display:flex;gap:10px;flex-wrap:wrap}
+.row>*{flex:1;min-width:130px}
+.row.tight>*{min-width:90px}
+.chk{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--text-2);cursor:pointer;user-select:none}
+.chk input{width:auto;margin:0;accent-color:var(--brand)}
+
+/* ---------- button ---------- */
+.btn{
+  display:inline-flex;align-items:center;justify-content:center;gap:6px;
+  padding:7px 15px;border-radius:var(--radius-s);border:1px solid var(--line);
+  background:var(--panel-2);color:var(--text);font-size:13px;font-family:inherit;cursor:pointer;
+  transition:.13s;white-space:nowrap;
+}
+.btn:hover{border-color:var(--line-hi);background:var(--panel-3)}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn.primary{background:var(--brand-solid);border-color:var(--brand-solid);color:#fff;font-weight:500}
+.btn.primary:hover{background:var(--brand-solid-hi);border-color:var(--brand-solid-hi)}
+.btn.danger{color:#ff8a80;border-color:var(--up-line)}
+.btn.danger:hover{background:var(--up-soft)}
+.btn.sm{padding:4px 10px;font-size:12px}
+.btn.ghost{background:transparent;border-color:transparent;color:var(--text-2);padding:4px 8px}
+.btn.ghost:hover{background:var(--panel-2);color:var(--text)}
+
+/* ---------- table ---------- */
+.tbl-wrap{overflow:auto;max-height:none}
+table.data{font-size:12.5px}
+table.data th{
+  text-align:left;padding:8px 10px;background:var(--panel-2);color:var(--text-2);
+  font-weight:600;font-size:11.5px;border-bottom:1px solid var(--line);
+  position:sticky;top:0;z-index:2;white-space:nowrap;
+}
+table.data td{padding:7px 10px;border-bottom:1px solid var(--line-2);white-space:nowrap}
+table.data tbody tr:hover{background:var(--panel-2)}
+table.data td.num{text-align:right;font-variant-numeric:tabular-nums;font-family:var(--mono);font-size:12px}
+table.data th.num{text-align:right}
+/* ---------- 可排序表头 ---------- */
+table.data th.sortable{cursor:pointer;user-select:none}
+table.data th.sortable:hover{background:var(--panel-3);color:var(--text)}
+table.data th.sortable .sarrow::after{content:'⇅';font-size:9px;margin-left:3px;opacity:.3}
+table.data th.sortable:hover .sarrow::after{opacity:.65}
+table.data th.sort-asc,table.data th.sort-desc{color:var(--brand-2)}
+table.data th.sort-asc .sarrow::after{content:'▲';font-size:8px;color:var(--brand-2);opacity:1}
+table.data th.sort-desc .sarrow::after{content:'▼';font-size:8px;color:var(--brand-2);opacity:1}
+table.data td.mono{font-family:var(--mono);font-size:11.5px;color:var(--text-2)}
+.empty{padding:34px 20px;text-align:center;color:var(--text-3);font-size:12.5px}
+
+/* ============================================================================
+   全站「正在取数」指示 + 容器状态块 + 按钮忙碌态
+   （2026-10-10 需求：查不到要报错、请求要有加载中效果，且**每一页**都要有）
+
+   三件东西都放在这一处、由 app.js 驱动（busyInc/boxState/guardClick）：
+     · #busy-bar  —— 任何页面打 /api 时顶部走一条细线
+     · .box-st    —— 列表卡「取数中 / 取失败 / 没数据」的统一样式
+     · .is-busy   —— 提交类按钮锁住期间转圈
+   页面模板一律不再各写一套（各写一套必然有漏的页面，也正是这次的起因）。
+   ============================================================================ */
+
+/* 顶部细进度条：不确定进度（一条光带来回跑）。
+   ⚠ 跑效用 `background-position` 而不是 `transform: translateX(...)` ——
+     位移会把这根 <i> 真正推出父容器，`verify_layout.py` 的「没有元素压出父元素」
+     当场报红（实测 3 个视口宽度各红一条）。背景位移不参与布局，rect 恒等于容器。
+   fixed 定位 → 弹窗预览（?embed=1 的同源 iframe）里也照样有。 */
+#busy-bar{position:fixed;top:0;left:0;right:0;height:2px;z-index:10000;pointer-events:none;
+  opacity:0;transition:opacity .18s;overflow:hidden}
+#busy-bar.on{opacity:1}
+#busy-bar i{display:block;height:100%;width:100%;border-radius:2px;
+  background:linear-gradient(90deg,transparent,var(--brand),var(--brand-2),transparent);
+  background-size:40% 100%;background-repeat:no-repeat;
+  animation:busy-run 1.05s linear infinite}
+@keyframes busy-run{from{background-position:-45% 0}to{background-position:145% 0}}
+
+/* 转圈（按钮忙碌态与「加载中」状态块共用一份） */
+.spin{display:block;width:16px;height:16px;border-radius:50%;
+  border:2px solid var(--line);border-top-color:var(--brand);
+  animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* 容器状态块：由 app.js 的 boxState()/boxHTML() 生成 */
+.box-st{padding:30px 20px;text-align:center;color:var(--text-3);font-size:12.5px}
+.box-st .box-ico{display:block;font-size:22px;line-height:1.2;margin-bottom:8px;opacity:.4}
+.box-st .box-t{font-size:13px;color:var(--text-2)}
+.box-st .box-d{margin-top:6px;font-size:12px;color:var(--text-3);word-break:break-all}
+.box-st.loading .spin{margin:0 auto 10px}
+.box-st.error .box-ico{opacity:.95;color:var(--danger)}
+.box-st.error .box-t{color:var(--danger)}
+.box-st.empty .box-ico{opacity:.5}
+
+/* 提交类按钮忙碌中。⚠ 不用 `el.disabled` 那套灰到底的观感来当唯一反馈 ——
+   「同步」这种要跑几分钟的按钮，灰得不透明的样子像"点坏了"，转个圈才像"在干活"。 */
+button.is-busy{opacity:.82;cursor:progress}
+button.is-busy::after{content:'';display:inline-block;vertical-align:-1px;width:9px;height:9px;
+  margin-left:7px;border-radius:50%;border:1.5px solid rgba(255,255,255,.32);
+  border-top-color:#fff;animation:spin .7s linear infinite}
+
+/* toast 可点掉（app.js 里绑了 click；错误提示默认停留更久，见那个函数） */
+.toast{cursor:pointer}
+
+/* 诊断页的查询状态区（#st-status）：贴在「查询条件」卡下面的一条独立提示，
+   不是列表卡里那种内嵌块 —— 所以给它自己的面板底色与描边。
+   ⚠ 空着时整条收掉（`:empty`），否则查询成功后会在卡片之间留一截空白。 */
+#st-status{margin-bottom:14px}
+#st-status:empty{display:none}
+#st-status .box-st{padding:22px 20px;border:1px solid var(--line);
+  border-radius:var(--radius);background:var(--panel)}
+#st-status .box-st.loading{border-style:dashed}
+#st-status .box-st.loading .box-t{color:var(--text-2)}
+#st-status .box-st.error{border-color:var(--danger)}
+.empty .big{font-size:26px;display:block;margin-bottom:8px;opacity:.35}
+
+/* ---------- misc ---------- */
+.tag{display:inline-block;padding:1px 7px;border-radius:5px;font-size:11px;background:var(--panel-2);border:1px solid var(--line);color:var(--text-2)}
+.tag.b{background:var(--brand-soft);border-color:var(--brand-line);color:var(--brand-2)}
+.tag.g{background:var(--down-soft);border-color:var(--down-line);color:#3fbc8a}
+.tag.r{background:var(--up-soft);border-color:var(--up-line);color:#ff7b70}
+.tag.y{background:var(--warn-soft);border-color:var(--warn-line);color:#e2b25f}
+.muted{color:var(--text-3)}
+.mono{font-family:var(--mono)}
+.small{font-size:11.5px}
+.hr{height:1px;background:var(--line-2);margin:14px 0}
+.flex{display:flex;gap:10px;align-items:center}
+.flex.between{justify-content:space-between}
+.flex.wrap{flex-wrap:wrap}
+.spacer{flex:1}
+.nowrap{white-space:nowrap}
+
+/* progress */
+.progress{height:6px;background:var(--panel-3);border-radius:4px;overflow:hidden}
+.progress>i{display:block;height:100%;background:linear-gradient(90deg,var(--brand),#8b5cf6);width:0;transition:width .3s;border-radius:4px}
+/* 日志框：比页面底再深一档，像终端；文字用冷灰蓝，长行可滚 */
+.logbox{
+  background:var(--terminal);color:#a9bdd8;border:1px solid var(--line-2);border-radius:var(--radius-s);padding:10px 12px;
+  font-family:var(--mono);font-size:11.5px;line-height:1.65;max-height:230px;overflow:auto;white-space:pre-wrap;
+}
+
+/* condition editor */
+.cond-list{display:flex;flex-direction:column;gap:6px}
+.cond-row{display:flex;gap:7px;align-items:flex-start}
+.cond-row textarea{min-height:38px;height:38px;padding:8px 10px;flex:1}
+.cond-idx{width:20px;flex:0 0 20px;text-align:right;color:var(--text-3);font-size:11.5px;padding-top:10px;font-family:var(--mono)}
+.cond-row .ok{color:var(--down);padding-top:9px;font-size:12px;width:14px;text-align:center}
+.cond-row .bad{color:var(--danger);padding-top:9px;font-size:12px;width:14px;text-align:center}
+.add-cond{padding:6px 12px;border:1px dashed var(--line);border-radius:var(--radius-s);color:var(--text-2);font-size:12.5px;cursor:pointer;text-align:center;transition:.13s;background:var(--panel-2)}
+.add-cond:hover{border-color:var(--brand);color:var(--brand-2);background:var(--brand-soft)}
+
+/* tabs */
+.tabs{display:flex;gap:3px;border-bottom:1px solid var(--line);margin-bottom:14px;overflow-x:auto}
+.tab{padding:7px 14px;font-size:13px;color:var(--text-2);cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap;transition:.13s}
+.tab:hover{color:var(--text)}
+.tab.active{color:var(--brand-2);border-color:var(--brand);font-weight:600}
+
+/* strategy card */
+.strat-item{display:flex;justify-content:space-between;gap:12px;padding:11px 14px;border:1px solid var(--line);border-radius:var(--radius-s);margin-bottom:8px;background:var(--panel-2);transition:.13s}
+.strat-item:hover{border-color:var(--line-hi);box-shadow:var(--shadow)}
+.strat-item .nm{font-weight:600;font-size:13px;display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+.strat-item .nt{font-size:11.5px;color:var(--text-3);margin-top:3px;line-height:1.55}
+.strat-acts{display:flex;gap:5px;align-items:flex-start;flex:0 0 auto}
+
+/* 买卖策略卡片拖拽排序（2026-10-09）—— 同页换位，落库持久化。
+   ⚠ 插入位置用**左右两条竖线**表示（复制 monitor 页的 drop-l/drop-r 视觉），
+     不用「整张卡高亮」：整卡高亮看不出是插到前面还是后面（左右半的语义就丢了）。
+   ⚠ `.strat-item` 要 `position:relative`，否则伪元素会飘到卡片外。 */
+#strat-list .strat-item[data-drag]{cursor:grab}
+#strat-list .strat-item{position:relative}
+#strat-list .strat-item.dragging{opacity:.32;border-style:dashed}
+#strat-list .strat-item.drop-l::before,
+#strat-list .strat-item.drop-r::before{
+  content:'';position:absolute;left:-7px;right:-7px;height:3px;border-radius:2px;
+  background:var(--brand);z-index:5;
+}
+#strat-list .strat-item.drop-l::before{top:-6px}
+#strat-list .strat-item.drop-r::before{bottom:-6px}
+
+/* chart */
+.chart{width:100%;height:300px}
+.chart.sm{height:210px}
+.chart.lg{height:420px}
+.chart.tk{height:400px}
+/* 个股诊断：K线 + 固定成交量格 + 两格下挂指标画在同一个实例里，高度由 JS 按格数算好后
+   写内联，这里的值只是首帧渲染前的兜底（默认四格 = 38+300+(38+64)+(38+78)+(38+78)+56 = 728） */
+.chart.stk{height:728px}
+
+/* 个股诊断 · K线下挂指标选择 */
+/* 分段切换（少数几个互斥选项，眼下就是 K 线周期）：比下拉少一次点击，当前选的是哪个也看得见。
+   选中态用 --brand-solid 实心底 —— 与 .btn.sm.on 同一套角色分工（--brand 只做文字/线，
+   实心填充必须用压暗的 --brand-solid，否则白字压在亮蓝上对比度不够）。 */
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:var(--radius-s);overflow:hidden;background:var(--panel-2)}
+.seg button{padding:3px 10px;font-size:12px;line-height:18px;background:transparent;border:0;border-left:1px solid var(--line);color:var(--text-2);cursor:pointer;font-family:inherit}
+.seg button:first-child{border-left:0}
+.seg button:hover{background:var(--panel-3);color:var(--text)}
+.seg button.on{background:var(--brand-solid);color:#fff}
+.seg button.on:hover{background:var(--brand-solid-hi)}
+.ind-picks{display:flex;align-items:center;gap:8px}
+.ind-picks .lb{margin:0}
+.ind-picks select{width:auto;min-width:150px;padding:4px 8px;font-size:12px}
+/* 高开/低开幅度输入框（K线卡标题栏）：窄一点，与旁边的 `.seg` 分段按钮等高。
+   单位 % 贴在框右侧，别塞进 label 里（label 已经写着「幅度」了）。 */
+.open-thr{display:inline-flex;align-items:center;gap:2px}
+.open-thr input{width:56px;padding:3px 6px;font-size:12px;text-align:right}
+.open-thr .unit{font-size:12px;color:var(--text-3)}
+/* 总览 · 涨跌停家数 */
+.chart-cap{font-size:12px;font-weight:600;margin:0 0 4px 2px}
+.btn.sm.on{background:var(--brand-solid);border-color:var(--brand-solid);color:#fff}
+.btn.sm.on:hover{background:var(--brand-solid-hi);border-color:var(--brand-solid-hi)}
+
+/* ---------- 分时监控宫格 ---------- */
+/* 高度按视口算，默认 6 格（3 列 × 2 行）正好铺满一屏；
+   行高 minmax(260px,1fr)：格子里要塞「主图 + 量比副图 + 10 档盘口」，
+   低于 260px 就装不下，所以给个下限、装不下时直接滚动。 */
+.mon-grid{
+  display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;
+  grid-auto-rows:minmax(260px,1fr);
+  height:calc(100vh - 236px);min-height:340px;overflow:auto;
+}
+.mon-grid::-webkit-scrollbar{width:8px}
+.mon-grid::-webkit-scrollbar-thumb{background:#2e3949;border-radius:4px;border:0}
+@media(max-width:1180px){.mon-grid{grid-template-columns:repeat(2,minmax(0,1fr));height:auto;min-height:0;overflow:visible;grid-auto-rows:300px}}
+@media(max-width:820px){.mon-grid{grid-template-columns:1fr;height:auto;min-height:0;overflow:visible;grid-auto-rows:320px}}
+
+/* 一格都没有时的空态：页面不内置任何股票，没添加过就是空的。
+   用虚线框 + 引导文案，别让人误以为「页面坏了 / 数据没加载出来」。
+   grid-column:1/-1 让它横跨整行（不然只占第一列那一小块）。 */
+.mon-empty{
+  grid-column:1 / -1;min-height:220px;padding:26px 18px;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;
+  text-align:center;border:1px dashed var(--line);border-radius:var(--radius-s);
+  background:var(--panel-2);color:var(--text-2);
+}
+.mon-empty b{font-size:15px;color:var(--text)}
+.mon-empty code{font-family:var(--mono);font-size:11.5px;background:var(--brand-soft);color:var(--brand-2);padding:1px 5px;border-radius:4px}
+
+/* 卡片头的标题 + 状态胶囊：状态文案很长（运行中 · 时段 · 轮次 · 成功率…），
+   一挤就把「分时监控」压成两行 —— 所以标题不参与压缩、不换行；胶囊自己折行。 */
+.mon-tt{flex:0 0 auto;white-space:nowrap}
+
+/* 卡片头里的「添加股票」输入框：单行小尺寸，不要撑满 */
+.mon-addinp{
+  width:168px !important;flex:0 0 168px;padding:4px 8px !important;
+  font-size:12px;font-family:var(--mono);
+}
+
+.mon-cell{
+  position:relative;display:flex;flex-direction:column;min-height:0;min-width:0;
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--radius-s);
+  padding:6px 8px 4px;transition:.13s;
+}
+.mon-cell:hover{border-color:var(--line-hi);box-shadow:var(--shadow)}
+.mon-cell.bad{border-color:var(--up-line);background:var(--up-soft)}
+
+/* 拖动排序：把手 ⠿ 用 radial-gradient 画点阵（不依赖字体里有没有盲文字符），
+   拖起来时原件半透明、目标格两侧出现竖直插入线（负偏移落在网格 10px 的缝里）。 */
+.mon-grip{
+  flex:0 0 10px;width:10px;height:14px;color:var(--text-3);opacity:.5;cursor:grab;
+  background-image:radial-gradient(currentColor 1px,transparent 1.1px);
+  background-size:5px 5px;background-position:1px 2px;
+}
+.mon-cell:hover .mon-grip{opacity:.85}
+.mon-cell:active .mon-grip{cursor:grabbing}
+.mon-cell.dragging{opacity:.32;border-style:dashed}
+.mon-cell.drop-l::before,.mon-cell.drop-r::before{
+  content:'';position:absolute;top:4px;bottom:4px;width:3px;border-radius:2px;
+  background:var(--brand);z-index:5;
+}
+.mon-cell.drop-l::before{left:-6px}
+.mon-cell.drop-r::before{right:-6px}
+.mon-grid.dragmode .mon-cell{transition:none}
+
+/* 右上角给删除按钮让位（按钮是绝对定位在格子角上） */
+.mon-top{display:flex;align-items:center;gap:6px;height:20px;flex:0 0 auto;padding-right:18px}
+.mon-code{
+  width:80px;flex:0 0 80px;padding:1px 5px !important;font-size:11px;font-family:var(--mono);
+  background:var(--panel-2);border-color:transparent;
+}
+.mon-code:hover{border-color:var(--line)}
+.mon-name{
+  flex:1;min-width:0;font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;cursor:pointer;
+}
+.mon-name:hover{color:var(--brand-2);text-decoration:underline dotted}
+.mon-dot{width:7px;height:7px;border-radius:50%;background:#4a5468;flex:0 0 7px;transition:.2s}
+.mon-dot.ok{background:var(--down)}
+.mon-dot.bad{background:var(--danger)}
+.mon-dot.wait{background:var(--warn)}
+/* 删除按钮：常显在每格右上角（不是 hover 才出现，用户第一眼要能看见） */
+.mon-del{
+  position:absolute;top:3px;right:4px;z-index:3;
+  width:17px;height:17px;padding:0;line-height:16px;text-align:center;
+  border:0;border-radius:5px;background:var(--panel-2);color:var(--text-3);
+  font-size:13px;font-family:inherit;cursor:pointer;opacity:.72;transition:.13s;
+}
+.mon-cell:hover .mon-del{opacity:1}
+.mon-del:hover{background:var(--up-soft);color:#ff7b70}
+
+.mon-quote{display:flex;align-items:baseline;gap:8px;height:24px;flex:0 0 auto;padding-left:2px;overflow:hidden}
+.mon-price{font-size:16px;font-weight:650;font-variant-numeric:tabular-nums;letter-spacing:-.4px}
+.mon-chg{font-size:11.5px;font-variant-numeric:tabular-nums;white-space:nowrap}
+
+/* 格子主体：左边是图（主图 + 量比副图共用一个 ECharts 实例），右边是五档盘口 */
+.mon-body{flex:1 1 auto;min-height:0;display:flex;gap:6px}
+.mon-charts{flex:1 1 auto;min-width:0;position:relative}
+
+/* 图与提示文案是**同一个壳里的两层**：
+   ECharts 初始化会接管 .mon-chart 的内容（把里面的空态提示清掉），所以提示不能放在它里面 ——
+   放在外层 .mon-chartwrap 当浮层，空格子时才显示，才真的看得见。 */
+.mon-chartwrap{position:absolute;inset:0}
+.mon-chart{position:absolute;inset:0;width:100%}
+.mon-tip{
+  position:absolute;inset:0;display:none;align-items:center;justify-content:center;
+  font-size:11.5px;color:var(--text-3);pointer-events:none;
+}
+.mon-cell.blank .mon-tip{display:flex}
+
+/* 五档盘口：卖5→卖1 在上、买1→买5 在下，价格按「相对昨收」着色（涨红跌绿） */
+.mon-book{
+  flex:0 0 90px;display:flex;flex-direction:column;justify-content:center;
+  border-left:1px solid var(--line-2);padding-left:5px;overflow:hidden;
+  font-variant-numeric:tabular-nums;
+}
+.mon-bk{display:flex;align-items:baseline;gap:4px;height:16px;line-height:16px}
+.mon-bk .mon-bkl{flex:0 0 22px;color:var(--text-3);font-size:9.5px}
+.mon-bk b{flex:1 1 auto;text-align:right;font-weight:600;font-size:10.5px}
+.mon-bk i{flex:0 0 34px;text-align:right;font-style:normal;color:var(--text-2);font-size:9.5px}
+.mon-bkseam{height:1px;background:var(--line-2);margin:2px 0}
+
+/* 全字段表弹窗（点格子里的股票名打开） */
+.fld-tbl{max-height:54vh;overflow:auto;border:1px solid var(--line-2);border-radius:var(--radius-s)}
+.fld-tbl table.data{margin:0;border:0}
+.fld-tbl thead th{position:sticky;top:0;background:var(--panel-2);z-index:1}
+.fld-mk{font-size:10px;padding:0 5px;border-radius:4px;white-space:nowrap}
+.fld-mk.ok{background:var(--down-soft);color:#3fbc8a}
+.fld-mk.warn{background:var(--warn-soft);color:#e2b25f}
+.fld-mk.unk{background:var(--panel-2);color:var(--text-3)}
+
+.mon-foot{
+  display:flex;gap:9px;flex:0 0 auto;height:16px;padding-left:2px;overflow:hidden;
+  font-size:10.5px;color:var(--text-3);font-variant-numeric:tabular-nums;white-space:nowrap;
+}
+.mon-foot b{font-weight:500;color:var(--text-2)}
+
+/* toast：深色底下靠亮边 + 投影分层，别用纯黑（会和页面底糊在一起） */
+#toast-wrap{position:fixed;right:18px;bottom:18px;z-index:9999;display:flex;flex-direction:column;gap:8px;align-items:flex-end}
+.toast{
+  background:#2a3444;color:#fff;padding:9px 15px;border-radius:var(--radius-s);font-size:12.5px;
+  border:1px solid var(--line-hi);
+  box-shadow:0 10px 30px rgba(0,0,0,.5);animation:tin .25s;max-width:400px;word-break:break-all;
+}
+.toast.ok{background:#136b49;border-color:#1d8b60} .toast.err{background:#a3322c;border-color:#c4463f} .toast.warn{background:#8a6210;border-color:#ab7b1c}
+@keyframes tin{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+
+/* modal */
+.modal-bg{position:fixed;inset:0;background:var(--overlay);z-index:900;display:flex;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(1.5px)}
+.modal{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);max-width:920px;width:100%;max-height:88vh;display:flex;flex-direction:column;box-shadow:0 24px 70px rgba(0,0,0,.62);overflow:hidden}
+.modal.wide{max-width:1160px}
+.modal-head{padding:13px 18px;border-bottom:1px solid var(--line-2);display:flex;justify-content:space-between;align-items:center;gap:12px}
+/* 右上角按钮组（✕，以及 K线预览的「下一个」）—— 单独包一层，否则 space-between
+   会把三个子元素摊开成「标题左、按钮中、✕右」。 */
+.modal-acts{display:flex;align-items:center;gap:8px;flex:0 0 auto}
+.modal-body{padding:16px 18px;overflow:auto}
+.modal-foot{padding:11px 18px;border-top:1px solid var(--line-2);display:flex;justify-content:flex-end;gap:8px;background:var(--panel-2)}
+
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:12.5px}
+.kv .k{color:var(--text-3)}
+.kv .v{font-family:var(--mono);text-align:right}
+
+.hintbox{background:var(--brand-soft);border:1px solid var(--brand-line);border-radius:var(--radius-s);padding:10px 13px;font-size:12px;color:#a9c3ff;line-height:1.7}
+.hintbox code{background:rgba(255,255,255,.06);border:1px solid var(--brand-line);border-radius:4px;padding:0 5px;font-family:var(--mono);font-size:11.5px;color:#cfdcff}
+.hintbox.warn{background:var(--warn-soft);border-color:var(--warn-line);color:#e2b25f}
+.hintbox.warn code{background:rgba(255,255,255,.06);border-color:var(--warn-line)}
+
+.fieldhelp{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:3px 12px;font-size:11.5px;max-height:190px;overflow:auto}
+.fieldhelp .fh{display:flex;justify-content:space-between;gap:8px;padding:2px 0;border-bottom:1px dotted var(--line-2)}
+.fieldhelp .fh .n{font-family:var(--mono);color:var(--brand-2)}
+.fieldhelp .fh .d{color:var(--text-3);text-align:right;font-size:11px}
+/* 每行的「示例」：点开看这个字段的实际取值（选股策略页 / 买卖策略页共用同一份渲染） */
+.fieldhelp .fh .d .fh-ex{margin-left:6px;font-size:10.5px;border-bottom:1px dotted var(--brand-line);cursor:pointer;white-space:nowrap}
+.fieldhelp .fh .d .fh-ex:hover{color:var(--brand);border-bottom-color:var(--brand)}
+
+/* ---------- 字段取值示例弹窗 ---------- */
+.fs-top{display:flex;justify-content:space-between;align-items:flex-end;gap:14px;flex-wrap:wrap;margin-bottom:12px}
+.fs-name{font-family:var(--mono);font-size:14px;color:var(--brand-2)}
+.fs-name .fs-desc{font-family:inherit;font-size:12px;color:var(--text-3);margin-left:8px}
+.fs-ctl{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-3)}
+.fs-ctl input[type=date]{background:var(--panel-2);border:1px solid var(--line);border-radius:var(--radius-s);color:var(--text);padding:4px 8px;font-size:12.5px}
+.fs-load{padding:26px 0;text-align:center;color:var(--text-3);font-size:12.5px}
+.fs-load.err{color:var(--danger)}
+.fs-empty{padding:18px 0;color:var(--warn);font-size:12.5px;line-height:1.8}
+/* 分位卡片：宽窄自适应，窄屏自动换行 */
+.fs-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:7px;margin-bottom:14px}
+.fs-stat{background:var(--panel-2);border:1px solid var(--line-2);border-radius:var(--radius-s);padding:7px 8px;text-align:center}
+.fs-stat .k{display:block;font-size:10.5px;color:var(--text-3)}
+.fs-stat .v{display:block;font-family:var(--mono);font-size:13.5px;color:var(--text);margin-top:2px}
+.fs-tbl{font-size:12.5px}
+.fs-tbl th{background:var(--panel-2);color:var(--text-2);font-weight:500;font-size:11.5px;padding:5px 9px;border-bottom:1px solid var(--line);text-align:left}
+.fs-tbl td{padding:4px 9px;border-bottom:1px solid var(--line-2)}
+.fs-tbl td.mono{font-family:var(--mono);color:var(--text-2)}
+.fs-tbl .num{text-align:right;font-family:var(--mono)}
+
+/* ---------- 条件股票池编辑器 ---------- */
+.pool-panel{margin-top:10px;padding:12px 14px;border:1px solid var(--line);border-radius:var(--radius-s);background:var(--panel-2)}
+.pool-row{display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap;margin-bottom:10px}
+.pool-row .field{margin:0;min-width:220px}
+.pool-panel .pool-where{width:100%;font-size:12.5px;line-height:1.75;resize:vertical}
+.pool-presets{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:8px 0}
+.pool-presets .btn{border-color:var(--line)}
+.pool-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:9px}
+.pool-actions input[type=date]{width:150px;font-size:12px}
+.pool-status{margin-left:2px}
+.pool-help{margin-top:9px;display:flex;flex-wrap:wrap;gap:5px;max-height:150px;overflow:auto}
+.pool-help .chip{display:inline-block;padding:1px 7px;border:1px solid var(--line);border-radius:5px;background:var(--panel);font-family:var(--mono);font-size:11px;color:var(--text-2);cursor:pointer}
+.pool-help .chip:hover{border-color:var(--brand);color:var(--brand-2)}
+.pool-note{margin-top:8px;line-height:1.65;color:var(--text-3)}
+.pool-note:empty{display:none}
+.pool-result{margin-top:10px}
+.pool-stat{display:flex;flex-wrap:wrap;gap:14px;padding:8px 11px;border:1px solid var(--line);border-radius:var(--radius-s);background:var(--panel-2);font-size:12px;color:var(--text-2);margin-bottom:8px}
+.pool-stat b{font-family:var(--mono);color:var(--text)}
+.pool-result .empty{padding:16px}
+table.data.sm td,table.data.sm th{padding:4px 8px;font-size:11.5px}
+
+/* ---------- 表达式输入提示（字段/函数自动补全） ---------- */
+.ac-pop{
+  /* fixed + 视口坐标：贴控件下沿定位，不受页面/容器滚动影响（滚动时直接收起） */
+  position:fixed;z-index:9000;min-width:236px;max-width:380px;
+  background:var(--panel-2);border:1px solid var(--line);border-radius:var(--radius-s);
+  box-shadow:0 10px 30px rgba(0,0,0,.6);overflow:hidden;font-size:12px;
+}
+.ac-list{max-height:230px;overflow-y:auto;overscroll-behavior:contain;padding:3px}
+.ac-row{display:flex;align-items:baseline;gap:8px;padding:4px 8px;border-radius:5px;cursor:pointer}
+.ac-row.on{background:var(--brand-soft)}
+.ac-row .ac-n{font-family:var(--mono);color:var(--brand-2);white-space:nowrap}
+.ac-row .ac-d{
+  color:var(--text-3);font-size:11px;flex:1;min-width:0;text-align:right;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.ac-row .ac-k{color:var(--text-3);font-size:10px;border:1px solid var(--line);border-radius:4px;padding:0 4px;flex:0 0 auto}
+.ac-tip{border-top:1px solid var(--line-2);padding:3px 8px;color:var(--text-3);font-size:10.5px;background:var(--panel)}
+
+/* ---------- 诊断页查询框的「股票候选」下拉（代码 / 名称都认） ----------
+   内联展开在查询卡里（不做 fixed 浮层）：最多 8 条、自己滚，选完收起就恢复原高。
+   与上面 .ac-pop 的分工：那个是**表达式补全**（字段/函数，浮在控件下沿），
+   这个是**选股票**（名称 + 代码 + 行业）—— 两个东西别混用同一套类名。 */
+.stk-sug-list{
+  background:var(--panel-2);border:1px solid var(--line);border-radius:var(--radius-s);
+  max-height:232px;overflow:auto;padding:3px;margin-top:6px;max-width:560px;
+}
+.stk-sug-row{display:flex;align-items:baseline;gap:9px;padding:5px 9px;border-radius:5px;cursor:pointer}
+.stk-sug-row:hover{background:var(--brand-soft)}
+.stk-sug-row .n{font-weight:600;color:var(--text)}
+.stk-sug-row .c{font-family:var(--mono);font-size:11.5px;color:var(--brand-2)}
+.stk-sug-row .d{color:var(--text-3);font-size:11px;margin-left:auto}
+
+/* ---------- AI 分析弹窗的输出区 ----------
+   模型回的是**纯文本**（可能带 **加粗** 与 # 小标题），渲染规则在 static/js/ai.js
+   的 md() 里，这里只负责排版：等宽体、行距松开、长词换行。
+   ⚠ 深色底上正文用 --text（不是 --text-2）：200 多字的分析结果用灰字会很难读。 */
+.ai-out{
+  min-height:58px;max-height:none;overflow:auto;
+  background:var(--panel-2);border:1px solid var(--line);border-radius:var(--radius-s);
+  padding:11px 13px;font-size:13px;line-height:1.85;color:var(--text);
+  white-space:normal;word-break:break-word;
+}
+.ai-out .ai-h{display:block;margin:6px 0 2px;color:var(--brand-2)}
+.ai-out.err{background:var(--up-soft);border-color:var(--up-line);color:#f0b3ae}
+.ai-out.pending,.ai-out .muted{color:var(--text-3)}
+.ai-hist{max-height:260px;overflow:auto}
+
+/* ---------- 诊断页的 AI 卡片（内联，不弹窗） ----------
+   输出区给一个高度上界：模型回三五百字是常事，不给上界就是「一张卡把整页顶下去」，
+   上面的 K 线反而要滚半天才看得见。流式时正文会自己滚到底（ai.js 的 cardSay）。 */
+#ai-card-out{min-height:150px;max-height:420px}
+/* 流式进行中：正文尾巴挂一个会闪的方块 —— 一眼看出「还在生成」，不用盯着字往外蹦 */
+.ai-out.streaming::after{content:'▌';margin-left:2px;color:var(--brand);
+  animation:ai-blink 1s steps(1) infinite}
+@keyframes ai-blink{50%{opacity:0}}
+/* 模型的「思考过程」（推理型模型才有）：折起来，**还没有正文时默认展开** ——
+   否则那四十多秒里页面上什么都没有，看着像卡死了。正文一到它就自己收起。 */
+.ai-think{margin:0 0 9px;border:1px dashed var(--line-hi);border-radius:var(--radius-s);
+  background:var(--panel)}
+.ai-think>summary{cursor:pointer;padding:5px 9px;color:var(--text-3);font-size:11.5px;outline:none}
+.ai-think>summary:hover{color:var(--text-2)}
+.ai-think-body{max-height:150px;overflow:auto;padding:2px 10px 8px;color:var(--text-2);
+  font-size:12px;line-height:1.7}
+/* 卡片底部：左边一句状态说明，右边「历史回复」—— 按钮因此落在卡片**右下角** */
+.ai-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:10px}
+.ai-foot .btn{flex:0 0 auto}
+
+/* ---------- 模型设置页：配置列表里「掐长度」的几列 ----------
+   这张表有 5 列（配置/模型/地址/Key/操作），其中三列的内容长度由**用户填的东西**决定：
+   配置名、模型名（`Qwen/Qwen2.5-72B-Instruct-AWQ` 这种）、地址（vLLM 网关 / 反向代理的长 URL）。
+   不给上界的话表格宽度没有天花板 —— 实测填一条长地址 + 长模型名，表格最小宽到 1069px，
+   在 1280 宽的窗口里就顶出容器 120px（「操作」列的按钮被推出去，得横向拖才点得到）。
+   给了上界之后最小宽 ≈ 900px，1280 以上都不需要滚；更窄时靠外层 .tbl-wrap 横向滚动兜底。
+   ⚠ 必须套在 <span> 上并 display:inline-block —— 直接在 <td> 上写 max-width 不生效
+     （td 的宽度由表格算法定，max-width 只是建议值）。截掉的完整值看 title。 */
+.prof-name{display:inline-block;max-width:110px;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;vertical-align:bottom}
+.prof-model{display:inline-block;max-width:170px;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;vertical-align:bottom}
+.prof-preset{display:inline-block;max-width:70px;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;vertical-align:bottom}
+.prof-url{display:inline-block;max-width:170px;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;vertical-align:bottom}
+/* 模板列表的「变量」列：一条模板用了 9 个变量时这格能到 400px 宽（把表顶出去）。
+   上限给得比配置表那几列宽 —— 这张表只有 4 列，有富余。 */
+.tpl-vars{display:inline-block;max-width:260px;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;vertical-align:bottom}
+
+/* ---------- 总览页 热股榜卡片（core/hot.py 的三个源） ----------
+   一行 = 名次 / 名称(+连板标签+代码) / 涨跌幅（涨红跌绿用全局 .up/.down）。
+   名称列必须 minmax(0,1fr)：不然长名字会把涨跌幅那一列顶出卡片。 */
+.hot-row{display:grid;grid-template-columns:20px minmax(0,1fr) auto;gap:8px;
+  align-items:center;padding:3.5px 0;border-bottom:1px solid var(--line-2);font-size:12.5px}
+.hot-row:last-child{border-bottom:0}
+.hot-rk{color:var(--text-3);font-size:11.5px;text-align:right;font-variant-numeric:tabular-nums}
+.hot-nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hot-nm .tag{margin-left:5px}   /* 连板标签贴着名称，但不粘住 */
+.hot-nm .cd{color:var(--text-3);font-family:var(--mono);font-size:11px;margin-left:6px}
+.hot-pc{font-variant-numeric:tabular-nums}
+/* 整行可点 = 弹 K线预览（2026-10-11 改；原来这一行是链到个股诊断页的 <a>）。
+   可点的行带 `data-k`（ts_code），不可点的（没代码）不带 —— 样式也跟着这个属性走，
+   免得两边的内边距不一致、左对齐错开。横向给一点内边距（用负外边距抵消），
+   hover 才有像样的高亮块。 */
+.hot-row[data-k]{cursor:pointer;padding-left:6px;padding-right:6px;
+  margin-left:-6px;margin-right:-6px;border-radius:4px}
+.hot-row[data-k]:hover{background:var(--panel-2)}
+.hot-row[data-k]:hover .hot-nm{color:var(--brand-2)}
+.hot-row[data-k]:focus-visible{outline:1px solid var(--brand);outline-offset:-1px}
+.hot-list .empty{padding:18px 10px}
+
+/* ---------- 今日期货（core/futures.py 的六市场分组，static/js/futures.js 渲染）
+   三列固定：主连 / 涨跌幅 / 查看K线；展开行里是该品种的次主连与各月份合约。
+   **颜色不新造**：涨跌一律走全局 `.up`/`.down`（--up/--down），这里只加布局。 */
+.ft-q{width:190px;padding:4px 9px;font-size:12px}
+#ft-list{padding:0}
+table.data.ft-tbl{margin:0}
+table.data.ft-tbl th,table.data.ft-tbl td{padding:6px 12px}
+.ft-th-k,.ft-k{text-align:right;width:104px}
+.ft-name{display:flex;align-items:center;gap:8px;min-width:0}
+/* 展开箭头：靠 rotate 表示开合，open 状态由 JS 加在行上（别只靠 hover 才看得出来） */
+.ft-exp{width:18px;height:18px;flex:0 0 18px;border:0;background:transparent;color:var(--text-3);
+  cursor:pointer;font-size:11px;line-height:1;border-radius:4px;transition:.13s}
+.ft-exp:hover{background:var(--panel-3);color:var(--brand-2)}
+tr.ft-main{cursor:pointer}
+tr.ft-main.open{background:var(--panel-2)}
+tr.ft-main.open .ft-exp{transform:rotate(90deg)}
+.ft-nm{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ft-cd{color:var(--text-3);font-size:11px}
+.ft-pct span{font-weight:600;font-variant-numeric:tabular-nums}
+/* 「最近期权到期」列（主连行，单位「天」）：等宽数字 + 不换行，
+   免得 1 位数 / 2 位数天数来回顶列宽 */
+.ft-near{font-variant-numeric:tabular-nums;white-space:nowrap}
+/* 「最近合约交割」列（主连行，同样单位「天」，另可能显示「已交割」）：同款等宽不换行 */
+.ft-dl{font-variant-numeric:tabular-nums;white-space:nowrap}
+/* 内层合约表：缩进 + 自己一圈细边框，跟主表分层 */
+.ft-subwrap{padding:7px 0 10px 26px}
+.ft-subhd{font-size:11.5px;color:var(--text-3);margin-bottom:6px}
+.ft-subhd b{color:var(--text-2)}
+table.data.ft-ct{border:1px solid var(--line-2);border-radius:var(--radius-s)}
+table.data.ft-ct th,table.data.ft-ct td{padding:4px 9px}
+table.data.ft-ct thead th{position:static}
+.ft-ct-nm{display:flex;align-items:center;gap:6px}
+/* 某家交易所取数失败：在列表上方单独提一条，别让它把整张表变成错误页 */
+.ft-warn{padding:9px 16px;font-size:12px;color:#e8bf7d;background:rgba(224,161,60,.1);
+  border-bottom:1px solid rgba(224,161,60,.32)}
+.ft-warn b{color:#f2cd90}
+
+/* 期货 K 线页（templates/futures_kline.html） */
+.fk-chart{width:100%;height:560px}
+.fk-last{font:600 13px/1 var(--mono);margin-left:8px}
+.fk-err{color:var(--danger)}
+/* 弹窗里是 iframe 嵌这一页（.kl-frame 高 calc(88vh - 132px)），图表要跟着矮下来 */
+body.embed .fk-chart{height:calc(86vh - 172px)}
+

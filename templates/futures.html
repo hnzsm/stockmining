@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}今日期货 · 短线选股工作台{% endblock %}
+{% block pagetitle %}今日期货{% endblock %}
+{% block pagedesc %}六大交易所的主力连续合约（主连）行情：五列 —— 主连 / 涨跌幅 / 最近期权到期 / 最近合约交割 / 查看K线，默认按「最近期权到期」从小到大排。点行首箭头展开该品种的同品种合约（含到期日与对应期权到期日）。{% endblock %}
+
+{% block content %}
+<div class="card" id="ft-card">
+  <div class="card-head">
+    <div class="card-title">
+      期货主连
+      <span class="tag" id="ft-asof">—</span>
+      <span class="tag" id="ft-stat">—</span>
+    </div>
+    <div class="flex">
+      <select id="ft-mkt" title="按交易所筛选"></select>
+      <input id="ft-q" class="ft-q" type="search" placeholder="搜品种 / 代码 / 合约"
+             autocomplete="off" spellcheck="false">
+      <button class="btn sm" id="ft-refresh" title="跳过 30 秒缓存重新读库">刷新</button>
+    </div>
+  </div>
+  <div id="ft-warn"></div>
+  <div id="ft-list"><div class="empty">正在取期货行情…</div></div>
+</div>
+<p class="small muted" id="ft-note">
+  行情来自<b>tushare 期货日线，已落本地库</b>（打开页面<b>不出网</b>）；
+  ⚠ tushare 的期货日线<b>收盘结算后</b>才更新（盘中取不到当天），所以盘中打开时这里显示的是<b>上一交易日收盘</b>
+  的行情，不是盘中实时 —— 具体是哪一天看标题栏那个日期；收盘后跑一次同步就能拿到当天。涨跌幅按<b>收盘价 vs 昨结算</b>算（期货的规矩，不是股票的「vs 昨收」）。
+  <b>最近期权到期</b>列＝该品种<b>全部可交易合约</b>里，对应期权<b>最快到期</b>的那个还剩几天
+  （鼠标停在那格上会写明是哪个到期日、来自哪个合约）；<b>列表默认按这一列从小到大排</b>，
+  点表头可换方向、或改按「涨跌幅」「最近合约交割」排 —— 没有对应期权的品种（如中金所股指期货）垫底。
+  <b>最近合约交割</b>列＝该品种里<b>最后交易日最早</b>的那个可交易合约（也就是展开行第一行）
+  距<b>今天</b>还剩几天（鼠标停在那格上会写明是哪个合约、哪一天交割；今天最后交易日的显示
+  「今天交割」、已经过去显示「已交割」）；
+  这一列同样可以点表头排序，默认从小到大（快交割的排最前），没有带到期日的合约垫底。
+  点行首箭头展开该品种当前可交易的各月份合约（<b>按到期日从近到远</b>），
+  展开表里<b>到期日</b>＝该期货合约的最后交易日、<b>期权到期日</b>＝该合约<b>对应期权</b>的到期日
+  （鼠标停在那格上会显示距今还有几天；中金所股指期权标的是指数、不是期货，所以那几行显「—」）。
+  数据没同步过时这里会是空的 —— 在「数据」页跑一次期货同步即可。
+</p>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/futures.js') }}"></script>
+{% endblock %}

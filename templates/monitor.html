@@ -1,0 +1,1790 @@
+{% extends "base.html" %}
+{% block title %}分时监控 · 短线选股{% endblock %}
+{% block pagetitle %}分时监控{% endblock %}
+{% block pagedesc %}纯前端六宫格（初始为空、自己添加）· 盘中每 3 秒 1 个请求刷新全部格（非交易时段只取一次且不留存）· 五档盘口 + 量比副图 · 可切日K（60 根取自本地库、当天用本地缓存现算，带 BOLL/MA5·10·20·30·60/跳空线且实时重算）· 全字段本地留存 12 小时{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-head">
+    <div class="card-title"><span class="mon-tt">分时监控</span> <span class="tag" id="mon-state">启动中…</span></div>
+    <div class="flex" style="gap:6px;flex-wrap:wrap;justify-content:flex-end">
+      <input type="text" class="mon-addinp" id="mon-add-code" spellcheck="false"
+             placeholder="股票代码，如 sh600519" maxlength="40" title="输入 q= 后面的代码，回车添加">
+      <button class="btn sm" id="mon-add">＋ 添加股票</button>
+      <button class="btn sm" id="mon-pause">暂停</button>
+      <button class="btn sm" id="mon-refresh">全部刷新</button>
+      <button class="btn sm" id="mon-mode" title="在分时图与日K线之间切换（作用于全部格子）">日K</button>
+      <button class="btn sm danger" id="mon-clear">清空本地缓存</button>
+    </div>
+  </div>
+  <div class="card-body tight">
+    <div class="mon-grid" id="mon-grid"></div>
+    <div class="small muted" id="mon-note" style="margin-top:8px">
+      <b id="mon-count">0 / 6 格</b>：<b>页面初始是空的、不内置任何股票</b>，你添加了哪几只就只缓存哪几只
+      （清单存在浏览器本地，下次打开自动恢复）。
+      <b>盘中（交易日 09:30–11:30 / 13:00–15:00）</b>每 3 秒刷新一次：<b>所有格子合并成 1 个请求</b>
+      （腾讯接口支持 <code>q=代码1,代码2,…</code>，一次全拿回来），<span id="mon-cycle">添加股票后开始采集</span>；
+      收盘后 / 午休 / 周末节假日<b>只在进入该时段时请求一次</b>（同样 1 个请求拿全部格，
+      把页面画出来），之后不再请求；这时<b>添加 / 切换股票会单独再取一次</b>，
+      而且这些快照<b>都不写入本地存储</b>。
+      <b>最多 6 只</b>：要换票就点每格右上角的 <b>×</b> 删掉一格，再用「＋ 添加股票」补上新的
+      （全删光也没关系，回到空态重新添加即可）。
+      添加时输入的就是 <code>q=</code> 后面的代码（<code>sh600519</code>）；只写 6 位数字会自动补前缀
+      （<code>600519 → sh600519</code>、<code>000001 → sz000001</code>，上证指数请写 <code>sh000001</code>），
+      也可逗号一次加多只。改格子左上角代码框回车同样生效。
+      <b>想换位置直接按住格子拖</b>（左上角 ⠿ 是把手），松手即落位，顺序会记进本地存储。
+      格子里：主图是<b>分时线（蓝）+ 均价线（橙，直接用接口 f51 的均价，不重算）</b>，
+      下方副图是 <b>量比（紫，f49，带 1.0 基准虚线）</b>，右边是<b>五档盘口</b>（卖5→卖1 / 买1→买5，按昨收着色）。
+      <b>点「日K」按钮可把全部格子切成日线图</b>（按钮文案随即变成「分时」，再点切回分时）：
+      <b>画出来的 60 根日K来自本地数据库</b>（本站 <code>/api/monitor/kline</code>，一次问全部格、<b>不含当天</b>、前复权），
+      <b>当天那根由本地缓存现算</b> —— 库里还没有当天数据（日线是收盘后才同步的），
+      所以拿每整分钟的全字段存档里的「当日累计」最高 / 最低 / 量 / 额，加上最新快照的今开与最新价，
+      拼出当天那根，盘中每 3 秒跟着行情动；本地若没有当天的分时数据（比如收盘后才打开页面），
+      就只画到昨日。<br>
+      日K 上还叠了<b>四条技术线，口径与策略回测完全一致（后端 <code>core/indicators.py</code>）</b>：
+      <b>MA5 / MA10 / MA20 / MA30 / MA60 均线</b>、
+      <b>BOLL 布林带（20 日、2 倍标准差，中轨＝MA20）</b>、
+      以及<b>跳空线</b>（向上跳空 <code>low &gt; 昨高</code> / 向下跳空 <code>high &lt; 昨低</code>，
+      线画在缺口边界上：向上跳空画昨高＝回补支撑、向下跳空画昨低＝回补压力，
+      鼠标停在哪根就能看到该缺口<b>是否已回补</b>）。
+      <b>这些线全都是实时重算的</b> —— 当天那根一变，均线 / 布林 / 跳空立刻跟着变
+      （为了 MA60 在窗口第一根就有值，接口其实多取了 59 根做预热，图上只画 60 根）。
+      <b>点股票名</b>可以查看这一格的全部 88 个原始字段并一键复制 JSON。
+      分时曲线按采样累积，<b>只有盘中采到的点会写进浏览器本地存储</b>，<b>超过 12 小时自动丢弃</b>；
+      除逐笔采样外，还会<b>每整分钟留 1 条全字段存档</b>，留给后续开发用。
+      非交易时段那份一次性快照<b>只用于当次显示、不保存</b>（下次打开会重新取一份）。
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+/* 分时监控：纯前端实现，不经过本站后端取行情。
+   数据源 https://qt.gtimg.cn/q=<code>（腾讯行情，GBK 编码，返回 `v_sz000001="51~平安银行~…";`）
+   该接口带 `Access-Control-Allow-Origin: *`，所以可以直接 fetch 后 TextDecoder('gbk') 解码。
+   而且它**支持一次问多只**：`q=sh600519,sz000001,…` → 返回里每只一段 `v_<代码>="…";`。
+   所以每轮只发 **1 个请求**覆盖全部宫格（6 格 = 1 个请求，不是 6 个）。
+   它只给「当前快照」，没有历史分时序列 —— 所以分时曲线是我们按轮询节拍（每 3 秒一轮）
+   自己采样累积出来的，历史点从 localStorage 恢复（12 小时有效期），刷新页面不丢。
+
+   **盘中才持续轮询**（交易日 09:30–11:30 / 13:00–15:00，每 3 秒一轮）：非交易时段（收盘后、
+   午休、周末节假日）**进入该时段时只请求一次**（一个批量请求拿全部格），拿一份最新快照把页面
+   画出来，之后不再请求；而且这一份**不写本地存储** —— 缓存里因此只会有盘中的采样点，
+   不会混进僵死的隔夜快照。
+   「今天是不是交易日」问本站 /api/market/trade_days（查不到就退回周一~周五近似，后端没起也不会把页面卡死）。
+
+   宫格数量可增删：代码清单存 localStorage（**初始为空、不内置任何代码**），上限 MAX_CELLS。
+   测试钩子：window.__monDebug（同源探针页用）+ URL 上的 ?force=open|closed|holiday、?codes=a,b,c。
+
+   **日K 视图（「日K」按钮）**：分时行情腾讯接口不给历史，日线历史只在本地库里 ——
+   所以切日K时向本站 /api/monitor/kline 要最近 DK_REQ 根（= 画出来的 DK_BARS 根 60 + 预热
+   DK_WARM 根 59，**不含当天**，前复权）；
+   **当天那一根库里还没有**（日线收盘后才同步），由前端拿本地缓存现算（见 todayBar）：
+   每整分钟的全字段存档里 最高/最低/量/额 都是「当日累计」口径，再叠上最新快照的今开与最新价。
+   日K 上叠 BOLL(20,2) + MA5/10/20/30/60 + 跳空缺口线（见 maOf/bollOf/gapsOf）：
+   **口径与后端 core/indicators.py 一致**（MA 是 min_periods=1、布林 sd 用样本标准差 ÷(n-1)），
+   并且**每 3 秒随当天那根重算**；指标算在全量 119 根上、只把最后 60 根切出来画
+   （否则 MA60 在窗口里只有一个点）。跳空线只画在缺口边界那一段（不是贯穿全图的长线）。
+   所以本站调用一共两处：交易日历 + 日K线。
+
+   **本地留存全字段**：接口一次返回 88 项（见下面 FLD 表），全部原样落 localStorage ——
+   采样点存 [时间戳, 交易秒, 价, 均价, 量比, 量]，另有「每整分钟 1 条」的全字段存档
+   （hist，上限 HIST_MAX 条）。点格子里的股票名能打开这张字段表并一键复制 JSON。 */
+(function () {
+  'use strict';
+
+  const API = 'https://qt.gtimg.cn/q=';
+  const MAX_CELLS = 6;                          // 最多格数（固定 6 宫格：要换票先删一格再加）
+  const POLL_MS = 3000;                         // 每 3 秒 1 次请求：一次把所有宫格的行情的拿回来（不逐格轮转）
+  const TTL = 12 * 3600 * 1000;                 // 本地存储保留 12 小时
+  const LS_PTS = 'sm_mon_pts_';                 // 每只股票一个 key
+  const LS_CODES = 'sm_mon_codes';
+  const TIMEOUT_MS = 5000;
+  const MAX_PTS = 5000;                         // 采样点上限：按 3 秒一轮，一个完整交易日 ≈ 4800 点，留点余量
+   const HIST_MAX = 180;                         // 全字段存档条数上限（每整分钟 1 条）
+  /* 日K（日线）视图：历史日线**只在本地库里**（腾讯接口只有当日快照、没有历史日线），
+     所以切日K时问本站 /api/monitor/kline 要 DK_BARS 根；**不含当天** ——
+     当天那一根库里还没有（日线收盘后才同步），由 todayBar() 拿本地缓存现算。 */
+  const DK_API = '/api/monitor/kline';
+  const DK_BARS = 60;                           // 画出来的根数（不含当天）
+  const DK_TTL = 5 * 60 * 1000;                 // 日线在内存里的缓存期（一天才变一次；「全部刷新」会强制重取）
+  /* 「画 60 根」和「要 60 根」是两件事：MA60 要在展示区**第一根**就有值，前面至少得再垫 59 根。
+     所以向接口要 DK_REQ = DK_BARS + DK_WARM 根（119 根，接口上限 250），指标在全量上算，
+     再切出最后 DK_BARS 根来画 —— 只拿 60 根算的话 MA60 全区间只有 1 个点（等于没画）。 */
+  const DK_WARM = 59;                           // 指标预热带（= 最长周期 - 1）
+  const DK_REQ = DK_BARS + DK_WARM;             // 实际请求根数（119）
+  /* 指标口径**必须与后端 core/indicators.py 一致**（同一批数据、同一套公式，两边要能对上）：
+       · 均线 ma(n) = close.rolling(n, min_periods=1).mean()  —— 不足 n 根也用现有的几根算；
+       · 布林 boll  = {"n": 20, "k": 2}（DEFAULT_INDICATORS.boll）：mid = MA20，
+         上下轨 = mid ± k·sd，sd 是 pandas rolling.std() = **样本标准差（÷ n-1，不是 ÷ n）**；
+         且 min_periods = n —— 不足 20 根不出值（图上就是断的，不拿半截窗口凑一条线）。
+       · 跳空与策略口径同源（tools/auto_strategies.py 的「跳空缺口不补」就是这两条）：
+           向上跳空 low > ref(high, 1)   向下跳空 high < ref(low, 1) */
+  const MA_PERIODS = [5, 10, 20, 30, 60];
+  const BOLL_N = 20, BOLL_K = 2;
+  /* 指标线配色（细线、不显示拐点；紫与 MA20 同色系但 BOLL 用粉色系，避免和均线混淆） */
+  const MA_COLORS = { 5: '#f0a020', 10: '#29b6f6', 20: '#ab47bc', 30: '#9e9e9e', 60: '#e6ecf5' };
+  const BOLL_COLORS = { up: '#ff5c8a', mid: '#ffb0c8', dn: '#ff5c8a' };
+  const GAP_COLOR = '#ffd166';                  // 跳空线（缺口）：琥珀色虚线，四条线里最显眼的那条
+  /* 蜡烛图配色：涨红跌绿（中国习惯），与全站一致 */
+  const UP_COLOR = '#e5352b', DOWN_COLOR = '#12a06a';
+   /* 这里**刻意没有内置代码清单**：页面初始是空的，你添加哪只就缓存哪只。
+     （早先版本有一份 6 只的 DEFAULTS 兜底，结果本地存储一被清空就「冒出几只没添加过的
+     股票」，看着像自己加的丢了 —— 现在没存过就是空。） */
+
+  /* ---------------- 腾讯 qt.gtimg.cn 字段表 ----------------
+     下标 = 把返回里双引号内的内容按 `~` 切分后的位置（实测 88 项）。标记分四档：
+       v = 已核对：拿本地 daily_kline 自算、或字段间的勾稽关系交叉验过；
+       u = 用户提供，尚未独立核对；
+       ? = 未考证：原样存下来，等后续开发时再定性；
+       - = 空占位（该位置常态为空串，腾讯留位用）。
+     已核对的关键几条（别凭印象改：tools/verify_monitor.py 里固化了断言）：
+       · f[51] 均价 ← 由 f[37]成交额(万)×1e4 ÷ (f[6]成交量(手)×100) 反算确认；
+       · f[63]/f[69]/f[70]/f[71] ← 与本地自算的 5/10/20/60 日涨幅**逐个相等**；
+       · f[58]/f[59] 盘后额(万)/量(手) ← 量×100×均价 ≈ 额；
+       · f[67]/f[68] ← 包住区间内自算的最高/最低价。 */
+  const FLD = [
+    /*  0- 9 */ '市场标记|v', '名称|v', '代码|v', '最新价|v', '昨收|v', '今开|v', '成交量(手)|v', '外盘(手)|v', '内盘(手)|v', '买一价|v',
+    /* 10-19 */ '买一量(手)|v', '买二价|v', '买二量(手)|v', '买三价|v', '买三量(手)|v', '买四价|v', '买四量(手)|v', '买五价|v', '买五量(手)|v', '卖一价|v',
+    /* 20-29 */ '卖一量(手)|v', '卖二价|v', '卖二量(手)|v', '卖三价|v', '卖三量(手)|v', '卖四价|v', '卖四量(手)|v', '卖五价|v', '卖五量(手)|v', '最近逐笔成交|-',
+    /* 30-39 */ '行情时间|v', '涨跌额|v', '涨跌幅%|v', '最高|v', '最低|v', '价/量/额|v', '成交量(手)|v', '成交额(万)|v', '换手率%|v', '市盈率TTM|v',
+    /* 40-49 */ '-|-', '最高|v', '最低|v', '振幅%|v', '流通市值(亿)|v', '总市值(亿)|v', '市净率|v', '涨停价|v', '跌停价|v', '量比|v',
+    /* 50-59 */ '委差(手)|v', '均价|v', '市盈率(动)|v', '市盈率(静)|v', '-|-', '-|-', '涨速%|?', '成交额(万)|v', '盘后额(万)|v', '盘后量(手)|v',
+    /* 60-69 */ '市场类别|v', '证券类型|v', '今年涨幅%|u', '5日涨幅%|v', '未考证|?', '未考证|?', '未考证|?', '52周最高|v', '52周最低|v', '10日涨幅%|v',
+    /* 70-79 */ '20日涨幅%|v', '60日涨幅%|v', '未考证|?', '未考证|?', '未考证|?', '未考证|?', '未考证|?', '-|-', '-|-', '未考证|?',
+    /* 80-87 */ '未考证|?', '-|-', '币种|v', '未考证|?', '-|-', '未考证|?', '未考证|?', '-|-',
+  ];
+  const FLD_NAME = FLD.map(s => s.split('|')[0]);
+  const FLD_MARK = FLD.map(s => s.split('|')[1]);
+  /* 给盘口/副图定位用的下标，全表只在这里出现一次字面量 */
+  const IX = { name: 1, code: 2, price: 3, prev: 4, open: 5, vol: 6, outer: 7, inner: 8,
+               ask1: 19, bid1: 9, time: 30, chg: 31, pct: 32, high: 33, low: 34,
+               amount: 37, turn: 38, amp: 43, pb: 46, up: 47, down: 48, vr: 49, avg: 51 };
+
+  /* A 股交易时段：09:30–11:30 / 13:00–15:00（本地时钟）。
+     **盘中持续轮询；非交易时段只在「进入该时段」时整轮请求一次**（见 step 里的 one-shot），
+     而且那一份快照不落盘 —— 缓存里因此只会有盘中的点。
+     收盘后再多采 60 秒，把 15:00 那笔收盘价采进来（收盘价是最后 1 秒才落定的）。 */
+  const AM_OPEN = 9 * 3600 + 30 * 60, AM_CLOSE = 11 * 3600 + 30 * 60;
+  const PM_OPEN = 13 * 3600, PM_CLOSE = 15 * 3600, CLOSE_GRACE = 60;
+  const IDLE_MS = 20000;                        // 非交易时段：最多每 20 秒醒一次看有没有开盘（纯本地，不发请求）
+  const CAL_API = '/api/market/trade_days';     // 交易日历（本站唯一被用到的接口）
+  const CAL_AHEAD_DAYS = 45;
+
+  /* 测试钩子：URL ?force=open|closed|holiday 或同源探针页设 window.__MON_FORCE__，
+     用来在非交易时段验证「盘中才会请求」。正常使用不会带这个参数。
+     ?codes=a,b,c 同理：先把这份清单种进本地存储再启动 —— 无头端到端跑的是干净 profile
+     （没有任何配置），不种的话页面就是空的，验不了「有内容时」那一套渲染/盘口/副图。 */
+  try {
+    const qs = new URLSearchParams(location.search);
+    const f = qs.get('force');
+    if (f) window.__MON_FORCE__ = f;
+    const seed = qs.get('codes');
+    if (seed) {
+      const arr = seed.split(/[,\s]+/).map(c => normCode(c)).filter(Boolean).slice(0, MAX_CELLS);
+      localStorage.setItem(LS_CODES, JSON.stringify({ v: 2, codes: arr }));
+    }
+  } catch (e) { /* ignore */ }
+
+  /* ---------------- 小工具 ---------------- */
+  const pad2 = n => String(n).padStart(2, '0');
+
+  /* 添加时输入的就是 q= 后面的代码：sh/sz/bj + 6 位原样用；
+     只写 6 位数字时按首位补前缀（6→沪 0/3→深 4/8/9→北），图省事。 */
+  function normCode(v) {
+    const s = String(v || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (/^(sh|sz|bj)\d{6}$/.test(s)) return s;
+    if (/^\d{6}$/.test(s)) {
+      const c = s[0];
+      if (c === '6') return 'sh' + s;
+      if (c === '0' || c === '3') return 'sz' + s;
+      if ('489'.indexOf(c) >= 0) return 'bj' + s;
+    }
+    return '';
+  }
+
+  /* 行情时间 20260915144054 → 交易日内的**秒序号** 0~14400
+     （09:30 起算，午休不占位；收盘后恒为 14400）
+     用秒而不是分钟作横轴：每轮（3 秒）都在采样，用分钟刻度会把同一分钟内的点全压在一个 x 上。 */
+  function secIdx(t14) {
+    if (!t14 || t14.length < 12) return null;
+    const h = +t14.slice(8, 10), m = +t14.slice(10, 12), s = +t14.slice(12, 14) || 0;
+    if (!isFinite(h) || !isFinite(m)) return null;
+    const t = h * 3600 + m * 60 + s;
+    const OPEN = 9 * 3600 + 30 * 60;              // 09:30
+    if (t < OPEN) return 0;
+    if (t <= 11 * 3600 + 30 * 60) return t - OPEN;                 // 上午 0~7200
+    if (t < 13 * 3600) return 7200;                                // 午休
+    if (t <= 15 * 3600) return 7200 + (t - 13 * 3600);             // 下午 7200~14400
+    return 14400;                                                  // 15:00 后
+  }
+  function secTime(sec) {
+    sec = Math.round(sec);
+    const t = sec <= 7200 ? (9 * 3600 + 30 * 60 + sec) : (13 * 3600 + (sec - 7200));
+    return pad2(Math.floor(t / 3600)) + ':' + pad2(Math.floor(t / 60) % 60) + ':' + pad2(t % 60);
+  }
+  const clockOf = ts => { const d = new Date(ts); return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds()); };
+  const dayKey = ts => { const d = new Date(ts); return d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate(); };
+  const ymd = d => d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+
+  /* ---------------- 交易时段判定 ----------------
+     「行情」全走腾讯接口，但「今天是不是交易日」得问本站日历 —— 只按周一~周五近似的话，
+     国庆/春节这种长假会白轮询一整天。日历取不到（后端没起 / 超出覆盖范围）就退回周末近似。 */
+  const cal = { days: {}, ok: false, from: '', to: '', at: 0, day: '' };
+
+  async function calLoad() {
+    const now = new Date();
+    const from = ymd(new Date(now.getTime() - 86400000));
+    const to = ymd(new Date(now.getTime() + CAL_AHEAD_DAYS * 86400000));
+    const ctl = new AbortController();
+    const tm = setTimeout(() => ctl.abort(), TIMEOUT_MS);
+    try {
+      const res = await fetch(CAL_API + '?start=' + from + '&end=' + to,
+                              { cache: 'no-store', signal: ctl.signal });
+      const js = await res.json();
+      const days = (js && js.ok && js.data && js.data.days) || [];
+      if (!days.length) throw new Error('日历为空');
+      cal.days = {};
+      days.forEach(d => { cal.days[d] = 1; });
+      cal.ok = true; cal.from = from; cal.to = to; cal.day = ymd(now); cal.at = Date.now();
+    } catch (e) {
+      cal.ok = false; cal.from = from; cal.to = to; cal.day = ymd(now); cal.at = Date.now();
+    } finally { clearTimeout(tm); }
+  }
+  /* 日历说不是交易日就不是；覆盖不到的日期退回周一~周五 */
+  function isTradeDay(d) {
+    const s = ymd(d);
+    if (cal.ok && s >= cal.from && s <= cal.to) return !!cal.days[s];
+    const w = d.getDay();
+    return w >= 1 && w <= 5;
+  }
+  function calFresh() {
+    const s = ymd(new Date());
+    if (s !== cal.day) { calLoad(); return; }                        // 跨日：重新取一次
+    if (!cal.ok && Date.now() - cal.at > 300000) calLoad();          // 上次没取到，5 分钟后再试
+  }
+
+  function forced() { try { return window.__MON_FORCE__ || ''; } catch (e) { return ''; } }
+
+  /* 当前处于哪个阶段：pre 未开盘 / am 上午 / lunch 午休 / pm 下午 / closed 已收盘 / holiday 非交易日 */
+  function phaseOf(now) {
+    const f = forced();
+    if (f === 'open') return { k: 'pm', txt: '盘中（强制）' };
+    if (f) return { k: f === 'holiday' ? 'holiday' : 'closed', txt: f === 'holiday' ? '非交易日（强制）' : '已收盘（强制）' };
+    const d = now || new Date();
+    if (!isTradeDay(d)) return { k: 'holiday', txt: '非交易日' };
+    const t = d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds();
+    if (t < AM_OPEN) return { k: 'pre', txt: '未开盘' };
+    if (t <= AM_CLOSE) return { k: 'am', txt: '上午盘中' };
+    if (t < PM_OPEN) return { k: 'lunch', txt: '午间休市' };
+    if (t <= PM_CLOSE + CLOSE_GRACE) return { k: 'pm', txt: '下午盘中' };
+    return { k: 'closed', txt: '已收盘' };
+  }
+  const isOpen = ph => ph.k === 'am' || ph.k === 'pm';
+
+  /* 「什么时候会自动恢复取数」——纯本地算，不发请求 */
+  function nextOpenText() {
+    const now = new Date();
+    const t = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+    if (phaseOf(now).k !== 'holiday' && !forced()) {
+      if (t < AM_OPEN) return '今日 09:30';
+      if (t > AM_CLOSE && t < PM_OPEN) return '今日 13:00';
+    }
+    for (let i = 1; i <= 15; i++) {
+      const d = new Date(now.getTime() + i * 86400000);
+      if (isTradeDay(d)) return pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + ' 09:30';
+    }
+    return '下个交易日 09:30';
+  }
+
+  /* ---------------- 本地存储（12 小时滚动窗口） ----------------
+     每只股票一个 key `sm_mon_pts_<code>`，v3 结构：
+       {v:3, t, pts:[[本地时间戳, 交易秒序号, 价, 均价, 量比, 累计量], …],
+             snap:{…最后一次完整快照（含全字段 raw）…},
+             hist:[[本地时间戳, 交易秒序号, [88 个原始字段字符串]], …]}
+     · pts 是画图用的逐笔采样（只有盘中且行情日期=今天的点才会进来）；
+     · snap 是最后一次拿到的完整快照，非交易时段不请求行情，靠它把页面画出来；
+     · hist 是**全字段**低频存档（每整分钟记 1 条），留给后续开发用（比如做盘口/量比回看）。
+     旧版本（v2，pts 每点 4 项）会被兼容读取：缺的位补 0，hist 视为空。 */
+  function storeRead(code) {
+    const empty = { pts: [], snap: null, hist: [] };
+    try {
+      const o = JSON.parse(localStorage.getItem(LS_PTS + code) || 'null');
+      if (!o || !Array.isArray(o.pts)) return empty;
+      const cut = Date.now() - TTL;
+      const pts = o.pts.filter(p => Array.isArray(p) && p.length >= 4 && p[0] >= cut)
+        .map(p => [p[0], p[1], p[2], p[3], p[4] || 0, p[5] || 0]);
+      const hist = (Array.isArray(o.hist) ? o.hist : [])
+        .filter(h => Array.isArray(h) && h[0] >= cut);
+      return { pts: pts, snap: (o.snap && o.snap.t >= cut) ? o.snap : null, hist: hist };
+    } catch (e) { return empty; }
+  }
+  function storeSave(code, pts, snap, hist) {
+    const cut = Date.now() - TTL;
+    let keep = pts.filter(p => p[0] >= cut);
+    if (keep.length > MAX_PTS) keep = keep.slice(-MAX_PTS);
+    let hs = (hist || []).filter(h => h[0] >= cut);
+    if (hs.length > HIST_MAX) hs = hs.slice(-HIST_MAX);
+    const val = { v: 3, t: Date.now(), pts: keep, snap: snap || null, hist: hs };
+    try { localStorage.setItem(LS_PTS + code, JSON.stringify(val)); }
+    catch (e) {
+      // 配额写满：把全字段存档丢掉、采样点只留最近 1/3 再试一次，失败就放弃（不打断监控）
+      try {
+        localStorage.setItem(LS_PTS + code, JSON.stringify({
+          v: 3, t: Date.now(), pts: keep.slice(-Math.floor(MAX_PTS / 3)), snap: snap || null, hist: [],
+        }));
+      } catch (e2) { /* ignore */ }
+    }
+  }
+  /* 清空本地行情缓存：**代码清单（配置）必须留着** —— 它是「我加过哪些股票」的唯一记录，
+     一起清掉就等于把用户加的自选全删了。这里按 key 精确排除 LS_CODES，
+     别图省事按 `sm_mon_` 前缀一刀切（那个前缀同时罩着配置）。
+     返回值是「清掉了几项」，不含被保留的代码清单。 */
+  function storeClearAll() {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.indexOf('sm_mon_') === 0 && k !== LS_CODES) keys.push(k);
+    }
+    keys.forEach(k => localStorage.removeItem(k));
+    return keys.length;
+  }
+  /* 代码清单：v2 = {v:2, codes:[…]}（可增删，长度 0~MAX_CELLS）
+     **不内置任何代码**：没存过、或存的就是空清单，一律返回空 —— 加过哪些就缓存哪些，
+     加回来曲线就能续上；读不出来（脏数据）也只当没加过，不塞默认票。
+     （旧版本存过固定 9 只的裸数组，这里兼容读取并截成 6 只。） */
+  function codesLoad() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(LS_CODES) || 'null');
+      const arr = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.codes) ? raw.codes : null);
+      if (arr && arr.length) {
+        const seen = {};
+        const uniq = arr.map(normCode).filter(c => c && !seen[c] && (seen[c] = 1));
+        return uniq.slice(0, MAX_CELLS);
+      }
+    } catch (e) { /* ignore */ }
+    return [];
+  }
+  function codesSave() {
+    try { localStorage.setItem(LS_CODES, JSON.stringify({ v: 2, codes: state.codes })); } catch (e) { /* ignore */ }
+  }
+
+  /* ---------------- 拉取行情 ----------------
+     腾讯这个接口支持**一次问多只**：`q=sh600519,sz000001,…`，返回里每只一行
+     `v_sh600519="…";`。所以整个页面每轮只发 **1 个请求**（不是每格一个），
+     拿回来按「`v_` 后面的代码」分发到各宫格 —— 6 格就省下 5/6 的请求。
+
+     parseQuote 把 `~` 分隔的那一段转成对象，返回「全字段 + 常用字段类型化」两份：
+     raw 是 88 项原始字符串（原样存本地），其余按 IX / 固定下标取出来供画图与盘口用。 */
+  function parseQuote(f) {
+    if (!f || f.length < 52) return null;
+    // 时间字段个别标的位置会漂一位，直接按「14 位 yyyymmddHHMMSS」找更稳
+    // （不是 12 位：20260915144257 = 20 + 12 位）
+    let t14 = '';
+    for (let i = 28; i < 34; i++) { if (f[i] && /^20\d{12}$/.test(f[i])) { t14 = f[i]; break; } }
+    const prev = +f[IX.prev];
+    let price = +f[IX.price];
+    if (!(price > 0)) price = prev;            // 未开盘 / 停牌时兜底
+    const lv = function (base) {               // 五档：base=9 买盘首价，base=19 卖盘首价
+      const out = [];
+      for (let k = 0; k < 5; k++) out.push([+f[base + k * 2], +f[base + k * 2 + 1]]);
+      return out;
+    };
+    return {
+      raw: f.slice(),                          // ★ 全字段原样留存（长度=88）
+      name: f[IX.name] || '', code: f[IX.code] || '',
+      date: t14 ? (t14.slice(0, 4) + '-' + t14.slice(4, 6) + '-' + t14.slice(6, 8)) : '',
+      minute: t14 ? t14.slice(0, 12) : '',
+      time: t14,
+      price: price, prev: prev, open: +f[IX.open],
+      vol: +f[IX.vol], outer: +f[IX.outer], inner: +f[IX.inner],
+      bids: lv(IX.bid1), asks: lv(IX.ask1),
+      chg: +f[IX.chg], pct: +f[IX.pct],
+      high: +f[IX.high], low: +f[IX.low],
+      amount: +f[IX.amount],                   // 万元
+      turn: +f[IX.turn], amp: +f[IX.amp], pb: +f[IX.pb],
+      up: +f[IX.up], down: +f[IX.down],
+      vr: +f[IX.vr],                           // 量比
+      avg: +f[IX.avg],                         // 均价（交易所口径，不重算）
+    };
+  }
+
+  /* 批量拉取：codes = ['sh600519','sz000001'] → { 'sh600519': {…}, 'sz000001': {…} }
+     返回体里每只一段 `v_<代码>="…";`（无效代码腾讯会回 v_pv_none_match，直接拿不到 key）。
+     按返回行里的 `v_` 名分发（不是按顺序对号入座）—— 某一只休市/代码写错时不会把后面的全串位。 */
+  async function fetchQuotes(codes) {
+    const ctl = new AbortController();
+    const tm = setTimeout(() => ctl.abort(), TIMEOUT_MS);
+    try {
+      const res = await fetch(API + codes.join(','), { cache: 'no-store', signal: ctl.signal });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const buf = await res.arrayBuffer();
+      const txt = new TextDecoder('gbk').decode(buf);
+      const out = {};
+      const re = /v_([a-z]{2}\d{6})="([^"]*)"/g;
+      let m;
+      while ((m = re.exec(txt)) !== null) {
+        const q = parseQuote(m[2].split('~'));
+        if (q) out[m[1]] = q;
+      }
+      return out;
+    } finally { clearTimeout(tm); }
+  }
+
+  /* ---------------- 日线（日K 视图用） ----------------
+     腾讯那个接口只给「当日快照」，没有历史日线 —— 历史日线只在本地库里，
+     所以切日K时问本站 /api/monitor/kline（同样是一次问多只，与行情轮询一个路子）；
+     要的是 DK_REQ 根 = 画出来的 DK_BARS 根 + DK_WARM 根预热（见上面常量里的说明）。
+     结果只放内存（state.daily），**不写 localStorage**：日线一天才变一次，
+     写进去只会白占配额，而且「清空本地缓存」也管不着它 —— 视图数据不该混进行情缓存。
+     只补「没有 / 过期 / 强制」的格子；分时视图下压根不会调到这里。 */
+  async function fetchDaily(codes, force) {
+    const need = (codes || []).filter(function (c) {
+      const d = state.daily[c];
+      return !!force || !d || (Date.now() - d.at > DK_TTL);
+    });
+    if (!need.length) return 0;
+    const ctl = new AbortController();
+    const tm = setTimeout(() => ctl.abort(), TIMEOUT_MS);
+    try {
+      const res = await fetch(DK_API + '?codes=' + need.join(',') + '&bars=' + DK_REQ,
+                              { cache: 'no-store', signal: ctl.signal });
+      const js = await res.json();
+      const map = (js && js.ok && js.data && js.data.bars) || {};
+      need.forEach(function (c) {
+        const b = map[c] || [];
+        state.daily[c] = { at: Date.now(), bars: b,
+                           err: b.length ? '' : '本地库里没有这只股票的日线（先在「数据管理」同步日线）' };
+      });
+      return need.length;
+    } catch (e) {
+      const why = (e && e.name === 'AbortError') ? '日线请求超时'
+        : ('日线请求失败：' + ((e && e.message) || '未知错误'));
+      need.forEach(function (c) { state.daily[c] = { at: Date.now(), bars: [], err: why }; });
+      return 0;
+    } finally { clearTimeout(tm); }
+  }
+  /* 只有「当前正停在日K视图」才去取日线 —— 分时视图下不必碰本站接口 */
+  async function ensureDaily(force) {
+    if (state.mode !== 'daily' || !state.codes.length) return 0;
+    const n = await fetchDaily(state.codes.slice(), !!force);
+    if (n) repaint();
+    return n;
+  }
+
+  /* ---------------- 图表 ----------------
+     一个 ECharts 实例装两层：
+       grid[0] 主图 = 分时线（蓝，带面积）+ 均价线（橙，直接用 f[51]，不重算）；
+       grid[1] 副图 = 量比（紫，直接用 f[49]），带 1.0 基准虚线 —— 两条线共用同一时间轴，
+       所以纵向永远对齐（横轴按秒，量比是「此刻的比值」，随时间变化本身就是有效信息）。 */
+  const PRICE_COLOR = '#4b83ff';
+  const AVG_COLOR = '#e08a00';
+  const VR_COLOR = '#7c5cf0';
+
+  function intradayOption(pts, prev) {
+    const data = [], avgData = [], vrData = [];
+    let vrMax = 0;
+    pts.forEach(function (p) {
+      data.push([p[1], p[2]]);
+      if (p[3] > 0 && isFinite(p[3])) avgData.push([p[1], p[3]]);
+      if (p[4] > 0 && isFinite(p[4])) { vrData.push([p[1], p[4]]); if (p[4] > vrMax) vrMax = p[4]; }
+    });
+    let hi = prev, lo = prev;
+    pts.forEach(p => {
+      if (isFinite(p[2])) { if (p[2] > hi) hi = p[2]; if (p[2] < lo) lo = p[2]; }
+    });
+    let d = Math.max(hi - prev, prev - lo, prev * 0.003) * 1.12;
+    if (!(d > 0)) d = Math.max(prev * 0.01, 0.01);
+    // 量比轴：0 起（量比本来就是相对量），上限留点余量，且至少到 1.2 好让 1.0 基准线看得见
+    vrMax = Math.max(1.2, Math.ceil(vrMax * 1.15 * 10) / 10);
+
+    // 横轴跟着「已采样的区间」走，而不是钉死在全天 09:30~15:00：
+    // 否则刚打开监控时曲线只会挤在最右边几个像素里，看着像没数据。
+    // 留一个最小 60 秒窗口，免得只有两三个点时被拉成一条折线。
+    let xMin = 0, xMax = 14400;
+    if (pts.length) {
+      xMin = pts[0][1];
+      xMax = Math.max(pts[pts.length - 1][1], xMin + 60);
+      if (xMin > xMax - 60) xMin = xMax - 60;
+    }
+
+    return {
+      animation: false,
+      tooltip: {
+        trigger: 'axis', confine: true, backgroundColor: 'rgba(16,21,29,.96)', borderColor: '#2a3444', borderWidth: 1,
+        textStyle: { color: '#e6ebf4', fontSize: 11 },
+        axisPointer: { type: 'line', label: { show: false }, link: [{ xAxisIndex: 'all' }] },
+        formatter: function (ps) {
+          if (!ps || !ps.length) return '';
+          const out = [];
+          ps.forEach(function (x) {
+            const v = x.value && x.value[1];
+            if (v === null || v === undefined || isNaN(v)) return;
+            out.push(x.marker + x.seriesName + ' ' + Number(v).toFixed(2));
+          });
+          return secTime(ps[0].value[0]) + '<br>' + out.join('<br>');
+        },
+      },
+      legend: {
+        top: 0, right: 22, itemWidth: 12, itemHeight: 6, itemGap: 7, icon: 'roundRect',
+        textStyle: { fontSize: 9, color: '#8b95a9' },
+        data: ['价格', '均价', '量比'],          // 点图例可单独开关（均价/量比去掉就是纯分时线）
+      },
+      grid: [
+        { left: 36, right: 24, top: 14, bottom: 62 },
+        { left: 36, right: 24, height: 40, bottom: 18 },
+      ],
+      xAxis: [
+        Object.assign({}, baseAxis, {
+          gridIndex: 0, type: 'value', min: xMin, max: xMax, splitNumber: 3, boundaryGap: false,
+          axisLabel: { show: false }, axisTick: { show: false },
+        }),
+        Object.assign({}, baseAxis, {
+          gridIndex: 1, type: 'value', min: xMin, max: xMax, splitNumber: 3, boundaryGap: false,
+          axisLabel: { fontSize: 8.5, color: '#8b95a9', hideOverlap: true, formatter: v => secTime(v) },
+        }),
+      ],
+      yAxis: [
+        Object.assign({}, baseAxis, {
+          gridIndex: 0, type: 'value', min: +(prev - d).toFixed(3), max: +(prev + d).toFixed(3), splitNumber: 2,
+          axisLabel: { fontSize: 9, color: '#8b95a9', formatter: v => Number(v).toFixed(2) },
+        }),
+        Object.assign({}, baseAxis, {
+          gridIndex: 1, type: 'value', min: 0, max: vrMax, splitNumber: 1,
+          axisLabel: { fontSize: 8, color: '#8b95a9', formatter: v => Number(v).toFixed(1) },
+        }),
+      ],
+      series: [
+        {
+          name: '价格', type: 'line', data: data, symbol: 'none', smooth: false,
+          xAxisIndex: 0, yAxisIndex: 0,
+          lineStyle: { width: 1.4, color: PRICE_COLOR },
+          areaStyle: { color: 'rgba(75,131,255,.18)' },
+          markLine: {
+            silent: true, symbol: 'none', animation: false,
+            label: { show: false },
+            lineStyle: { color: '#b8c2d4', type: 'dashed', width: 1 },
+            data: [{ yAxis: prev }],
+          },
+        },
+        {
+          name: '均价', type: 'line', data: avgData, symbol: 'none', smooth: false,
+          xAxisIndex: 0, yAxisIndex: 0,
+          lineStyle: { width: 1.4, color: AVG_COLOR },
+        },
+        {
+          name: '量比', type: 'line', data: vrData, symbol: 'none', smooth: false,
+          xAxisIndex: 1, yAxisIndex: 1,
+          lineStyle: { width: 1.2, color: VR_COLOR },
+          areaStyle: { color: 'rgba(124,92,240,.20)' },
+          markLine: {
+            silent: true, symbol: 'none', animation: false,
+            label: { show: false },
+            lineStyle: { color: '#c9b8f5', type: 'dashed', width: 1 },
+            data: [{ yAxis: 1 }],                // 量比 = 1 的基准线
+          },
+        },
+      ],
+    };
+  }
+
+  /* ---------------- 日K 的技术指标（均线 / 布林 / 跳空） ----------------
+     口径**必须与后端 core/indicators.py 一致** —— 否则「图上看到的」和「策略里用的」
+     就是两套数（同一个项目里冒出两套 MA20，是最难查的那种错）：
+       · 均线 ma(n) = close.rolling(n, min_periods=1).mean()：不足 n 根就用现有的几根算，
+         所以第一根就有值，图上不会断头；
+       · 布林 boll = {n: 20, k: 2}，min_periods = 20（不足 20 根不出值 —— 图上那一段就是空的，
+         不拿半截窗口凑一条线）；sd 是 pandas rolling.std() = **样本标准差 ÷(n-1)**，
+         写成 ÷n 会系统性偏窄，与后端对不上；
+       · 跳空：向上 low > ref(high,1)、向下 high < ref(low,1)（与内置策略「跳空缺口不补」同源）。
+     三个函数都吃「升序、已前复权」的收盘 / 高低序列，输入多长输出就多长。 */
+  function maOf(closes, n) {
+    const out = new Array(closes.length);
+    let sum = 0;
+    for (let i = 0; i < closes.length; i++) {
+      sum += closes[i];
+      if (i >= n) sum -= closes[i - n];
+      out[i] = sum / Math.min(i + 1, n);      // min_periods=1：前 n 根用「已有的那几根」求均值
+    }
+    return out;
+  }
+
+  function bollOf(closes, n, k) {
+    const mid = new Array(closes.length).fill(null);
+    const up = new Array(closes.length).fill(null);
+    const dn = new Array(closes.length).fill(null);
+    let sum = 0;
+    for (let i = 0; i < closes.length; i++) {
+      sum += closes[i];
+      if (i >= n) sum -= closes[i - n];
+      if (i >= n - 1) {
+        const m = sum / n;
+        let v = 0;
+        for (let j = i - n + 1; j <= i; j++) v += (closes[j] - m) * (closes[j] - m);
+        const sd = Math.sqrt(v / (n - 1));    // 样本标准差：与 pandas rolling().std() 同口径
+        mid[i] = m; up[i] = m + k * sd; dn[i] = m - k * sd;
+      }
+    }
+    return { mid: mid, up: up, dn: dn };
+  }
+
+  /* 跳空（缺口）：返回 [{i, dir, y, lo, hi, filled}]
+       i      产生缺口的那一根（它跟前一根之间跳空了）
+       dir    1 = 向上跳空 / -1 = 向下跳空
+       y      缺口线画在这个价上 —— 向上跳空画「昨高」（缺口下沿，回补的支撑位），
+              向下跳空画「昨低」（缺口上沿，回补的压力位）
+       lo/hi  缺口区间：向上 = [昨高, 今低]、向下 = [今高, 昨低]
+       filled 之后有没有哪根的低价（向上）／高价（向下）碰回过缺口边界，即是否已回补 */
+  function gapsOf(bars) {
+    const out = [];
+    for (let i = 1; i < bars.length; i++) {
+      const p = bars[i - 1], b = bars[i];
+      let dir = 0, y = 0, gLo = 0, gHi = 0;
+      if (b.low > p.high) { dir = 1; y = p.high; gLo = p.high; gHi = b.low; }
+      else if (b.high < p.low) { dir = -1; y = p.low; gLo = b.high; gHi = p.low; }
+      else continue;
+      let filled = false;
+      for (let j = i + 1; j < bars.length && !filled; j++) {
+        if (dir > 0 ? bars[j].low <= y : bars[j].high >= y) filled = true;
+      }
+      out.push({ i: i, dir: dir, y: y, lo: gLo, hi: gHi, filled: filled });
+    }
+    return out;
+  }
+
+  /* ---------------- 日K（日线）图 ----------------
+     与分时图同样是「一个实例两层」：主图蜡烛（涨红跌绿）+ 副图成交量（按当根涨跌着色）。
+     横轴是类别轴（每根一格），两级 grid 共用同一批日期，纵向永远对齐。
+     view 来自 dailyView(i)：bars 是**展示窗口**（库里最后 DK_BARS 根 + 本地现算的当天那根），
+     ma / boll / gaps 已经按同一个窗口切好 —— 指标是在**全量**（含 DK_WARM 预热）上算的，
+     所以窗口的第一根也有 MA60 与布林三轨。
+     指标**每 3 秒跟着当天那根一起重算**（closes 里含当天那根本地现算的收盘价）：
+     均线 / 布林 / 跳空都会随最新价实时动，不是收盘后才刷新的静态图。
+     tooltip 里会点名「今日（本地缓存现算）」，因为那一根不是库里的数据。 */
+  function dailyOption(view, todayDate) {
+    const bars = (view && view.bars) || [];
+    const ma = (view && view.ma) || {};
+    const boll = (view && view.boll) || { mid: [], up: [], dn: [] };
+    const gaps = (view && view.gaps) || [];
+    const dates = bars.map(b => b.date);
+    /* 缺口按「产生缺口的那一根」归档，供 tooltip 用
+       （一根最多一个缺口：不可能既向上跳空又向下跳空） */
+    const gapAt = {};
+    gaps.forEach(function (g) { gapAt[g.x2] = g; });
+    const num2 = function (v) {
+      return (v === null || v === undefined || !isFinite(v)) ? null : (+v).toFixed(2);
+    };
+    /* ECharts 蜡烛图的数据顺序是 开·收·低·高（不是通常的「开高低收」），写反会画出倒蜡烛 */
+    const kdata = bars.map(b => [b.open, b.close, b.low, b.high]);
+    const vdata = bars.map(function (b) {
+      const up = b.close >= b.open;
+      return { value: b.vol || 0,
+               itemStyle: { color: up ? 'rgba(229,53,43,.55)' : 'rgba(18,160,106,.55)' } };
+    });
+    let hi = 0, lo = 0, vMax = 0;
+    bars.forEach(function (b) {
+      if (b.high > hi) hi = b.high;
+      if (b.low > 0 && (!lo || b.low < lo)) lo = b.low;
+      if (b.vol > vMax) vMax = b.vol;
+    });
+    /* 指标极值也要进 y 轴范围：布林上下轨可以跑到当根 K 线的高低之外
+       （横盘之后急拉/急跌时最常见），不进范围就被裁到画布外，看着像「布林线没画」。
+       跳空线画在缺口边界（＝前一根的高/低价）上，本身就落在区间内，不用单独兜。 */
+    const feed = function (arr) {
+      (arr || []).forEach(function (v) {
+        if (v === null || v === undefined || !isFinite(v)) return;
+        if (v > hi) hi = v;
+        if (v > 0 && (!lo || v < lo)) lo = v;
+      });
+    };
+    MA_PERIODS.forEach(function (n) { feed(ma[n]); });
+    feed(boll.up); feed(boll.mid); feed(boll.dn);
+    if (!(hi > 0) || !(lo > 0)) { hi = 1; lo = 0; }
+    const pad = Math.max((hi - lo) * 0.08, hi * 0.004, 0.01);
+
+    /* 跳空线：每条缺口画一段「两点同价」的横线；段与段之间**塞一个 null 断开**
+       （不塞的话 ECharts 会把上一个缺口的末端跟下一个缺口的起点连起来，
+        图上就冒出一条根本不在数据里的斜线）。横轴是类别轴，直接写 [下标, 价格]。 */
+    const gdata = [];
+    gaps.forEach(function (g) {
+      if (gdata.length) gdata.push(null);
+      gdata.push([g.x1, g.y]);
+      gdata.push([g.x2, g.y]);
+    });
+    /* 均线 / 布林 / 跳空都是细线，且不画拐点符号（几十根的小图里，拐点符号只会糊成一片） */
+    const lineOf = function (name, data, color, dash) {
+      return { name: name, type: 'line', data: data || [], xAxisIndex: 0, yAxisIndex: 0,
+               showSymbol: false, symbol: 'none', smooth: false, connectNulls: false,
+               lineStyle: { width: 1, color: color, type: dash || 'solid' },
+               itemStyle: { color: color }, z: 3, tooltip: { show: false } };
+    };
+
+    return {
+      animation: false,
+      tooltip: {
+        trigger: 'axis', confine: true, backgroundColor: 'rgba(16,21,29,.96)', borderColor: '#2a3444', borderWidth: 1,
+        textStyle: { color: '#e6ebf4', fontSize: 11 },
+        axisPointer: { type: 'line', label: { show: false }, link: [{ xAxisIndex: 'all' }] },
+        formatter: function (ps) {
+          if (!ps || !ps.length) return '';
+          const ix = ps[0].dataIndex;
+          const b = bars[ix];
+          if (!b) return '';
+          const pct = (b.pct === null || b.pct === undefined || !isFinite(b.pct)) ? null : b.pct;
+          let s = b.date + (b.date === todayDate ? '　<b>今日（本地缓存现算）</b>' : '') + '<br>' +
+                  '开 ' + b.open.toFixed(2) + '　高 ' + b.high.toFixed(2) + '<br>' +
+                  '低 ' + b.low.toFixed(2) + '　收 ' + b.close.toFixed(2) +
+                  (pct === null ? '' : '　' + (pct > 0 ? '+' : '') + pct.toFixed(2) + '%') + '<br>' +
+                  '量 ' + fmtLots(b.vol) + ' 手';
+          /* 指标行：不足周期的地方是 null（布林前 19 根、均线的第一根起就有值），显示成 —— */
+          const row = function (label, arr) {
+            const v = num2(arr && arr[ix]);
+            return v === null ? '' : label + ' ' + v + '　';
+          };
+          [row('MA5', ma[5]) + row('MA10', ma[10]),
+           row('MA20', ma[20]) + row('MA30', ma[30]),
+           row('MA60', ma[60])].forEach(function (t) {
+            if (t) s += '<br>' + t.replace(/　$/, '');
+          });
+          const bu = num2(boll.up[ix]), bm = num2(boll.mid[ix]), bd = num2(boll.dn[ix]);
+          if (bu !== null || bm !== null || bd !== null) {
+            s += '<br><span style="color:' + BOLL_COLORS.up + '">BOLL</span> 上 ' +
+                 (bu === null ? '—' : bu) + '　中 ' + (bm === null ? '—' : bm) +
+                 '　下 ' + (bd === null ? '—' : bd);
+          }
+          const g = gapAt[ix];
+          if (g) {
+            s += '<br><span style="color:' + GAP_COLOR + '">' + (g.dir > 0 ? '向上跳空' : '向下跳空') +
+                 '</span> 缺口 ' + Math.min(g.lo, g.hi).toFixed(2) + '~' +
+                 Math.max(g.lo, g.hi).toFixed(2) + (g.filled ? '（已回补）' : '（未回补）');
+          }
+          return s;
+        },
+      },
+      /* 图例：日K / 成交量 / 5 条均线 / 布林三轨 / 跳空 = 10 项，小格子里放不下就让它横向滚动
+         （type:'scroll'），主图上方留一行（top: 22）给图例，别压到蜡烛上 */
+      legend: {
+        type: 'scroll', top: 0, left: 2, right: 2, itemWidth: 11, itemHeight: 5, itemGap: 5,
+        textStyle: { fontSize: 9, color: '#8b95a9' }, inactiveColor: '#4a5468',
+        data: ['日K', '成交量'].concat(MA_PERIODS.map(n => 'MA' + n))
+                              .concat(['BOLL上轨', 'BOLL中轨', 'BOLL下轨', '跳空']),
+      },
+      grid: [
+        { left: 40, right: 20, top: 22, bottom: 58 },
+        { left: 40, right: 20, height: 34, bottom: 18 },
+      ],
+      xAxis: [
+        Object.assign({}, baseAxis, {
+          gridIndex: 0, type: 'category', data: dates, boundaryGap: true,
+          axisLabel: { show: false }, axisTick: { show: false },
+        }),
+        Object.assign({}, baseAxis, {
+          gridIndex: 1, type: 'category', data: dates, boundaryGap: true,
+          axisLabel: { fontSize: 8.5, color: '#8b95a9', hideOverlap: true,
+                       formatter: v => String(v).slice(5) },
+        }),
+      ],
+      yAxis: [
+        Object.assign({}, baseAxis, {
+          gridIndex: 0, type: 'value', min: +(lo - pad).toFixed(3), max: +(hi + pad).toFixed(3),
+          splitNumber: 2,
+          axisLabel: { fontSize: 9, color: '#8b95a9', formatter: v => Number(v).toFixed(2) },
+        }),
+        Object.assign({}, baseAxis, {
+          gridIndex: 1, type: 'value', min: 0, max: Math.max(vMax * 1.15, 1), splitNumber: 1,
+          axisLabel: { fontSize: 8, color: '#8b95a9', formatter: v => fmtLots(v) },
+        }),
+      ],
+      series: [
+        {
+          name: '日K', type: 'candlestick', data: kdata,
+          xAxisIndex: 0, yAxisIndex: 0, barMaxWidth: 9,
+          itemStyle: { color: UP_COLOR, color0: DOWN_COLOR,
+                       borderColor: UP_COLOR, borderColor0: DOWN_COLOR },
+        },
+        {
+          name: '成交量', type: 'bar', data: vdata,
+          xAxisIndex: 1, yAxisIndex: 1, barMaxWidth: 9,
+        },
+      ].concat(
+        MA_PERIODS.map(function (n) { return lineOf('MA' + n, ma[n], MA_COLORS[n]); }),
+        [
+          lineOf('BOLL上轨', boll.up, BOLL_COLORS.up, 'dashed'),
+          lineOf('BOLL中轨', boll.mid, BOLL_COLORS.mid),
+          lineOf('BOLL下轨', boll.dn, BOLL_COLORS.dn, 'dashed'),
+          /* 跳空线压在其它线上面（z 最大），缺口边界是要一眼看到的那条参考价 */
+          {
+            name: '跳空', type: 'line', data: gdata, xAxisIndex: 0, yAxisIndex: 0,
+            showSymbol: false, symbol: 'none', connectNulls: false,
+            lineStyle: { width: 1.6, color: GAP_COLOR, type: 'dashed' },
+            itemStyle: { color: GAP_COLOR }, z: 4, tooltip: { show: false },
+          },
+        ]
+      ),
+    };
+  }
+
+  /* ---------------- 状态 ---------------- */
+  const state = {
+    codes: codesLoad(),
+    /* cells: [{pts, snap, hist, raw, lastMin, prev, name, ts}]
+       pts 每点 = [本地时间戳, 交易秒序号, 价, 均价, 量比, 累计成交量(手)] */
+    paused: false,
+    timer: null,
+    gen: 0,               // 增删宫格的代次：请求返回时发现代次变了就丢弃结果
+    rounds: 0,            // 盘中的「轮」数：每发一轮批量请求 +1
+    ok: 0,
+    fail: 0,
+    lastAt: 0,
+    lastN: 0,             // 上一轮批量请求里成功拿到的只数（状态栏显示）
+    open: null,           // 上次判定时是否处于盘中（变化时刷新提示文案）
+    shot: '',             // 已经「一次性请求」过的非交易时段（phase.k）——同一时段只取一次
+    reqs: 0,              // 真正发出去的行情请求数（每轮 1 个，与格数无关；非交易时段 = 1）
+    mode: 'intraday',     // 'intraday'=分时（默认） / 'daily'=日K；整页一个开关，作用于全部格子
+    daily: {},            // code → {at, bars, err}：日线（不含当天）来自本站 /api/monitor/kline，只放内存
+  };
+
+  /* 一格的初始状态：分时点 + 全字段存档 + 上一次的快照
+     （快照让非交易时段也能显示收盘价与盘口，不用请求） */
+  function cellState(code) {
+    const o = storeRead(code);
+    return {
+      pts: o.pts, snap: o.snap, hist: o.hist,
+      raw: (o.snap && o.snap.raw) || null,        // 最近一次的全字段原始数组
+      lastMin: '',                                // 全字段存档的「分钟游标」
+      prev: (o.snap && o.snap.prev) || 0,
+      name: (o.snap && o.snap.name) || '',
+      ts: 0,
+    };
+  }
+
+  function resetCells() {
+    state.cells = state.codes.map(cellState);
+  }
+
+  /* 增删宫格会重写 innerHTML，旧的 echarts 实例必须显式 dispose：
+     否则 mkChart 的缓存里那个实例仍「活着」（isDisposed()=false），
+     但它挂的 DOM 已被丢掉 —— 后面的 setOption 全打在废弃节点上，图就再也不动了。 */
+  function disposeCharts() {
+    if (!window.echarts) return;
+    Array.prototype.forEach.call(document.querySelectorAll('.mon-chart'), function (el) {
+      const inst = echarts.getInstanceByDom(el);
+      if (inst && !inst.isDisposed()) inst.dispose();
+    });
+  }
+
+  function buildGrid() {
+    const g = document.getElementById('mon-grid');
+    /* 空态：页面不内置任何股票，没添加过（或全删光了）就是 0 格。
+       这里必须给一句明确的引导，否则一片空白看着像「页面坏了 / 数据没加载出来」。 */
+    if (!state.codes.length) {
+      g.innerHTML = '<div class="mon-empty">' +
+        '<b>还没有添加股票</b>' +
+        '<span>在上方输入代码后回车即可添加（如 <code>sh600519</code>，只写 6 位数字会自动补前缀），最多 ' +
+        MAX_CELLS + ' 只</span>' +
+        '<span class="muted">添加了哪几只就只缓存哪几只，下次打开自动恢复；' +
+        '「清空本地缓存」只清分时数据，不动这份清单。</span>' +
+        '</div>';
+      renderMeta();
+      return;
+    }
+    g.innerHTML = state.codes.map(function (c, i) {
+      /* draggable 先关着：格子里有输入框，若一开始就 true，原生拖拽会抢走 mousedown，
+         代码框里就没法拖选文字了。mousedown 落在「非交互区域」时才临时打开。 */
+      return '<div class="mon-cell blank" data-i="' + i + '" draggable="false">' +
+        '<div class="mon-top">' +
+          '<span class="mon-grip" title="按住拖动，可调整宫格顺序"></span>' +
+          '<input class="mon-code" value="' + esc(c) + '" spellcheck="false" maxlength="8" title="输入代码后回车">' +
+          '<span class="mon-name" title="点这里看这只股票的全部 88 个原始字段">—</span>' +
+          '<span class="mon-dot" title="状态"></span>' +
+        '</div>' +
+        '<button class="mon-del" data-del="' + i + '" title="删除这一格">×</button>' +
+        '<div class="mon-quote"><span class="mon-price">—</span><span class="mon-chg">—</span></div>' +
+        /* 左边是图（主图 + 量比副图共用一个实例），右边是五档盘口 */
+        '<div class="mon-body">' +
+          '<div class="mon-charts"><div class="mon-chartwrap">' +
+            /* 提示浮层必须在 .mon-chart 外面：ECharts init 会接管容器内容，放里面会被清掉 */
+            '<div class="mon-chart" id="mon-chart-' + i + '"></div>' +
+            '<div class="mon-tip">采集中…</div>' +
+          '</div></div>' +
+          '<div class="mon-book" id="mon-book-' + i + '"></div>' +
+        '</div>' +
+        '<div class="mon-foot"><span>均 <b>—</b></span><span>高 <b>—</b></span>' +
+          '<span>低 <b>—</b></span><span>额 <b>—</b></span><span>量比 <b>—</b></span></div>' +
+        '</div>';
+    }).join('');
+    Array.prototype.forEach.call(g.querySelectorAll('.mon-code'), function (inp) {
+      inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') inp.blur(); });
+      inp.addEventListener('change', function () { onCodeChange(inp); });
+    });
+    Array.prototype.forEach.call(g.querySelectorAll('.mon-del'), function (btn) {
+      btn.addEventListener('click', function () { removeCell(+btn.dataset.del); });
+    });
+    Array.prototype.forEach.call(g.querySelectorAll('.mon-name'), function (nm) {
+      nm.addEventListener('click', function () {
+        openFieldModal(+nm.closest('.mon-cell').dataset.i);
+      });
+    });
+    renderMeta();
+  }
+
+  function renderMeta() {
+    const n = state.codes.length;
+    const c = document.getElementById('mon-count');
+    if (c) c.textContent = n + ' / ' + MAX_CELLS + ' 格';
+    const cy = document.getElementById('mon-cycle');
+    if (cy) cy.textContent = n === 0 ? '添加股票后开始采集'
+      : (n + ' 格共 1 个请求，每 3 秒全部刷新一次');
+  }
+
+  /* 空格子里的提示文案：非交易时段要说清「不是坏了，是按设计停了」；
+     日K 视图下换成「日线到没到」（跟时段无关），所以按格取文案 */
+  function setTips(ph) {
+    ph = ph || phaseOf();
+    const txt = isOpen(ph) ? '采集中…'
+      : ph.k === 'pre' ? '未开盘 · 已取一次快照（09:30 自动开始采集）'
+        : ph.k === 'lunch' ? '午间休市 · 已取一次快照（13:00 自动继续）'
+          : ph.k === 'holiday' ? '非交易日 · 只取一次快照'
+            : '已收盘 · 只取一次快照（' + nextOpenText() + ' 恢复）';
+    Array.prototype.forEach.call(document.querySelectorAll('.mon-cell'), function (el) {
+      const t = el.querySelector('.mon-tip');
+      if (!t) return;
+      t.textContent = (state.mode === 'daily') ? dailyTip(+el.dataset.i) : txt;
+    });
+  }
+
+  function rebuild() {
+    disposeCharts();
+    buildGrid();
+    state.cells.forEach(function (_, i) { paintSnap(i); drawCell(i); });
+    setTips(phaseOf());
+  }
+
+  /* ---------------- 分时 ⇄ 日K 视图切换 ----------------
+     整页一个开关（作用于全部格子，不做「每格各切一个」）：
+       · 切到日K：向本站要日线（腾讯接口没有历史日线），当天那根由本地缓存现算；
+       · 切回分时：直接用内存里的采样点重画，**不需要任何请求**。
+     视图只影响「画什么」，不影响取数：行情轮询照旧每 3 秒一轮，
+     所以停在日K视图时当天那根 K 线照样跟着动（每轮 applyQuote → drawCell）。 */
+  function renderModeBtn() {
+    const btn = document.getElementById('mon-mode');
+    if (!btn) return;
+    const daily = state.mode === 'daily';
+    /* 文案＝点下去会切到哪个视图（和「暂停 / 继续」一个路子），别写成当前状态 */
+    btn.textContent = daily ? '分时' : '日K';
+    btn.classList.toggle('on', daily);
+    btn.title = daily
+      ? '切回分时图（全部格子）'
+      : '切成日K线（全部格子）：最近 ' + DK_BARS + ' 根取自本地库，当天那根由本地缓存现算，' +
+        '带 BOLL(20,2) + MA5/10/20/30/60 + 跳空缺口线（都随行情实时重算）';
+  }
+
+  /* 重画全部格子（只动画笔，不发请求、不改数据）。切视图与日线到位后都用它 */
+  function repaint() {
+    setTips(phaseOf());
+    state.cells.forEach(function (_, i) { drawCell(i); });
+  }
+
+  async function setMode(m) {
+    m = (m === 'daily') ? 'daily' : 'intraday';
+    if (state.mode === m) return;
+    state.mode = m;
+    renderModeBtn();
+    repaint();                       // 先用手上有的数据立刻重画，别等网络（切视图不该卡一下）
+    await ensureDaily(false);        // 日K 视图下补日线（没有 / 过期的才问）
+    bumpStatus();
+  }
+
+  /* ---------------- 当天那根日K：**只用本地缓存现算** ----------------
+     库里没有当天数据（日线是收盘后才同步的），所以当天那根由浏览器自己拼：
+       · 每整分钟的全字段存档（hist）：最高(33)/最低(34)/成交量(6)/成交额(37) 都是
+         「当日累计」口径 —— 所以哪怕存档只留了最后 180 条（HIST_MAX），
+         取「最大值」拿到的仍是全天的高低与全天的量额；今开(5)更是一整日不变的常量；
+       · 分时采样点（pts）：兜底用（刚打开页面时可能还没有存档），第 6 位就是累计成交量；
+       · 最后一次快照（snap）：只有「快照日期＝今天」才认（非交易时段的隔夜快照不算），
+         它的今开/最新价最权威。
+     口径与库里一致：价 = 元，量 = 手，额 = 万元（腾讯 f[37] 本身就是万元）。
+     没有当天数据（收盘后才打开页面、非交易日）就返回 null —— 不硬凑一根假 K 线。 */
+  function todayBar(i) {
+    const st = state.cells[i];
+    if (!st) return null;
+    const today = dayKey(Date.now());
+    const todayS = ymd(new Date());
+    let open = 0, high = 0, low = 0, close = 0, vol = 0, amt = 0;
+
+    (st.hist || []).forEach(function (h) {
+      if (dayKey(h[0]) !== today) return;
+      const r = h[2];
+      if (!r || r.length < 52) return;
+      const o = +(r[IX.open] || 0);
+      if (o > 0 && !open) open = o;
+      const hh = +(r[IX.high] || 0); if (hh > high) high = hh;
+      const ll = +(r[IX.low] || 0); if (ll > 0 && (!low || ll < low)) low = ll;
+      const c = +(r[IX.price] || 0); if (c > 0) close = c;
+      const v = +(r[IX.vol] || 0); if (v > vol) vol = v;
+      const a = +(r[IX.amount] || 0); if (a > amt) amt = a;
+    });
+
+    let ptsOpen = 0;
+    (st.pts || []).forEach(function (p) {
+      if (dayKey(p[0]) !== today || !(p[2] > 0)) return;
+      if (!ptsOpen) ptsOpen = p[2];
+      if (p[2] > high) high = p[2];
+      if (!low || p[2] < low) low = p[2];
+      close = p[2];
+      if (p[5] > vol) vol = p[5];
+    });
+
+    const s = (st.snap && st.snap.date === todayS && st.snap.price > 0) ? st.snap : null;
+    if (s) {
+      if (s.price > high) high = s.price;
+      if (!low || s.price < low) low = s.price;
+      if (s.high > high) high = s.high;
+      if (s.low > 0 && (!low || s.low < low)) low = s.low;
+      close = s.price;
+      if (s.vol > vol) vol = s.vol;
+      if (s.amount > amt) amt = s.amount;
+    }
+
+    const openF = (s && s.open > 0) ? s.open : (open || ptsOpen);
+    if (!(openF > 0) || !(close > 0) || !(high > 0) || !(low > 0)) return null;
+    if (openF > high) high = openF;          // 今开必然落在当日高低区间内（缺帧时兜一下）
+    if (openF < low) low = openF;
+    const prev = (s && s.prev > 0) ? s.prev : (st.prev > 0 ? st.prev : 0);
+    return { date: todayS, open: openF, high: high, low: low, close: close,
+             vol: vol, amount: amt, prev: prev,
+             pct: prev > 0 ? (close / prev - 1) * 100 : null, today: true };
+  }
+
+  /* 日K 视图下这一格的**全量**日线：库里那 DK_REQ 根（不含当天）+ 本地现算的当天那根。
+     库里若已经有当天（收盘后同步过日线），就以库里的为准，不再叠一根本地算的。
+     全量比画出来的多 DK_WARM 根 —— 多出来的是指标的预热带（见 DK_WARM 那里）。 */
+  function dailyAll(i) {
+    const code = state.codes[i];
+    const d = state.daily[code];
+    const bars = (d && Array.isArray(d.bars)) ? d.bars.slice() : [];
+    const tb = todayBar(i);
+    if (tb && (!bars.length || bars[bars.length - 1].date < tb.date)) bars.push(tb);
+    return bars;
+  }
+
+  /* 真正画出去的那一串 = 全量的最后 DK_BARS 根（带当天那根就是 DK_BARS+1 根）。
+     指标在全量上算、这里只切窗口，所以窗口第一根也有 MA60 与布林三轨。 */
+  function dailySeries(i) {
+    const all = dailyAll(i);
+    if (all.length <= DK_BARS) return all;
+    const hasToday = !!all[all.length - 1].today;
+    const n = DK_BARS + (hasToday ? 1 : 0);
+    return all.length > n ? all.slice(all.length - n) : all;
+  }
+
+  /* 交给 dailyOption 的一整包：展示窗口 + 已按窗口切好的指标 + 缺口。
+     **每 3 秒重算一次**（当天那根跟着行情动），所以均线 / 布林 / 跳空都是活的，
+     不是收盘后才刷新的静态图。 */
+  function dailyView(i) {
+    const all = dailyAll(i);
+    const bars = dailySeries(i);
+    const off = all.length - bars.length;
+    const closes = all.map(function (b) { return b.close; });
+    const ma = {};
+    MA_PERIODS.forEach(function (n) { ma[n] = maOf(closes, n).slice(off); });
+    const b = bollOf(closes, BOLL_N, BOLL_K);
+    /* 缺口也切到展示窗口：一条缺口要「前一根 → 产生它的那根」两个点都在窗口里才画得出来，
+       窗口第一根上的那个缺口缺了「前一根」，只能跳过（一根的事，不影响整体） */
+    const gaps = gapsOf(all).filter(function (g) { return g.i - 1 >= off; })
+      .map(function (g) {
+        return { x1: g.i - 1 - off, x2: g.i - off, dir: g.dir, y: g.y,
+                 lo: g.lo, hi: g.hi, filled: g.filled };
+      });
+    return { bars: bars, ma: ma,
+             boll: { mid: b.mid.slice(off), up: b.up.slice(off), dn: b.dn.slice(off) },
+             gaps: gaps };
+  }
+
+  /* 日K 视图下空格子的提示：说的是「日线到没到」，跟交易时段无关
+     （分时那套「已收盘 · 只取一次快照」在日K视图里没有意义） */
+  function dailyTip(i) {
+    const d = state.daily[state.codes[i]];
+    if (!d) return '日K 加载中…';
+    if (d.err) return d.err;
+    if (dailySeries(i).length < 2) return '本地没有这只股票的日线（先在「数据管理」同步日线）';
+    return '日K';
+  }
+
+  function cellEl(i) { return document.querySelector('.mon-cell[data-i="' + i + '"]'); }
+
+  function setDot(i, cls, title) {
+    const el = cellEl(i); if (!el) return;
+    const dot = el.querySelector('.mon-dot');
+    dot.className = 'mon-dot' + (cls ? ' ' + cls : '');
+    if (title) dot.title = title;
+    el.classList.toggle('bad', cls === 'bad');
+  }
+
+  /* 重画某一格：按当前视图分流。
+     分时：只使用「与最新采样同一天」的点，跨日自动清干净；
+     日K：库里的 DK_BARS 根（含预热算出的均线/布林/跳空）+ 本地现算的当天那根（见 dailyView）。 */
+  function drawCell(i) {
+    const st = state.cells[i];
+    const box = document.getElementById('mon-chart-' + i);
+    if (!st || !box) return;
+    const cell = cellEl(i);
+    if (state.mode === 'daily') {
+      const view = dailyView(i);                 // 展示窗口 + 已切好窗口的均线/布林/缺口
+      if (cell) cell.classList.toggle('blank', view.bars.length < 2);
+      mkChart(box, dailyOption(view, ymd(new Date())));
+      return;
+    }
+    let pts = st.pts;
+    if (pts.length) {
+      const dk = dayKey(pts[pts.length - 1][0]);
+      pts = pts.filter(p => dayKey(p[0]) === dk);
+    }
+    if (cell) cell.classList.toggle('blank', pts.length < 2);
+    mkChart(box, intradayOption(pts, st.prev || (pts.length ? pts[0][2] : 0)));
+  }
+
+  /* 非交易时段进来时用本地留存的快照先把这一格画出来（随后的一次性请求会覆盖它）。
+     注意：非交易时段的快照**不再落盘**，所以这里拿到的多半是「上一个盘中的最后一帧」。 */
+  function paintSnap(i) {
+    const st = state.cells[i];
+    if (!st || !st.snap || !(st.snap.price > 0)) return;
+    paintQuote(i, st.snap);
+    setDot(i, '', '本地快照 ' + clockOf(st.snap.t));
+  }
+
+  /* 手数显示：>=1 万手折成「万」，窄栏里不摆千分位逗号 */
+  const fmtLots = v => !(v > 0) ? '—' : (v >= 10000 ? (v / 10000).toFixed(2) + '万' : String(Math.round(v)));
+
+  function paintQuote(i, q) {
+    const el = cellEl(i); if (!el) return;
+    const chg = isFinite(q.chg) ? q.chg : 0, pct = isFinite(q.pct) ? q.pct : 0;
+    const cls = (pct > 0 ? 'up' : (pct < 0 ? 'down' : 'flat'));
+    el.querySelector('.mon-name').textContent = q.name || state.codes[i];
+    const pe = el.querySelector('.mon-price');
+    pe.textContent = q.price > 0 ? q.price.toFixed(2) : '—';
+    pe.className = 'mon-price ' + cls;
+    const ce = el.querySelector('.mon-chg');
+    ce.textContent = (chg > 0 ? '+' : '') + chg.toFixed(2) + '  ' +
+                     (pct > 0 ? '+' : '') + pct.toFixed(2) + '%';
+    ce.className = 'mon-chg ' + cls;
+    const b = el.querySelectorAll('.mon-foot b');
+    b[0].textContent = q.avg > 0 ? q.avg.toFixed(2) : '—';
+    b[1].textContent = q.high > 0 ? q.high.toFixed(2) : '—';
+    b[2].textContent = q.low > 0 ? q.low.toFixed(2) : '—';
+    b[3].textContent = q.amount > 0 ? fmt.big(q.amount) : '—';
+    if (b[4]) b[4].textContent = q.vr > 0 ? q.vr.toFixed(2) : '—';     // 量比（f49）
+    paintBook(i, q);
+  }
+
+  /* 五档盘口：卖 5→卖 1 在上、买 1→买 5 在下（和行情软件的顺序一致）；
+     价格按「相对昨收」着色 —— 涨红跌绿，这是中国习惯。 */
+  function paintBook(i, q) {
+    const el = document.getElementById('mon-book-' + i);
+    if (!el) return;
+    const prev = q.prev > 0 ? q.prev : 0;
+    const tone = p => (p > 0 && prev > 0) ? (p > prev ? 'up' : (p < prev ? 'down' : 'flat')) : 'flat';
+    const row = function (label, p, v) {
+      return '<div class="mon-bk"><span class="mon-bkl">' + label + '</span>' +
+             '<b class="' + tone(p) + '">' + (p > 0 ? p.toFixed(2) : '—') + '</b>' +
+             '<i>' + fmtLots(v) + '</i></div>';
+    };
+    const asks = q.asks || [], bids = q.bids || [];
+    let h = '';
+    for (let k = 4; k >= 0; k--) { const a = asks[k] || [0, 0]; h += row('卖' + (k + 1), a[0], a[1]); }
+    h += '<div class="mon-bkseam"></div>';
+    for (let k = 0; k < 5; k++) { const bq = bids[k] || [0, 0]; h += row('买' + (k + 1), bq[0], bq[1]); }
+    el.innerHTML = h;
+  }
+
+  /* 只有「盘中 + 行情日期就是今天」的点才允许落缓存：
+     非交易时段腾讯会把上一交易日的快照一直挂着（时间还停在 15:00:00），不挡住的话
+     点会被续到今天的曲线上 —— 宁可少存，绝不存错。 */
+  function cacheable(q, ph) {
+    if (!isOpen(ph || phaseOf())) return false;
+    return q.date === ymd(new Date());
+  }
+
+  function applyQuote(i, code, q) {
+    const st = state.cells[i];
+    if (!st) return;
+    const ph = phaseOf();
+    const sec = secIdx(q.time);
+    const today = dayKey(Date.now());
+    const last = st.pts[st.pts.length - 1];
+    st.prev = q.prev || q.price;
+    st.name = q.name;
+    st.raw = q.raw || st.raw;
+    if (!st.hist) st.hist = [];
+    /* 快照 = 最后一次拿到的「完整一帧」：常用字段 + 五档盘口 + 全部 88 个原始字段。
+       非交易时段不请求行情，就靠它把这一格完整画出来（含盘口）。 */
+    st.snap = { t: Date.now(), name: q.name, code: q.code, date: q.date, minute: q.minute, time: q.time,
+                price: q.price, prev: q.prev, open: q.open, vol: q.vol, chg: q.chg, pct: q.pct,
+                high: q.high, low: q.low, amount: q.amount, avg: q.avg, vr: q.vr,
+                outer: q.outer, inner: q.inner, bids: q.bids, asks: q.asks,
+                raw: q.raw || null };
+    if (sec !== null && q.price > 0 && cacheable(q, ph)) {
+      const pt = [Date.now(), sec, q.price, q.avg || 0, q.vr || 0, q.vol || 0];
+      if (!last || dayKey(last[0]) !== today) {
+        st.pts = [pt];                                 // 跨日：昨日曲线整条丢掉
+      } else if (sec > last[1]) {
+        st.pts.push(pt);                               // 正常推进
+      } else if (sec === last[1]) {
+        st.pts[st.pts.length - 1] = pt;                // 同一秒（重试/收盘后）覆盖末点
+      }
+      // sec < last[1]：收盘后 sec 恒为 14400，被上面两个分支吃掉，不会无限堆点
+      // 全字段存档：每个整分钟留 1 条完整原始帧（留给后续开发，不是逐笔明细）
+      if (q.minute && q.minute !== st.lastMin) {
+        st.lastMin = q.minute;
+        st.hist.push([Date.now(), sec, q.raw || []]);
+        if (st.hist.length > HIST_MAX) st.hist = st.hist.slice(-HIST_MAX);
+      }
+    }
+    /* 只有盘中才落盘：曲线的采样点必须都是盘中的；非交易时段那份快照拿来看就行，
+       写进 localStorage 只会把隔夜/僵死的帧灌进缓存，下次打开还会被误当成
+       「本地留存的收盘快照」——所以非交易时段的请求一律不留存。 */
+    if (isOpen(ph)) storeSave(code, st.pts, st.snap, st.hist);
+    st.ts = Date.now();
+    paintQuote(i, q);
+    drawCell(i);
+  }
+
+  /* ---------------- 轮询调度：每 3 秒一次，一次请求拿回全部宫格；非盘中不发请求 ---------------- */
+  function schedule(ms) {
+    if (state.timer) clearTimeout(state.timer);
+    state.timer = setTimeout(step, ms || POLL_MS);
+  }
+  /* 非交易时段：按「下一个时段边界」睡，最多 IDLE_MS 醒一次（纯本地判断，不发请求）。
+     边界就在眼前时精确在那一刻醒来，所以 09:30 / 13:00 不会被拖后。 */
+  function scheduleIdle(now) {
+    const d = now || new Date();
+    const t = d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds();
+    let wait = IDLE_MS;
+    [AM_OPEN, AM_CLOSE, PM_OPEN, PM_CLOSE + CLOSE_GRACE].forEach(function (m) {
+      const gap = (m - t) * 1000;
+      if (gap > 0 && gap < wait) wait = gap;
+    });
+    schedule(wait < 1000 ? 1000 : wait);
+  }
+
+  /* 批量拉一轮：**一个请求覆盖全部宫格**，拿回来按代码分发。
+     manual=true 才绕过「非盘中不发请求」的门禁 —— 「全部刷新」按钮和非交易时段的
+     「一次性请求」都走这条路。**是否落盘由 applyQuote 按当前时段决定**，
+     所以 manual 的请求在非交易时段照样不会写 localStorage。 */
+  async function pullAll(manual) {
+    const codes = state.codes.slice();
+    if (!codes.length) return 0;
+    if (!manual && !isOpen(phaseOf())) return 0;       // 自动轮询只在盘中
+    const ph = phaseOf();
+    const gen = state.gen;
+    const label = isOpen(ph) ? '请求中' : '取一次快照';
+    codes.forEach(function (_, i) { setDot(i, 'wait', label); });
+    state.reqs++;                                       // 每轮只 +1（与格数无关）
+    try {
+      const map = await fetchQuotes(codes);
+      if (gen !== state.gen) return 0;                  // 期间增删过宫格：下标语义已变，结果丢掉
+      let hit = 0, miss = 0;
+      codes.forEach(function (code, i) {
+        const q = map[code];
+        if (q) {
+          applyQuote(i, code, q);
+          setDot(i, 'ok', isOpen(ph) ? ('最近更新 ' + clockOf(Date.now()))
+                                     : ('非交易时段一次性快照 ' + clockOf(Date.now())));
+          hit++;
+        } else {
+          setDot(i, 'bad', '这只没返回数据（代码对吗？）');
+          miss++;
+        }
+      });
+      state.ok += hit;
+      state.fail += miss;
+      state.lastN = hit;
+      return hit;
+    } catch (e) {
+      if (gen !== state.gen) return 0;
+      const why = (e && e.name === 'AbortError') ? '请求超时' : ('请求失败 ' + (e && e.message));
+      codes.forEach(function (_, i) { setDot(i, 'bad', why); });
+      state.fail += codes.length;
+      state.lastN = 0;
+      return 0;
+    }
+  }
+
+  /* 单只拉取（添加/切换某一格时用）：走同一条批量通道，只是数组里只有一只 —— 
+     不另开一条取数路径，解析/分发/落盘的判定只有一份。 */
+  async function pullOne(i, manual) {
+    const code = state.codes[i];
+    if (!code) return false;
+    if (!manual && !isOpen(phaseOf())) return false;
+    const gen = state.gen;
+    setDot(i, 'wait', '请求中');
+    state.reqs++;
+    try {
+      const map = await fetchQuotes([code]);
+      if (gen !== state.gen) return false;
+      const q = map[code];
+      if (q) { applyQuote(i, code, q); setDot(i, 'ok', '最近更新 ' + clockOf(Date.now())); state.ok++; return true; }
+      setDot(i, 'bad', '这只没返回数据（代码对吗？）'); state.fail++;
+      return false;
+    } catch (e) {
+      if (gen !== state.gen) return false;
+      setDot(i, 'bad', (e && e.name === 'AbortError') ? '请求超时' : ('请求失败 ' + (e && e.message)));
+      state.fail++;
+      return false;
+    }
+  }
+
+  /* 非交易时段的「只取一次」：进入该时段（或刚打开页面）时把所有格**一个请求**问一遍，
+     只为拿一份最新快照把页面画出来。**不落盘**（applyQuote 里按 isOpen 判定）。
+     同一时段内只跑一次（state.shot 记住跑了哪个时段），否则 20 秒一醒就发一轮请求。 */
+  async function offHoursShot() {
+    if (state.paused) return;
+    await pullAll(true);
+  }
+
+  async function step() {
+    calFresh();
+    const ph = phaseOf();
+    if (state.paused) { bumpStatus(ph); schedule(); return; }
+    if (!isOpen(ph)) {
+      if (state.open !== false) { state.open = false; setTips(ph); }
+      if (state.shot !== ph.k) {
+        /* 刚进入这个非交易时段（或刚打开页面）：整轮请求一次拿最新快照。
+           跑完 state.shot 就记住了，之后所有调度只做纯本地空转、不再发请求。 */
+        state.shot = ph.k;
+        bumpStatus(ph);
+        await offHoursShot();
+        bumpStatus();
+        scheduleIdle();
+        return;
+      }
+      bumpStatus(ph);
+      scheduleIdle();
+      return;
+    }
+    state.shot = '';                          // 回到盘中：清掉「已取过一次」的标记
+    if (state.open !== true) { state.open = true; setTips(ph); }
+    const gen = state.gen;
+    const t0 = Date.now();
+    await pullAll(false);                     // 一个请求 = 全部宫格
+    if (gen !== state.gen) { schedule(); return; }   // 期间增删过宫格，结果已丢弃
+    state.lastAt = Date.now();
+    state.rounds++;
+    bumpStatus();
+    // 保持「每 3 秒一轮」的节拍：扣掉本次请求耗时，慢请求时至少留 1 秒
+    schedule(Math.max(1000, POLL_MS - (Date.now() - t0)));
+  }
+
+  /* 日K 视图下在状态栏点一下视图名 —— 免得「看着日线却以为在分时」 */
+  function modeNote() {
+    return state.mode === 'daily'
+      ? (' · 日K视图（' + DK_BARS + ' 根 + 当日现算 · BOLL/均线/跳空实时重算）') : '';
+  }
+
+  function bumpStatus(ph) {
+    const el = document.getElementById('mon-state');
+    if (!el) return;
+    ph = ph || phaseOf();
+    /* 一格都没有时不摆「第 0 轮 · 0 格」这种读不通的文案，直接说清该干什么 */
+    if (!state.codes.length) {
+      el.textContent = (state.paused ? '已暂停' : ph.txt) + ' · 还没有添加股票（在上方输入代码添加）' + calNote();
+      return;
+    }
+    if (state.paused) { el.textContent = '已暂停（' + ph.txt + '）' + modeNote(); return; }
+    if (!isOpen(ph)) {
+      el.textContent = ph.txt + ' · 仅取一次快照 · ' + nextOpenText() + ' 自动恢复' + modeNote() + calNote();
+      return;
+    }
+    el.textContent = '运行中 · ' + ph.txt + ' · 第 ' + state.rounds + ' 轮 · ' +
+                     state.codes.length + ' 格 / 每 3 秒一次' +
+                     ' · 本轮 ' + state.lastN + '/' + state.codes.length +
+                     ' · 累计成功 ' + state.ok + ' / 失败 ' + state.fail +
+                     (state.lastAt ? ' · ' + clockOf(state.lastAt) : '') + modeNote() + calNote();
+  }
+  /* 日历没取到（后端没起 / 超出覆盖范围）时得说一声，否则「今天算不算交易日」是猜的 */
+  function calNote() {
+    return cal.ok ? '' : ' · 日历不可用，按周一~周五近似';
+  }
+
+  /* ---------------- 增删宫格 ---------------- */
+  /* 增删都走「改数组 → gen++ → rebuild」，正在飞的那次请求结果按代次丢掉，
+     不会把行情写到错位的新格子上。 */
+  function addCell(code) {
+    if (state.codes.length >= MAX_CELLS) { toast('最多 ' + MAX_CELLS + ' 只，先点格子右上角 × 删掉一格再加', 'err'); return false; }
+    if (state.codes.indexOf(code) >= 0) { toast('该股票已在监控中：' + code, 'err'); return false; }
+    state.gen++;
+    state.codes.push(code);
+    state.cells.push(cellState(code));
+    state.rounds = 0;
+    codesSave();
+    rebuild();
+    bumpStatus();
+    /* 挪到本轮同步添加全部结束之后再拉：一次加多只时每只都会 gen++，
+       若这里立刻发请求，先加的那只会被后一只的代次丢掉 —— 结果要等下**一整轮**
+       （3 秒）才补上名字/价格/盘口，看着像没加上。
+       微任务在本轮同步代码跑完后才执行，那时 gen 已经稳定，请求就不会被丢了。
+       非交易时段也照取一次（manual）：刚加的票不能空着，而 applyQuote 按 isOpen 判定，
+       那一份照样不会写进本地存储。
+       日K 视图下顺带把这只的日线也补上（ensureDaily 自己判断当前是不是日K视图）。 */
+    Promise.resolve().then(function () {
+      pullOne(state.codes.indexOf(code), !isOpen(phaseOf()));
+      ensureDaily(false);
+    });
+    return true;
+  }
+
+  /* 移除只摘掉宫格，**不清本地缓存** —— 误删了把代码加回来，曲线还能接上；
+     要彻底清点卡片头的「清空本地缓存」（那个也只清分时数据、不动代码清单）。
+     允许删到 0 格：页面本来就不内置任何股票，全删光就是空态（会显示添加入口引导）。 */
+  function removeCell(i) {
+    if (!state.codes.length) return;
+    const code = state.codes[i];
+    state.gen++;
+    state.codes.splice(i, 1);
+    state.cells.splice(i, 1);
+    state.rounds = 0;
+    codesSave();
+    rebuild();
+    bumpStatus();
+    toast(state.codes.length
+      ? ('已移除 ' + code + '（本地分时点仍保留，重新添加可续上）')
+      : ('已移除 ' + code + '，宫格已清空（本地分时点仍保留）'));
+  }
+
+  /* 拖动排序：把 from 格整体挪到「原数组第 insertBefore 个之前」的位置。
+     codes 与 cells 是平行数组，必须**同一套置换**一起挪，否则代码和曲线就错位了。
+     挪完 gen++（在途请求按代次丢弃）、轮次归零，再整格重建。 */
+  function reorderCells(from, insertBefore) {
+    const n = state.codes.length;
+    if (from < 0 || from >= n || n < 2) return -1;
+    let at = insertBefore;
+    if (at < 0) at = 0;
+    if (at > n) at = n;
+    if (from < at) at--;                 // 源格被摘掉后，它后面的下标整体前移一位
+    if (at === from) return -1;          // 原地没动
+    state.gen++;
+    const code = state.codes.splice(from, 1)[0];
+    state.codes.splice(at, 0, code);
+    const cst = state.cells.splice(from, 1)[0];
+    state.cells.splice(at, 0, cst);
+    state.rounds = 0;
+    codesSave();
+    rebuild();
+    bumpStatus();
+    return at;
+  }
+
+  function submitAdd() {
+    const inp = document.getElementById('mon-add-code');
+    const raw = (inp.value || '').trim();
+    if (!raw) { toast('请先输入股票代码', 'err'); inp.focus(); return; }
+    const parts = raw.split(/[,，;；\s]+/).filter(Boolean);
+    let added = 0, bad = [];
+    parts.forEach(function (p) {
+      const code = normCode(p);
+      if (!code || !addCell(code)) { if (!code) bad.push(p); return; }
+      added++;
+    });
+    if (bad.length) toast('代码无法识别：' + bad.join(' '), 'err');
+    else if (added) toast('已添加 ' + added + ' 只，继续监控中');
+    if (added) { inp.value = ''; inp.focus(); }
+  }
+
+  /* ---------------- 全字段表弹窗 ----------------
+     接口一次返回 88 项，本地全部原样存着（最新快照 + 每整分钟 1 条存档）。
+     点格子里的股票名就打开这张表，还能一键复制 JSON —— 后续要加指标时直接照下标取，
+     不用再回头翻接口。 */
+  const MARK_TXT = { v: ['已核对', 'ok'], u: ['用户提供', 'warn'], '?': ['未考证', 'unk'], '-': ['空占位', 'unk'] };
+
+  function copyText(txt) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(txt); return true; }
+    } catch (e) { /* 落到下面的兜底 */ }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = txt; ta.style.position = 'fixed'; ta.style.top = '-1000px';
+      document.body.appendChild(ta); ta.select();
+      const okk = document.execCommand('copy');
+      ta.remove(); return okk;
+    } catch (e) { return false; }
+  }
+
+  function fieldPayload(i) {
+    const st = state.cells[i] || {};
+    const code = state.codes[i] || '';
+    return {
+      code: code,
+      name: (st.snap && st.snap.name) || '',
+      market_time: (st.snap && st.snap.time) || '',
+      api: API + code,
+      note: 'field_names[i] 对应接口按 ~ 切分后的第 i 项；hist 为每整分钟 1 条的全字段存档',
+      field_names: FLD_NAME.slice(),
+      field_marks: FLD_MARK.slice(),
+      raw: (st.raw || []).slice(),
+      hist: (st.hist || []).slice(),
+    };
+  }
+
+  function openFieldModal(i) {
+    const st = state.cells[i];
+    if (!st) return;
+    const code = state.codes[i];
+    const raw = st.raw || [];
+    const snap = st.snap || null;
+    let bytes = 0;
+    try { bytes = (localStorage.getItem(LS_PTS + code) || '').length; } catch (e) { /* ignore */ }
+    let rows = '';
+    for (let k = 0; k < FLD.length; k++) {
+      const m = MARK_TXT[FLD_MARK[k]] || MARK_TXT['?'];
+      const cellv = (raw[k] === undefined || raw[k] === '') ? '<span class="muted">（空）</span>' : esc(raw[k]);
+      rows += '<tr><td class="num muted">' + k + '</td>' +
+              '<td style="font-family:var(--mono)">' + esc(FLD_NAME[k]) + '</td>' +
+              '<td>' + cellv + '</td>' +
+              '<td><span class="fld-mk ' + m[1] + '">' + m[0] + '</span></td></tr>';
+    }
+    const body =
+      '<div class="small muted" style="margin-bottom:8px">' +
+        '接口 <code>' + esc(API + code) + '</code>' +
+        (snap && snap.time ? ' · 行情时间 <b>' + esc(snap.time) + '</b>' : '') +
+        (st.ts ? ' · 最近采样 ' + clockOf(st.ts) : '') +
+        '<br>本地留存：分时采样 <b>' + st.pts.length + '</b> 点 · 全字段存档 <b>' + (st.hist || []).length +
+        '</b> 条（每整分钟 1 条） · 该股存储约 <b>' + (bytes / 1024).toFixed(1) + ' KB</b>' +
+      '</div>' +
+      '<div class="fld-tbl"><table class="data sm"><thead><tr>' +
+        '<th style="width:40px">下标</th><th style="width:132px">字段</th><th>值</th>' +
+        '<th style="width:70px">可信度</th></tr></thead><tbody>' + rows + '</tbody></table></div>' +
+      '<div class="small muted" style="margin-top:8px">' +
+        '「已核对」= 拿本地 daily_kline 自算、或用字段勾稽关系交叉验过；「未考证」= 原样存着，要用时再定性。' +
+        '单位：成交额/盘后额 = 万元，成交量 = 手，市值 = 亿元，均价/价格 = 元。' +
+      '</div>';
+    const foot = '<button class="btn sm" id="fld-copy">复制 JSON（含全部字段与存档）</button>' +
+                 '<button class="btn sm ghost" data-close>关闭</button>';
+    const mo = mkModal('字段表 · ' + ((snap && snap.name) || '') + ' ' + code, body, foot, null, true);
+    const btn = mo.el.querySelector('#fld-copy');
+    if (btn) btn.addEventListener('click', function () {
+      const okc = copyText(JSON.stringify(fieldPayload(i), null, 1));
+      toast(okc ? ('已复制全部字段 JSON（含 ' + (st.hist || []).length + ' 条存档）')
+                : '复制失败：请手动选中表格内容', okc ? '' : 'err');
+    });
+  }
+
+  /* ---------------- 交互 ---------------- */
+  function onCodeChange(inp) {
+    const i = +inp.closest('.mon-cell').dataset.i;
+    const code = normCode(inp.value);
+    if (!code) { toast('代码无效：请输入 6 位代码或 sz000001 形式', 'err'); inp.value = state.codes[i]; return; }
+    if (code === state.codes[i]) { inp.value = code; return; }
+    if (state.codes.indexOf(code) >= 0) { toast('该股票已在其它格中：' + code, 'err'); inp.value = state.codes[i]; return; }
+    state.gen++;
+    state.codes[i] = code;
+    inp.value = code;
+    codesSave();
+    // 旧格的图与数据一起换掉
+    state.cells[i] = cellState(code);
+    const el = cellEl(i);
+    el.querySelector('.mon-name').textContent = (state.cells[i].name || code);
+    el.querySelector('.mon-price').textContent = '—';
+    el.querySelector('.mon-chg').textContent = '—';
+    Array.prototype.forEach.call(el.querySelectorAll('.mon-foot b'), b => { b.textContent = '—'; });
+    const bk = el.querySelector('.mon-book');      // 盘口也要清掉，否则会留着上一只票的五档
+    if (bk) bk.innerHTML = '';
+    disposeCharts();
+    mkChart(document.getElementById('mon-chart-' + i),
+            state.mode === 'daily'
+              ? dailyOption({ bars: [], ma: {}, boll: {}, gaps: [] }, '')
+              : intradayOption([], 0));
+    setDot(i, '', '');
+    toast('第 ' + (i + 1) + ' 格已切换为 ' + code);
+    paintSnap(i);                      // 换到的票若本地有快照/分时，先画出来（不用请求）
+    drawCell(i);
+    pullOne(i, !isOpen(phaseOf()));    // 非交易时段也先取一份快照（不落盘），别让新票空着
+    ensureDaily(false);                // 日K 视图下把换到的这只的日线补上
+  }
+
+  async function refreshAll() {
+    const btn = document.getElementById('mon-refresh');
+    if (!state.codes.length) { toast('还没有添加股票，先在上方输入代码添加', 'err'); return; }
+    btn.disabled = true;
+    const ph = phaseOf();
+    try {
+      await pullAll(true);        // 手动点的：不受时段限制（但非盘中不会写进分时缓存）；1 个请求覆盖全部格
+      /* 日K 视图下顺带强制重取日线：收盘后同步过数据的话，库里会多出当天的行，
+         这时就不该再拿本地缓存现算那根（dailySeries 里谁新用谁）。 */
+      if (state.mode === 'daily') await ensureDaily(true);
+      state.lastAt = Date.now();
+      bumpStatus();
+      const dk = state.mode === 'daily' ? ('（含日K线 ' + DK_BARS + ' 根）') : '';
+      toast((isOpen(ph) ? ('已刷新全部 ' + state.codes.length + ' 格（1 个请求）')
+                        : '非交易时段：只取一次快照，不写入本地存储（' + nextOpenText() + ' 自动恢复）') + dk);
+    } finally { btn.disabled = false; }
+  }
+
+  document.getElementById('mon-pause').addEventListener('click', function () {
+    state.paused = !state.paused;
+    this.textContent = state.paused ? '继续' : '暂停';
+    this.classList.toggle('on', state.paused);
+    if (!state.paused && isOpen(phaseOf())) { state.open = null; tick(); }  // 继续时立即接上节拍
+    else bumpStatus();
+  });
+  document.getElementById('mon-refresh').addEventListener('click', refreshAll);
+  document.getElementById('mon-mode').addEventListener('click', function () {
+    setMode(state.mode === 'daily' ? 'intraday' : 'daily');
+  });
+  document.getElementById('mon-add').addEventListener('click', submitAdd);
+  document.getElementById('mon-add-code').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') submitAdd();
+  });
+  document.getElementById('mon-clear').addEventListener('click', function () {
+    if (!confirm('清空全部本地监控缓存（12 小时内的采样点 + 每整分钟 1 条的全字段存档）？\n' +
+                 '股票代码清单会保留（不会把你加过的股票清掉）。')) return;
+    const n = storeClearAll();
+    state.gen++;
+    resetCells();
+    rebuild();
+    toast('已清空 ' + n + ' 项本地缓存');
+  });
+
+  /* ---------------- 拖动排序（原生 HTML5 DnD） ----------------
+     整格可拖，「把手」是头行最左的 ⠿（就是个视觉提示，真正判据是 mousedown 落点）。
+     两个必须处理的点：
+       1) **draggable 平时关着**：格子里的代码输入框若处在可拖元素内部，原生拖拽会抢走 mousedown，
+          输入框里就没法拖选文字。所以只有 mousedown 落在非交互元素上才临时打开。
+       2) dragover 必须 preventDefault，否则浏览器不会触发 drop（这是 DnD 最常见的「拖了没反应」）。 */
+  const DND = { from: -1, to: -1, after: false };
+  const gridEl = document.getElementById('mon-grid');
+
+  function clearDropMark() {
+    Array.prototype.forEach.call(document.querySelectorAll('.mon-cell.drop-l,.mon-cell.drop-r'),
+      function (el) { el.classList.remove('drop-l', 'drop-r'); });
+  }
+  function endDrag() {
+    clearDropMark();
+    if (gridEl) gridEl.classList.remove('dragmode');
+    Array.prototype.forEach.call(document.querySelectorAll('.mon-cell'), function (el) {
+      el.classList.remove('dragging');
+      el.draggable = false;                 // 关回去，代码框才能正常选字
+    });
+    DND.from = -1; DND.to = -1; DND.after = false;
+  }
+  function cellOf(e) {
+    return (e.target && e.target.closest) ? e.target.closest('.mon-cell') : null;
+  }
+
+  gridEl.addEventListener('mousedown', function (e) {
+    const cell = cellOf(e);
+    if (!cell) return;
+    cell.draggable = !(e.target.closest && e.target.closest('input,button,textarea,select,a'));
+  });
+
+  gridEl.addEventListener('dragstart', function (e) {
+    const cell = cellOf(e);
+    if (!cell || cell.draggable !== true) { e.preventDefault(); return; }
+    DND.from = +cell.dataset.i; DND.to = -1; DND.after = false;
+    cell.classList.add('dragging');
+    gridEl.classList.add('dragmode');
+    if (e.dataTransfer) {
+      try { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', String(DND.from)); }
+      catch (err) { /* ignore */ }
+    }
+  });
+
+  gridEl.addEventListener('dragover', function (e) {
+    if (DND.from < 0) return;
+    const cell = cellOf(e);
+    if (!cell) { clearDropMark(); DND.to = -1; return; }
+    e.preventDefault();                                   // 见上面注释 2)
+    if (e.dataTransfer) { try { e.dataTransfer.dropEffect = 'move'; } catch (err) { /* ignore */ } }
+    const r = cell.getBoundingClientRect();
+    const after = (e.clientX - r.left) > r.width / 2;      // 落在格子右半区 → 插到它后面
+    const idx = +cell.dataset.i;
+    clearDropMark();
+    cell.classList.add(after ? 'drop-r' : 'drop-l');
+    DND.to = idx; DND.after = after;
+  });
+
+  gridEl.addEventListener('drop', function (e) {
+    if (DND.from < 0) { endDrag(); return; }
+    e.preventDefault();
+    const from = DND.from, to = DND.to, after = DND.after;
+    endDrag();                                            // 先收视觉，再改数据（顺序无关，但要拿到旧值）
+    if (to < 0) return;
+    const at = reorderCells(from, to + (after ? 1 : 0));
+    if (at >= 0) toast('第 ' + (from + 1) + ' 格已移到第 ' + (at + 1) + ' 格');
+  });
+
+  gridEl.addEventListener('dragend', endDrag);
+  gridEl.addEventListener('dragleave', function (e) {
+    // 拖出网格之外（进到页面别处）就把插入线收掉；在格子之间移动时不算离开
+    if (!gridEl.contains(e.relatedTarget)) { clearDropMark(); DND.to = -1; }
+  });
+
+  /* 立刻重算一次（不等待计时器）：暂停恢复、跨日、测试探针都用它 */
+  function tick() {
+    if (state.timer) clearTimeout(state.timer);
+    step();
+  }
+
+  /* 测试钩子（同源 iframe 探针页与 ?force= 用；正常使用不会碰）：
+     force('open'|'closed'|'holiday'|'') 覆盖时钟并立即重算；info() 暴露轮询状态供断言。 */
+  window.__monDebug = {
+    force(k) { try { window.__MON_FORCE__ = k || ''; } catch (e) { /* ignore */ } tick(); },
+    tick: tick,
+    info() {
+      const ph = phaseOf();
+      return { phase: ph.k, open: isOpen(ph), paused: state.paused, timer: !!state.timer,
+               ok: state.ok, fail: state.fail, reqs: state.reqs, cells: state.codes.length,
+               rounds: state.rounds,      // 盘中走过的「轮」数（每轮 1 个批量请求）
+               lastN: state.lastN,        // 上一轮成功返回的只数
+               pollMs: POLL_MS,
+               shot: state.shot,          // 已经一次性请求过的时段（空串 = 还没取 / 已在盘中）
+               codes: state.codes.slice(),
+               calOk: cal.ok, status: (document.getElementById('mon-state') || {}).textContent || '' };
+    },
+    isTradeDay: d => isTradeDay(d),
+    nextOpen: nextOpenText,
+    /* 全字段相关的测试入口：fields() 拿原始 88 项，book() 拿五档，hist() 拿存档条数 */
+    fields: i => (state.cells[i] ? (state.cells[i].raw || null) : null),
+    /* 日K 视图相关：mode() 当前视图、setMode() 切换、dk(i) 该格实际画出去的那串
+       （库里 DK_BARS 根 + 本地现算的当天那根），todayBar(i) 单独拿当天那根；
+       dkAll(i) 全量（多 DK_WARM 根预热带）、dkView(i) 展示窗口 + 已切好的均线/布林/缺口、
+       dkCfg() 指标参数（探针拿它核对接口请求根数，别把数字写死在断言里） */
+    mode: () => state.mode,
+    setMode: m => setMode(m),
+    dk: i => dailySeries(i),
+    dkAll: i => dailyAll(i),
+    dkView: i => dailyView(i),
+    dkCfg: () => ({ bars: DK_BARS, warm: DK_WARM, req: DK_REQ,
+                    ma: MA_PERIODS.slice(), boll: { n: BOLL_N, k: BOLL_K } }),
+    /* 指标函数裸入口：口径这种东西（min_periods、样本标准差、缺口边界）在真数据上很难断言边界，
+       探针拿几条合成序列直接调真代码做单元测试 —— 比在 60 根真 K 线上猜边界靠谱。 */
+    maOf: (closes, n) => maOf(closes, n),
+    bollOf: (closes, n, k) => bollOf(closes, n, k),
+    gapsOf: bars => gapsOf(bars),
+    dkCache: () => Object.keys(state.daily),
+    todayBar: i => todayBar(i),
+    book: i => {
+      const st = state.cells[i];
+      return (st && st.snap) ? { bids: st.snap.bids || [], asks: st.snap.asks || [], vr: st.snap.vr } : null;
+    },
+    hist: i => (state.cells[i] ? (state.cells[i].hist || []).length : 0),
+    fieldHelp: () => FLD_NAME.slice(),
+    fieldMarks: () => FLD_MARK.slice(),
+    openField: openFieldModal,
+  };
+
+  /* ---------------- 启动 ----------------
+     先把交易日历取回来再决定要不要请求：日历只影响「今天该不该取数」，
+     取不到就退回周一~周五近似，绝不会把页面卡住。 */
+  async function boot() {
+    await calLoad();
+    resetCells();
+    rebuild();
+    renderModeBtn();          // 视图按钮的初始文案 / 状态（默认分时）
+    bumpStatus();
+    step();
+  }
+  boot();
+})();
+</script>
+{% endblock %}

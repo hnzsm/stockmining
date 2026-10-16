@@ -1,0 +1,430 @@
+{% extends "base.html" %}
+{% block title %}今日选股 · 短线选股{% endblock %}
+{% block pagetitle %}今日选股{% endblock %}
+{% block pagedesc %}用「选股策略」在指定交易日圈出候选标的 · 想看买卖点可再挂一个「买卖策略」{% endblock %}
+
+{% block content %}
+<div class="hintbox" style="margin-bottom:14px">
+  选出<b>当日符合「选股策略」的股票</b>。选股策略里已经包含入池条件、剔 ST / 板块、上市天数与最小成交额，
+  所以这里只需要挑一条选股策略（<a href="/pools" target="_blank">管理选股策略</a>）。<br>
+  <span class="small muted">想同时看到「下一交易日怎么买 / 持仓怎么卖」，可以在右边再挂一个
+  <a href="/strategies" target="_blank">买卖策略</a>（留空也行，那就只列候选股）。</span>
+</div>
+
+<div class="card">
+  <div class="card-head"><div class="card-title">选股配置</div></div>
+  <div class="card-body">
+    <div class="row">
+      <div class="field" style="flex:2;min-width:250px"><label class="lb">选股策略
+        <span class="hint">买哪些票；股票池过滤项与入池条件都在它里面</span></label>
+        <select id="sc-universe"></select></div>
+      <div class="field" style="flex:1.6;min-width:200px"><label class="lb">买卖策略（可选）
+        <span class="hint">挂着它才会算买入触发 / 卖出信号</span></label>
+        <select id="sc-strategy"></select></div>
+      <div class="field" style="flex:1.6;min-width:220px"><label class="lb">排序表达式（选填）
+        <span class="hint">数值越大越靠前</span></label>
+        <input type="text" id="sc-sort" class="mono" spellcheck="false"
+          placeholder="如 turnover_rate（换手高在前）、-total_mv（市值小在前）"></div>
+      <div class="field"><label class="lb">交易日</label><input type="date" id="sc-date"></div>
+      <div class="field"><label class="lb">最多返回</label><input type="number" id="sc-limit" value="200" step="50"></div>
+    </div>
+    <div id="sc-pool"></div>
+    <div class="flex wrap" style="margin-bottom:10px">
+      <label class="chk"><input type="checkbox" id="sc-save" checked> 保存选股结果到数据库</label>
+      <span class="small muted" id="sc-save-hint"></span>
+    </div>
+    <div class="flex">
+      <button class="btn primary" id="btn-screen">开始选股</button>
+      <button class="btn" id="btn-history">查看已保存结果</button>
+      <span class="spacer"></span>
+      <span class="pill" id="sc-hint">—</span>
+    </div>
+    <div id="sc-job" style="display:none;margin-top:12px">
+      <div class="flex between" style="margin-bottom:6px"><span class="small" id="sc-msg">…</span><span class="small mono" id="sc-pct">0%</span></div>
+      <div class="progress"><i id="sc-bar"></i></div>
+    </div>
+  </div>
+</div>
+
+<div class="card" id="sc-plan" style="display:none">
+  <div class="card-head">
+    <div class="card-title">买入计划 <span class="tag" id="plan-tag"></span></div>
+    <div class="flex">
+      <span class="small muted" id="plan-note"></span>
+      <button class="btn sm" id="btn-export-screen">导出 CSV</button>
+    </div>
+  </div>
+  <div class="card-body">
+    <div class="hintbox" id="plan-hint" style="margin-bottom:12px"></div>
+    <div class="tbl-wrap" id="sc-result"></div>
+  </div>
+</div>
+
+<div class="card" id="sc-history" style="display:none">
+  <div class="card-head"><div class="card-title">已保存的选股结果</div><button class="btn sm" data-close-box="sc-history">收起</button></div>
+  <div class="card-body tight"><div id="sc-history-list"><div class="empty">加载中…</div></div></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let scResult = null;
+let poolEd = null;   // 条件股票池编辑器（DOMContentLoaded 里构造）
+const DETAIL_FIELDS = ['close','pre_close','open','boll_lower','boll_mid','boll_upper','boll_pos','ma5','ma20','ma60','rsi6','kdj_k','kdj_d','vol','vma5','turnover_rate','total_mv','pct_chg','mf_main_net','mf_main_ratio','mf_net'];
+
+/* 结果表额外列：**由后端给**（`indicators.col_spec`）—— 列 = 策略条件/评分/条件池里
+   真正引用到的字段（筹码/两融、技术指标、估值都算）。这里不写死任何字段名。
+   ⚠ 渲染三件套 `extraCols` / `colText` / `colCls` 在 `static/js/app.js`，选股策略试跑页
+   （`pool.html`）共用同一份 —— 别在本页再写一遍，两份早晚跑偏。 */
+
+function condTag(c){
+  if (c.error) return `<span class="tag r" title="${esc(c.error)}">表达式错误</span>`;
+  return `<span class="tag ${c.ok?'g':'r'}">${c.ok?'✔':'✘'}</span>`;
+}
+
+function detailHtml(it){
+  const cs = (it.detail && it.detail.conditions) || [];
+  const vals = (it.detail && it.detail.values) || {};
+  const rows = cs.map(c=>`<tr><td style="width:92px">${esc(c.group)}</td>
+      <td class="mono" style="font-size:12px">${esc(c.expr)}</td>
+      <td style="width:44px">${condTag(c)}</td></tr>`).join('');
+  // 自己条件里用到的字段排最前（能直接对上表里的列），其余按常用顺序、再按字母
+  const cols = extraCols(scResult), back = cols.map(c=>c.key);
+  const lab = {}; cols.forEach(c=>{ lab[c.key] = c.label; });
+  const rank = k => {
+    const i = back.indexOf(k);
+    if (i >= 0) return i;
+    const j = DETAIL_FIELDS.indexOf(k);
+    return j >= 0 ? 100 + j : 900;
+  };
+  const keys = Object.keys(vals).sort((a,b)=> rank(a)-rank(b) || a.localeCompare(b));
+  const vhtml = keys.map(k=>`<span class="tag" style="font-family:var(--mono)" title="${esc(k)}">`
+      + `${esc(lab[k] || k)} = ${vals[k]}</span>`).join(' ');
+  return `<table class="data"><tbody>${rows}</tbody></table>
+    <div style="margin-top:10px"><div class="small muted" style="margin-bottom:5px">关键指标</div><div class="flex wrap" style="gap:5px">${vhtml||'—'}</div></div>`;
+}
+
+function planHint(cfg){
+  if (!cfg) return '未挂「买卖策略」—— 这里只列出当日符合选股策略的候选股。'
+    + '点每行的 <b>K线</b> 弹窗预览形态（不跳转）；想看买卖点，点代码进个股诊断页再挂一套买卖策略。';
+  if (!cfg.buy_trigger || !cfg.buy_trigger.length)
+    return '买入触发条件为空 —— 下一交易日<b>无条件</b>按开盘价买入候选股。';
+  return `下一交易日满足 <b>${cfg.buy_trigger.map(esc).join(' 且 ')}</b> 时按<b>开盘价买入</b>；
+    卖出条件：<b>${(cfg.sell_signal||[]).map(esc).join(' 且 ') || '仅靠风控离场'}</b>。`;
+}
+
+/** 当前股票池描述（选股策略 → {pool_id:N}；静态池 → 代码字符串）。 */
+function poolSpec(){ return poolEd ? poolEd.value() : $('#sc-universe').value; }
+
+/** 当前选股口径 → URL 参数。整页链接与弹窗预览**共用这一份**，别各拼一套。
+    `trade_date` 是必须的：不带上，K线会停在「最新那天」，跟列表不是同一天。
+    `sel_only=1`：没挂买卖策略（表单上「买卖策略（可选）」留空）时告诉诊断页
+    「这里只选了票」—— 否则它会拿默认买卖参数跑一遍单票回测，弹窗里冒出一张
+    「策略收益」卡，跟这批票选得对不对毫无关系。 */
+function viewParams(tradeDate){
+  const p = {};
+  const spec = poolSpec();
+  if (spec && typeof spec === 'object' && spec.pool_id) p.pool_id = spec.pool_id;
+  const sid = $('#sc-strategy').value;
+  if (sid) p.strategy_id = sid;
+  else p.sel_only = '1';
+  if (tradeDate) p.trade_date = tradeDate;
+  return p;
+}
+
+/** 个股诊断页链接：带上选股策略的 pool_id，图上的「命中」点才按它逐日求值。 */
+function stockUrl(tsCode, tradeDate){
+  const q = new URLSearchParams(viewParams(tradeDate)).toString();
+  return '/stock/' + encodeURIComponent(tsCode) + (q ? '?' + q : '');
+}
+
+/** 「K线」按钮 → 弹窗预览（嵌诊断页的预览模式，不跳转、不丢现场）。
+    `list`/`index` 是**当页那张表**的行与行号：弹窗右上角的「下一个」按它翻，
+    对得上屏幕上的顺序；`paramsOf` 给「每行一个查询日」的历史结果列表用（翻过去
+    仍是那一行自己的 trade_date，不会串成同一份口径）。 */
+function openKline(tsCode, name, tradeDate, list, index, paramsOf){
+  if (!window.klinePreview) return;
+  // list/index/paramsOf 不给就是 undefined —— 入口那边按「没有列表」处理（不摆「下一个」），
+  // 所以这里不用 if 分支，照传即可。
+  window.klinePreview({
+    tsCode: tsCode, name: name, params: viewParams(tradeDate),
+    list: list, index: index, paramsOf: paramsOf,
+  });
+}
+
+async function runScreen(){
+  const spec = poolSpec();
+  // 「今日选股」只挑选股策略：没挑池子就没得筛（静态池是范围、不是条件）
+  if (!spec || typeof spec === 'string') return toast('请先选一条选股策略', 'warn');
+  const sid = $('#sc-strategy').value;
+  $('#sc-job').style.display = '';
+  try {
+    const body = {
+      universe: spec, trade_date: $('#sc-date').value,
+      limit: Number($('#sc-limit').value), save: $('#sc-save').checked && !!sid
+    };
+    if (sid) body.strategy_id = Number(sid);
+    const sortExpr = $('#sc-sort').value.trim();
+    if (sortExpr) body.sort_expr = sortExpr;      // 空则后端沿用买卖策略的评分表达式
+    const r = await apiPost('/api/screen/run', body);
+    renderResult(r);
+    $('#sc-job').style.display = 'none';
+  } catch (e) { toast(e.message, 'err', 7000); $('#sc-job').style.display = 'none'; }
+}
+
+/* ---------- 结果表：点表头排序（客户端，只排**已返回的这批**） ----------
+   为什么不重新请求：服务端的 `sort_expr` 已经定了初始顺序（也是「评分」列的口径）；
+   点表头只是在这批里换个看法，不该再跑一次全市场。
+
+   交互复用买卖策略页「交易明细」那一套（同一份 CSS：`.sortable` / `.sarrow` /
+   `.sort-asc|.sort-desc`）：点同列切升降、换列时文本列默认升序、数值列默认降序。
+   ⚠ 缺值（—）永远沉底，不随升降序翻上来 —— 否则一点升序，一屏「—」全冒到最前面。
+   ⚠ 「#」列可点 = **恢复服务端原顺序**（点过别的列之后总得有条回路）。 */
+const SC_TEXT_COLS = { ts_code: 1, name: 1, industry: 1 };   // 按文本比，其余按数值比
+let scSort = { key: '', dir: -1 };                           // key='' = 服务端原顺序
+
+/** 屏幕上真正要显示的这批（顺序 = 当前排序）。不改 items，只重排引用。 */
+function scSortedItems(){
+  const its = (scResult && scResult.items) || [];
+  if (!scSort.key) return its.slice();
+  const key = scSort.key, text = !!SC_TEXT_COLS[key], dir = scSort.dir > 0 ? 1 : -1;
+  return its.map((it, i) => ({ it, i })).sort((a, b) => {
+    const va = a.it[key], vb = b.it[key];
+    const na = va === null || va === undefined || (typeof va === 'number' && isNaN(va));
+    const nb = vb === null || vb === undefined || (typeof vb === 'number' && isNaN(vb));
+    if (na || nb) return (na && nb) ? a.i - b.i : (na ? 1 : -1);   // 缺值沉底（不受方向影响）
+    const c = text ? String(va).localeCompare(String(vb), 'zh')
+                   : (Number(va) < Number(vb) ? -1 : (Number(va) > Number(vb) ? 1 : 0));
+    return c ? c * dir : a.i - b.i;                                // 同值保持原相对顺序
+  }).map(p => p.it);
+}
+
+/** 可排序表头。`key` 传 '' → 普通表头；传 '__orig' → 「#」= 回服务端原序（可点、但不冒充排序）。 */
+function scTh(label, key, cls, title){
+  if (!key) return `<th class="${cls || ''}">${esc(label)}</th>`;
+  const tip = title !== undefined ? title : '点击按「' + label + '」排序';
+  // 「#」是回原序的入口，不是一列可比大小的值 —— 不给 ▲/▼，免得看着像「按行号排」
+  if (key === '__orig') {
+    return `<th class="${(cls ? cls + ' ' : '') + 'sortable'}" data-sort="__orig"`
+      + ` title="${esc(tip)}">${esc(label)}</th>`;
+  }
+  const dc = (scSort.key === key) ? (scSort.dir > 0 ? ' sort-asc' : ' sort-desc') : '';
+  return `<th class="${(cls ? cls + ' ' : '') + 'sortable' + dc}" data-sort="${key}"`
+    + ` title="${esc(tip)}">${esc(label)}<span class="sarrow"></span></th>`;
+}
+
+function renderResult(r){
+  scResult = r;
+  scSort = { key: '', dir: -1 };           // 新一次选股 → 回到服务端（排序表达式）那套顺序
+  $('#sc-hint').textContent = `${r.trade_date} · 扫描 ${fmt.int(r.scanned)} 只 · 命中 ${fmt.int(r.count)} 只` +
+    (r.returned !== undefined && r.returned < r.count ? `（展示前 ${r.returned} 只）` : '');
+  $('#sc-plan').style.display = '';
+  $('#plan-tag').textContent = r.strategy_name + ' · ' + r.universe;
+  $('#plan-note').textContent = (r.timeframe==='weekly'?'周K':'日K') + '策略'
+    + (r.sort_expr ? ' · 按 ' + r.sort_expr + ' 降序'
+                   : ' · 未设排序表达式（按 |涨跌幅| 降序）');
+  const picked = $('#sc-strategy').value;
+  const cfg = picked
+    ? ((window.__strategies||[]).find(s=>String(s.id)===String(picked)) || {}).config
+    : null;
+  $('#plan-hint').innerHTML = planHint(cfg);
+  paintResult();
+}
+
+/** 画表格 —— 表头与行都按**当前** scSort 出；点表头只重画这一块，不重新选股。 */
+function paintResult(){
+  const r = scResult;
+  if (!r) return;
+  if (!r.items.length) {
+    $('#sc-result').innerHTML = '<div class="empty"><span class="big">⌖</span>该交易日没有股票满足选股条件</div>';
+    return;
+  }
+  // 额外列：后端按「条件引用到的字段」算好列定义，这里照单渲染
+  const cols = extraCols(r);
+  const view = scSortedItems();
+  const extraHead = cols.map(c => scTh(c.label, c.key, 'num', c.key)).join('');
+  const extraCell = (it) => cols.map(c =>
+    `<td class="num ${colCls(c, it[c.key])}">${colText(c, it[c.key])}</td>`).join('');
+  const head = scTh('#', '__orig', '', '点击恢复服务端排序（按排序表达式）')
+    + scTh('代码', 'ts_code') + scTh('名称', 'name') + scTh('行业', 'industry')
+    + scTh('收盘', 'close', 'num') + scTh('涨跌幅', 'pct_chg', 'num')
+    + scTh('成交额(千元)', 'amount', 'num') + scTh('换手%', 'turnover_rate', 'num')
+    + scTh('总市值(亿)', 'total_mv', 'num') + scTh('主力净额(万)', 'mf_main_net', 'num')
+    + extraHead
+    + scTh('评分', 'score', 'num',
+           (r.sort_expr ? '排序表达式：' + r.sort_expr : '未设排序表达式 —— 按 |涨跌幅| 降序')
+           + ' · 点击按「评分」排序')
+    + '<th>命中明细</th><th>操作</th>';
+  $('#sc-result').innerHTML = `<table class="data"><thead><tr>${head}</tr></thead><tbody>
+    ${view.map((it,i)=>`<tr>
+      <td class="mono small">${i+1}</td>
+      <td class="mono">${esc(it.ts_code)}</td>
+      <td>${esc(it.name)}</td>
+      <td class="small muted">${esc(it.industry||'')}</td>
+      <td class="num">${fmt.price(it.close)}</td>
+      <td class="num ${fmt.cls(it.pct_chg)}">${fmt.pct(it.pct_chg)}</td>
+      <td class="num">${fmt.big(it.amount)}</td>
+      <td class="num">${it.turnover_rate===null?'—':Number(it.turnover_rate).toFixed(2)}</td>
+      <td class="num">${fmt.mv(it.total_mv)}</td>
+      <td class="num ${fmt.cls(it.mf_main_net)}">${fmt.big(it.mf_main_net)}</td>
+      ${extraCell(it)}
+      <td class="num">${it.score===null?'—':Number(it.score).toFixed(3)}</td>
+      <td><button class="btn sm" data-detail="${i}">查看</button></td>
+      <td><button class="btn sm" data-kline="${esc(it.ts_code)}" data-idx="${i}"
+            title="弹窗预览 K线（含下挂指标，不跳转）">K线</button>
+          <button class="btn sm" data-ai="${i}"
+            title="调用大模型分析这只股票（模型与语句模板在「模型设置」里配）">AI分析</button></td>
+      </tr>`).join('')}</tbody></table>`;
+
+  // 点表头 → 换排序。点同列切方向；换列时文本列升序、数值列降序；「#」回到服务端原序。
+  $$('th[data-sort]', $('#sc-result')).forEach(th => th.onclick = () => {
+    const k = th.dataset.sort;
+    if (k === '__orig') scSort = { key: '', dir: -1 };
+    else if (scSort.key === k) scSort.dir = -scSort.dir;
+    else scSort = { key: k, dir: SC_TEXT_COLS[k] ? 1 : -1 };
+    paintResult();
+  });
+
+  $$('[data-detail]').forEach(b=>b.onclick=guardClick(b, ()=>{
+    const it = view[Number(b.dataset.detail)];
+    mkModal(it.ts_code + ' ' + it.name + ' · 命中明细', detailHtml(it));
+  }));
+  // 「K线」按钮 → 弹窗预览，基准日用这份结果那一天（与列表严格同日）。
+  // ⚠ 名单交给**当前屏幕上这个顺序**（view）—— 弹窗里的「下一个」才跟列表对得上。
+  // ⚠ 只绑 #sc-result 里的按钮：`$$('[data-kline]')` 会连「已保存的选股结果」那份
+  //   一起抓过来，把它的 trade_date 也换成今天这份 —— 历史行看着是旧日期、图却停在
+  //   新日期，点进去还以为「当时就这么走」。
+  $$('[data-kline]', $('#sc-result')).forEach(b=>b.onclick=guardClick(b, ()=>{
+    const i = Number(b.dataset.idx);
+    const it = view[i] || {};
+    openKline(b.dataset.kline, it.name || '', r.trade_date, view, i);
+  }));
+  // 「AI分析」：喂给弹窗的就是**屏幕上这一行**的数（收盘/涨跌幅/行业），
+  // 弹窗实现只有一份（static/js/ai.js），诊断页那边也是它。
+  $$('[data-ai]', $('#sc-result')).forEach(b=>b.onclick=guardClick(b, ()=>{
+    const it = view[Number(b.dataset.ai)] || {};
+    window.aiAnalyze({ ts_code: it.ts_code, name: it.name, industry: it.industry,
+                       trade_date: r.trade_date, source: 'screen',
+                       close: it.close, pct_chg: it.pct_chg });
+  }));
+}
+
+async function loadHistory(){
+  const box = $('#sc-history-list');
+  $('#sc-history').style.display = '';     // 失败也得看得见这张卡（错误块摆在它里面）
+  boxState(box, 'loading', '加载中…');
+  let rows;
+  try { rows = await apiGet('/api/screen/history?limit=500'); }
+  catch (e) { boxState(box, 'error', '选股历史没取到', e.message); return; }
+  box.innerHTML = rows.length ? `<table class="data"><thead><tr>
+    <th>日期</th><th>策略</th><th>代码</th><th>名称</th><th class="num">收盘</th><th class="num">涨跌幅</th><th class="num">评分</th><th></th>
+    </tr></thead><tbody>${rows.map((r,j)=>`<tr>
+      <td class="mono small">${esc(r.trade_date)}</td><td>${esc(r.strategy_name||'')}</td>
+      <td class="mono">${esc(r.ts_code)}</td><td>${esc(r.name||'')}</td>
+      <td class="num">${fmt.price(r.close)}</td>
+      <td class="num ${fmt.cls(r.pct_chg)}">${fmt.pct(r.pct_chg)}</td>
+      <td class="num">${r.score===null?'—':Number(r.score).toFixed(3)}</td>
+      <td><button class="btn sm" data-kline="${esc(r.ts_code)}" data-idx="${j}"
+            data-date="${esc(r.trade_date)}" title="弹窗预览 K线（含下挂指标，不跳转）">K线</button></td>
+      </tr>`).join('')}</tbody></table>` : '<div class="empty">暂无已保存的选股结果</div>';
+  // 已保存的历史结果：基准日按**那一行**的日期（不是最新那天），否则预览对不上当时的口径。
+  // 翻到「下一个」时也是**那个行自己的** trade_date（paramsOf 逐行算），不会串。
+  $$('[data-kline]', $('#sc-history-list')).forEach(b => b.onclick = () => {
+    const row = rows[Number(b.dataset.idx)] || {};
+    openKline(b.dataset.kline, row.name || '', b.dataset.date,
+              rows, Number(b.dataset.idx), it => viewParams(it.trade_date));
+  });
+}
+
+/* 导出用的 CSV 行 —— 单独拎出来是为了能测：列头取自后端 extra_cols，
+   和屏幕上的表头**同一份**（以前导出另抄了一遍筹码列，早晚跑偏）。
+   行序取**屏幕当前顺序**（`scSortedItems()`）：排过序就按排序后的导，
+   否则「看到的」和「导出的」不是一回事。 */
+function csvLines(){
+  if (!scResult || !scResult.items.length) return null;
+  const cols = extraCols(scResult);
+  const head = ['代码','名称','行业','收盘','涨跌幅%','成交额千元','换手率%','总市值亿','主力净额万']
+    .concat(cols.map(c => c.label)).concat(['评分']);
+  return [head.join(',')].concat(scSortedItems().map(it=>[
+    it.ts_code, it.name, it.industry, it.close, it.pct_chg, it.amount,
+    it.turnover_rate, fmt.mvNum(it.total_mv), it.mf_main_net]
+    .concat(cols.map(c => it[c.key] === null || it[c.key] === undefined ? '' : it[c.key]))
+    .concat([it.score]).join(',')));
+}
+
+$('#btn-screen').onclick = guardClick($('#btn-screen'), runScreen);
+$('#btn-history').onclick = guardClick($('#btn-history'), loadHistory);
+$$('[data-close-box]').forEach(b=>b.onclick=()=>{ $('#'+b.dataset.closeBox).style.display='none'; });
+$('#btn-export-screen').onclick = guardClick($('#btn-export-screen'), () => {
+  const lines = csvLines();
+  if (!lines) return toast('无结果可导出','warn');
+  const blob = new Blob(['\ufeff'+lines.join('\n')], {type:'text/csv;charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'screen_' + scResult.trade_date + '.csv';
+  a.click();
+});
+
+/* ---------- 排序表达式 ----------
+   结果表按它**降序**（`评分`列显示的就是它的值）；数值越大越靠前，想「小的在前」
+   就把式子取反（`-total_mv`）。口径与买卖策略页的「③ 评分表达式」是同一条：
+   对一次选股来说「排序」和「评分」就是一个式子，所以后端直接拿它当 score_expr 用。
+
+   默认跟着「买卖策略」的评分表达式走；用户在框里改过（`sortTouched`）就不再覆盖 ——
+   否则刚手写完，下拉一改就被冲掉。⚠ 它只是**这一次选股**的排序：不落库、
+   也不改买卖策略里存的那条。 */
+let sortTouched = false;
+function syncSortFromStrategy() {
+  if (sortTouched) return;
+  const s = ((window.__strategies || []).find(x => String(x.id) === $('#sc-strategy').value) || {});
+  $('#sc-sort').value = (s.config || {}).score_expr || '';
+}
+
+/* 入库需要一条买卖策略（screen_result.strategy_id 非空）——
+   没挂买卖策略时把勾选框禁用掉，免得点了「保存」却什么也没存。 */
+function syncSaveHint(){
+  const has = !!$('#sc-strategy').value;
+  $('#sc-save').disabled = !has;
+  $('#sc-save-hint').textContent = has
+    ? '' : '（未挂买卖策略，选股结果不入库）';
+}
+
+document.addEventListener('DOMContentLoaded', async () => {
+  const [strategies, universes, cfg] = await Promise.all([
+    apiGet('/api/strategies'), apiGet('/api/universes'), apiGet('/api/config')
+  ]);
+  const [presets, fields, pools] = await Promise.all([
+    apiGet('/api/universe/presets').catch(()=>[]),
+    apiGet('/api/universe/fields').catch(()=>[]),
+    apiGet('/api/pools').catch(()=>[])
+  ]);
+  window.__strategies = strategies;
+  // 买卖策略**可选**：不选就是「只看选股策略」，命中 = 当日入池的股票
+  $('#sc-strategy').innerHTML = '<option value="">（不指定 · 只看选股策略）</option>'
+    + strategies.map(s=>`<option value="${s.id}">${esc(s.name)}${s.builtin?'（样例）':''}</option>`).join('');
+  // 股票池下拉**只给「选股策略」**（用户要求：今天选股只选选股策略）——
+  // 静态池是「范围」不是「条件」，选股逻辑一律走选股策略。
+  poolEd = new PoolEditor({
+    select: '#sc-universe', panel: '#sc-pool', date: '#sc-date',
+    universes: universes, pools: pools, presets: presets, fields: fields,
+    groups: ['pool'],
+    default: pools.length ? 'pool:' + pools[0].id : undefined
+  });
+  $('#sc-date').value = cfg.latest_trade_date || cfg.today;
+  if (poolEd.dateEl) poolEd.dateEl.value = $('#sc-date').value;
+  $('#sc-strategy').addEventListener('change', () => { syncSortFromStrategy(); syncSaveHint(); });
+  // 排序表达式框里也能补全字段名（与买卖策略页的评分框共用 ac.js，公式只写一份）
+  $('#sc-sort').addEventListener('input', () => { sortTouched = true; });
+  if (window.ExprAC) window.ExprAC.attach($('#sc-sort'), { weekly: false });
+  syncSortFromStrategy();
+  syncSaveHint();
+  const qs = new URLSearchParams(location.search);
+  if (qs.get('strategy_id')) {
+    $('#sc-strategy').value = qs.get('strategy_id');
+    syncSortFromStrategy(); syncSaveHint();
+  }
+  if (qs.get('pool_id')) $('#sc-universe').value = 'pool:' + qs.get('pool_id');
+  if (qs.get('run') === '1') runScreen();
+});
+</script>
+{% endblock %}

@@ -1,0 +1,32 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>margin shot</title>
+<style>html,body{margin:0;padding:0;overflow:hidden;background:#0e131a}
+iframe{width:1400px;height:820px;border:0;display:block;margin-left:-700px}</style>
+</head><body>
+<!-- 只为「肉眼看一眼融资融券卡」用的一次性辅助页：加载诊断页 → 等两融图画完（4 条 series）
+     → 把 iframe 内部滚到「筹码与两融」那块 → 主框架截图正好拍在那张卡上。
+     ⚠ 用能看到的像素说话：右轴 name 会不会和别的 name 叠在一起，只有截图能验。 -->
+<!-- 只把「融资融券」那张卡框进视口：整页 1400 宽缩略后看不清轴名，所以用负 margin
+     把 iframe 的右半（第二列）推进视口，再把 iframe 内部纵向滚到那排卡。 -->
+<iframe id="fr" src="about:blank"></iframe>
+<script>
+const fr = document.getElementById('fr');
+fr.onload = function () {
+  const w = fr.contentWindow, d = fr.contentDocument;
+  let n = 0;
+  const t = setInterval(function () {
+    n++;
+    const el = d.getElementById('chart-margin');
+    const inst = (w.echarts && el) ? w.echarts.getInstanceByDom(el) : null;
+    const so = inst ? inst.getOption() : null;
+    const done = so && so.series && so.series.length >= 4;
+    if (done || n > 80) {
+      clearInterval(t);
+      const box = d.getElementById('st-card-chips') || el;
+      if (box) w.scrollTo(0, Math.max(0, box.getBoundingClientRect().top + w.scrollY - 8));
+      document.title = done ? ('ready series=' + so.series.map(function (s) { return s.name; }).join(',')) : 'timeout';
+    }
+  }, 250);
+};
+fr.src = '/stock/600519.SH';
+</script>
+</body></html>

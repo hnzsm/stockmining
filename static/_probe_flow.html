@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>触发提醒「删」端到端链路 探针</title>
+<style>
+  body{margin:0;background:#0d1117;color:#e6ebf4;font:13px/1.6 Consolas,monospace}
+  #out{white-space:pre-wrap;padding:12px;margin:0}
+  iframe{position:fixed;left:-99999px;top:0;width:1500px;height:1600px;border:0}
+</style>
+</head>
+<body>
+<pre id="out">未运行 —— 本页是自检探针，加 ?run=1&amp;gid=分组id&amp;code=股票代码 才开始。</pre>
+<script>
+/* ============================================================================
+   端到端走一遍「触发提醒列表 → 点删 → 规则真的没了、列表真的刷新」
+
+   为什么单独开一页：回归里那条「点删」只敢点**取消**（真删一次就少一条真规则，
+   跑几轮那 149 条布林下轨规则就没了）。所以「点了确认真删掉了」这一档一直没人验过 ——
+   而它恰恰是最容易出问题的一档：删除接口换了口径、删完忘了刷新、列表还留着那行。
+
+   数据由外面（临时脚本）用**临时组 + 临时规则 + 一条合成触发记录**造好，
+   这里只做 UI 操作，绝不碰真实数据。
+   ============================================================================ */
+(function () {
+  var params = new URLSearchParams(location.search);
+  var out = document.getElementById('out');
+  if (params.get('run') !== '1') return;
+  var GID = +(params.get('gid') || 0);
+  var CODE = params.get('code') || '';
+
+  var CHECKS = [];
+  function ok(name, cond, extra) {
+    CHECKS.push({ name: name, ok: !!cond, extra: extra == null ? '' : String(extra) });
+    out.textContent = JSON.stringify({ done: false, checks: CHECKS }, null, 1);
+  }
+  function waitFor(fn, limitMs, stepMs) {
+    return new Promise(function (resolve, reject) {
+      var t0 = Date.now();
+      (function tick() {
+        var v; try { v = fn(); } catch (e) { v = null; }
+        if (v) return resolve(v);
+        if (Date.now() - t0 > limitMs) return reject(new Error('timeout'));
+        setTimeout(tick, stepMs || 150);
+      })();
+    });
+  }
+  function mk(url) {
+    return new Promise(function (res, rej) {
+      var f = document.createElement('iframe');
+      f.onload = function () { setTimeout(function () { res(f); }, 150); };
+      f.src = url;
+      document.body.appendChild(f);
+      setTimeout(function () { rej(new Error('iframe load 超时')); }, 60000);
+    });
+  }
+  function rowsOf(D) {
+    return Array.prototype.slice.call(D.querySelectorAll('#feed-list tr[data-code]'));
+  }
+  function rowCodes(D) {
+    return rowsOf(D).map(function (tr) { return tr.dataset.code; });
+  }
+
+  (async function () {
+    try {
+      var f = await mk('/watch');
+      var W = f.contentWindow, D = W.document;
+      var dbg = await waitFor(function () { return W.__watchDebug; }, 30000, 150);
+
+      /* ---------- 1. 切到那个临时分组 ---------- */
+      var g = D.querySelector('#grp-list .grp[data-id="' + GID + '"]');
+      ok('临时分组在页面左侧列表里', !!g, g ? g.textContent.trim().slice(0, 24) : '没找到 gid=' + GID);
+      if (g) g.click();
+      await waitFor(function () { return dbg.state().feed_group === GID; }, 40000, 150);
+      // 等列表真的画完（「加载中…」也躺在 .empty 里，不等就假绿 —— C54）
+      await waitFor(function () {
+        return rowsOf(D).length > 0 || /暂无触发|没有命中/.test((D.querySelector('#feed-list') || {}).textContent || '');
+      }, 40000, 150);
+
+      var codes0 = rowCodes(D);
+      ok('触发列表里出现了那只票（合成记录喂进来了）',
+         codes0.indexOf(CODE) >= 0, 'gid=' + GID + ' 行=' + codes0.join(','));
+
+      /* ---------- 2. 找到那一行的「删」，记住它带的 alert_id ---------- */
+      var row = rowsOf(D).filter(function (tr) { return tr.dataset.code === CODE; })[0];
+      var btn = row ? row.querySelector('button[data-daid]') : null;
+      var aid = btn ? +btn.dataset.daid : 0;
+      ok('该行的「删」按钮带着**真 alert_id**（不是摆设）', !!aid, 'alert_id=' + aid);
+
+      /* ---------- 3. 真点一次「删」，confirm 走「确定」 ---------- */
+      var msgs = [];
+      W.confirm = function (m) { msgs.push(String(m)); return true; };
+      if (btn) btn.click();
+      await waitFor(function () { return rowCodes(D).indexOf(CODE) < 0; }, 40000, 150);
+
+      ok('点了「确定」之后，那一行从列表里消失了（列表真的刷新了，不是只弹个 toast）',
+         rowCodes(D).indexOf(CODE) < 0, '剩余行=' + rowCodes(D).join(',') || '空');
+      ok('弹了且只弹了一次确认框，且把「删的是什么」讲清楚（删除提醒 + 连带记录 + 不可撤销）',
+         msgs.length === 1 && /删除提醒/.test(msgs[0]) && /记录/.test(msgs[0])
+           && /不可撤销|不再提醒/.test(msgs[0]),
+         msgs.length ? msgs[0].replace(/\n/g, ' | ').slice(0, 130) : '没弹确认框');
+
+      var st2 = dbg.state();
+      var stillHas = (st2.alerts || []).some(function (a) { return a.id === aid; });
+      ok('页面钩子里的规则列表也不再含这条（不是只把 DOM 那行抹了）',
+         !stillHas, 'aid=' + aid + ' 剩余规则 ' + (st2.alerts || []).length + ' 条');
+
+      out.textContent = JSON.stringify({ done: true, checks: CHECKS }, null, 1);
+    } catch (e) {
+      CHECKS.push({ name: '探针自身异常', ok: false, extra: String(e && e.message || e) });
+      out.textContent = JSON.stringify({ done: true, checks: CHECKS }, null, 1);
+    }
+  })();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>可用字段「示例」弹窗探针</title>
+<style>
+  body{margin:0;background:#0d1117;color:#e6ebf4;font:13px/1.6 Consolas,monospace}
+  #out{white-space:pre-wrap;padding:12px;margin:0}
+  iframe{position:fixed;left:-99999px;top:0;width:1440px;height:1100px;border:0}
+</style>
+</head>
+<body>
+<pre id="out">未运行 —— 本页是自检探针，加 ?run=1 才开始（只读 DOM、点两次链接，不写任何数据）。</pre>
+<script>
+/* ============================================================================
+   「可用字段参考」每行的「示例」链接 + 取值弹窗 探针
+   ----------------------------------------------------------------------------
+   需求原话：「有些字段的值我不知道该填多少，希望在可用字段参考那块加个示例链接，
+   点击弹出示例弹窗，展示可用字段及其值」。
+
+   要验的都不是文本能读出来的事：
+     a) 每个字段**都**有「示例」链接，且链接挂的字段名 == 那一行显示的字段名
+        （串行是这类列表最典型的错）；
+     b) 点它真弹窗、**不跳走这页**（条件编辑现场不能丢），弹的是**这个**字段；
+     c) 弹窗里的东西真的画出来了：7 档分位的卡片、样例行、样本口径文字 ——
+        不是只有个空壳；
+     d) 两个页面（选股策略 /pools、买卖策略 /strategies）都用同一套渲染
+        （app.js 的 fieldHelpRow），不是各写一遍。
+
+   做法：同源 iframe 装 /pools（src 必须 JS 赋值）→ 展开字段面板 → 逐行抠链接 →
+   点 turnover_rate 那行 → 等弹窗里出分位卡片 → 关掉 → 再开 /strategies 数一遍链接。
+   ============================================================================ */
+(function () {
+  var params = new URLSearchParams(location.search);
+  var out = document.getElementById('out');
+  if (params.get('run') !== '1') return;      // 门禁：防用户误打开
+
+  var CHECKS = [];
+  function ok(name, cond, extra) {
+    CHECKS.push({ name: name, ok: !!cond, extra: extra == null ? '' : String(extra) });
+    out.textContent = JSON.stringify({ done: false, checks: CHECKS }, null, 1);
+  }
+
+  function waitFor(fn, limitMs, stepMs) {
+    return new Promise(function (resolve, reject) {
+      var t0 = Date.now();
+      (function tick() {
+        var v;
+        try { v = fn(); } catch (e) { v = null; }
+        if (v) return resolve(v);
+        if (Date.now() - t0 > limitMs) return reject(new Error('等待超时'));
+        setTimeout(tick, stepMs || 200);
+      })();
+    });
+  }
+
+  function loadPage(url) {
+    return new Promise(function (resolve) {
+      var f = document.createElement('iframe');
+      f.width = 1440; f.height = 1100;
+      f.addEventListener('load', function () { resolve(f); });   // 先挂监听再赋 src
+      f.src = url;
+      document.body.appendChild(f);
+    });
+  }
+
+  /* 展开「可用字段参考」面板，并等字段行真的有「示例」链接 */
+  function openHelp(D, W, hostSel) {
+    var toggle = D.querySelector('#toggle-help');
+    if (toggle) toggle.click();
+    return waitFor(function () {
+      var rows = D.querySelectorAll(hostSel + ' .fh');
+      if (!rows.length) return null;
+      return rows[0].querySelector('.fh-ex') ? rows : null;
+    }, 20000, 150);
+  }
+
+  function auditRows(D, W, hostSel) {
+    var rows = [].slice.call(D.querySelectorAll(hostSel + ' .fh'));
+    var dataRows = rows.filter(function (r) { return r.querySelector('.fh-ex'); });
+    /* 没有链接的行只允许是「分组说明行」（买卖策略页那栏有：周线字段小标题，
+       它是 grid-column:1/-1 的整行说明，本来就不是一个字段）。 */
+    var headers = rows.filter(function (r) {
+      return !r.querySelector('.fh-ex') && /1\/-1/.test(r.getAttribute('style') || '');
+    });
+    var broken = [], dupe = [], labels = [];
+    dataRows.forEach(function (r) {
+      var n = r.querySelector('.n').textContent.trim();
+      var a = r.querySelector('.fh-ex');
+      var f = a.getAttribute('data-f') || '';
+      labels.push(n);
+      if (f !== n) broken.push(n + '→' + f);          // 链接挂错字段 = 串行
+      if (/^\s|\s$/.test(f)) dupe.push(f);
+      if (!a.getAttribute('title')) dupe.push(n + ' 无 title');
+    });
+    return { total: rows.length, withLink: dataRows.length, headers: headers.length,
+             broken: broken, bad: dupe, labels: labels,
+             naughty: rows.length - dataRows.length - headers.length };   // 既非字段也非说明行
+  }
+
+  (async function () {
+    try {
+      /* ---------------- 选股策略页 /pools ---------------- */
+      var f = await loadPage('/pools');
+      var W = f.contentWindow, D = f.contentDocument;
+      var host = '#help-fields';
+      var rows = await openHelp(D, W, host);
+      ok('字段面板展开后每行都渲染了「示例」链接', rows.length > 100, rows.length + ' 行');
+
+      var au = auditRows(D, W, host);
+      ok('「示例」链接数是随字段来的（不是只给少数几个加）',
+         au.withLink === au.total && au.total > 100,
+         au.withLink + '/' + au.total);
+      ok('每行链接挂的字段名 == 该行显示的字段名（没串行）',
+         au.broken.length === 0, au.broken.slice(0, 4).join(' | '));
+      ok('链接带 title / 字段名干净', au.bad.length === 0, au.bad.slice(0, 4).join(' | '));
+      ok('周线字段（w_ 前缀）也在里面',
+         au.labels.some(function (x) { return x.indexOf('w_') === 0; }),
+         au.labels.filter(function (x) { return x.indexOf('w_') === 0; }).slice(0, 4).join(','));
+      /* 这一版顺手修的口径 bug：字段清单以前是从 FIELD_HELP 逐行拆名字拼的，
+         `ma5…ma250` 这种省略号拆不出真字段名 ⇒ 一批字段在面板里查不到。
+         现在清单以 condition_field_help 为准，两边必须**一个不多一个不少**。 */
+      ok('均线/派生类字段都在列表里（省略号那版会整批丢掉）',
+         ['ma5', 'ma20', 'ma60', 'ma250', 'ma_bull', 'boll_dev', 'ret60', 'pos120',
+          'close_pos', 'change_amt', 'mtmpct12', 'obv_ma10', 'vol_ratio10']
+           .every(function (n) { return au.labels.indexOf(n) >= 0; }),
+         '缺 ' + ['ma5', 'ma20', 'ma60', 'ma250', 'ma_bull', 'boll_dev', 'ret60', 'pos120',
+                  'close_pos', 'change_amt', 'mtmpct12', 'obv_ma10', 'vol_ratio10']
+           .filter(function (n) { return au.labels.indexOf(n) < 0; }).join(','));
+      ok('没有「ma5…ma250」这种不是字段名的东西混进来',
+         !au.labels.some(function (x) { return /[…\.]{2,}|…/.test(x); }),
+         au.labels.filter(function (x) { return /…/.test(x); }).join(','));
+
+      /* 点一个便宜的字段（turnover_rate ≈2s；挑不到就点第一个） */
+      var want = 'turnover_rate';
+      var row = [].slice.call(D.querySelectorAll(host + ' .fh')).filter(function (r) {
+        return r.querySelector('.n').textContent.trim() === want; })[0];
+      if (!row) { want = au.labels[0]; row = [].slice.call(D.querySelectorAll(host + ' .fh'))[0]; }
+      var urlBefore = W.location.href;
+      row.querySelector('.fh-ex').click();
+      var modal = await waitFor(function () { return D.querySelector('.modal-bg') || null; },
+                                10000, 100).catch(function () { return null; });
+      ok('点「示例」弹出弹窗', !!modal);
+      ok('外层还停在 /pools（没被链接带走、条件现场没丢）',
+         W.location.href === urlBefore && W.location.pathname === '/pools', W.location.pathname);
+
+      var head = modal ? modal.querySelector('.modal-head h3') : null;
+      ok('弹窗标题就是这个字段', !!head && head.textContent.indexOf(want) >= 0,
+         head ? head.textContent : '没有标题');
+      ok('弹窗里写着这是「与选股同一套计算口径」',
+         (modal ? modal.querySelector('.modal-foot').textContent : '').indexOf('同一套计算口径') >= 0);
+
+      var cards = await waitFor(function () {
+        var c = modal ? modal.querySelectorAll('.fs-stat') : null;
+        return (c && c.length) ? c : null;                    // 等真值回来
+      }, 120000, 250).catch(function () { return null; });
+      ok('分位卡片画出来了（7 档：最小/10/25/中位/75/90/最大）',
+         !!cards && cards.length === 7, cards ? cards.length + ' 张' : '没有');
+      /* ⚠ 说明文字是**值回来之后**才填的 —— 要等卡片出来再读，否则读到空串（第一版就这么假红过） */
+      var nameEl = modal ? modal.querySelector('.fs-name') : null;
+      var descEl = modal ? modal.querySelector('.fs-desc') : null;
+      ok('弹窗里写着字段名 + 中文说明（值回来之后填的）',
+         !!nameEl && nameEl.textContent.indexOf(want) >= 0
+           && !!descEl && descEl.textContent.length > 2,
+         (nameEl ? nameEl.textContent : '') + ' | ' + (descEl ? descEl.textContent : ''));
+      var keys = cards ? [].slice.call(cards).map(function (c) {
+        return c.querySelector('.k').textContent.trim(); }) : [];
+      ok('分位档位的名字是后端给的那 7 个',
+         keys.join(',') === '最小值,10 分位,25 分位,中位数,75 分位,90 分位,最大值',
+         keys.join(','));
+      var vals = cards ? [].slice.call(cards).map(function (c) {
+        return c.querySelector('.v').textContent.trim(); }) : [];
+      ok('每档都有数值（不是一屏「—」）',
+         vals.length === 7 && vals.every(function (v) { return /[\d]/.test(v); }), vals.join(' | '));
+
+      var dateEl = modal ? modal.querySelector('[data-date]') : null;
+      ok('弹窗里有交易日输入框，且已回填后端认的日期',
+         !!dateEl && /^\d{4}-\d{2}-\d{2}$/.test(dateEl.value), dateEl ? dateEl.value : '没有');
+
+      var basis = modal ? modal.querySelector('[data-basis]').textContent.trim() : '';
+      ok('写明样本口径（多少只 / 从哪来）',
+         /全市场 \d+ 只里等距抽 \d+ 只/.test(basis), basis);
+
+      var tbl = modal ? modal.querySelector('.fs-tbl') : null;
+      var trs = tbl ? tbl.querySelectorAll('tbody tr') : [];
+      var cols = trs.length ? trs[0].querySelectorAll('td').length : 0;
+      ok('样例行画出来了（代码 / 名称 / 值）', trs.length >= 3 && cols === 3,
+         trs.length + ' 行 × ' + cols + ' 列');
+      var firstRow = trs.length ? [].slice.call(trs[0].querySelectorAll('td'))
+                                  .map(function (t) { return t.textContent.trim(); }) : [];
+      ok('样例行每格都有内容（代码形状 + 名称 + 数字）',
+         /^\d{6}\.(SH|SZ|BJ)$/.test(firstRow[0] || '') && !!firstRow[1] && /[\d]/.test(firstRow[2] || ''),
+         firstRow.join(' | '));
+      var ths = tbl ? [].slice.call(tbl.querySelectorAll('thead th'))
+                            .map(function (t) { return t.textContent.trim(); }) : [];
+      ok('表头第三列写的就是这个字段名', ths[2] === want, ths.join(' / '));
+
+      var box = modal.querySelector('.modal');
+      var rect = box.getBoundingClientRect();
+      ok('弹窗在视口里、没被裁掉（宽高有实际尺寸）',
+         rect.width > 240 && rect.height > 160 && rect.top >= 0 && rect.left >= 0,
+         Math.round(rect.width) + '×' + Math.round(rect.height)
+           + ' @' + Math.round(rect.left) + ',' + Math.round(rect.top));
+
+      modal.querySelector('.modal-foot [data-close]').click();
+      await waitFor(function () { return D.querySelector('.modal-bg') ? null : 1; }, 5000, 100)
+        .catch(function () { return null; });
+      ok('关掉弹窗后它被移除（不留叠加层）', !D.querySelector('.modal-bg'));
+
+      /* ---------------- 换一个不存在的日期：要给出人话错误，不是空白 ----------------
+         ⚠ 必须**先等这次打开自己的取数跑完**（分位卡片出来）再改日期 —— 否则两次取数
+         在同一个弹窗里抢 `[data-out]`：先发的那次晚回时会把错误提示覆盖掉，
+         于是看起来"没有提示"（第一版就这么假红过两次）。 */
+      row.querySelector('.fh-ex').click();
+      var m2 = await waitFor(function () { return D.querySelector('.modal-bg') || null; },
+                             10000, 100).catch(function () { return null; });
+      await waitFor(function () { return m2 && m2.querySelector('.fs-stat') ? 1 : null; },
+                    120000, 250).catch(function () { return null; });
+      var d2 = m2 ? m2.querySelector('[data-date]') : null;
+      if (d2) {
+        d2.value = '2019-01-02';
+        d2.dispatchEvent(new W.Event('change', { bubbles: true }));
+        var err = await waitFor(function () {
+          var e = m2.querySelector('.fs-load.err');
+          return e ? e : null;
+        }, 60000, 200).catch(function () { return null; });
+        var seen = m2.querySelector('[data-out]');
+        ok('选到没有数据的交易日 → 弹窗里给出人话提示（不是一直转圈/空白）',
+           !!err && err.textContent.length > 3,
+           err ? err.textContent.trim()
+               : '没有提示；out=' + (seen ? seen.innerHTML.replace(/\s+/g, ' ').slice(0, 120) : '?'));
+      } else {
+        ok('选到没有数据的交易日 → 弹窗里给出人话提示', false, '拿不到日期输入框');
+      }
+      m2.querySelector('.modal-foot [data-close]').click();
+      await waitFor(function () { return D.querySelector('.modal-bg') ? null : 1; }, 5000, 100)
+        .catch(function () { return null; });
+
+      /* ---------------- 条件池编辑器里的字段 chip 也能点出示例 ----------------
+         池编辑器（回测页内嵌）的「可用字段」是一排 chip，只有字段名 + 悬停说明，
+         以前点不动。写条件的人多半就在这儿，所以也接上了同一个弹窗。
+         ⚠ 用 /backtest：只有它的 PoolEditor 带 `groups:['custom']`（今日选股页那个
+         下拉里根本没有「自定义条件池…」，也没有面板）；
+         ⚠ 这一页有「回测配置本地草稿」，改池子会写进 localStorage → 先备份、
+         验完还原**并重新加载一次**（否则销毁 iframe 时的 `pagehide` 又把改动写回去）。 */
+      var f3 = await loadPage('/backtest');
+      var W3 = f3.contentWindow, D3 = f3.contentDocument;
+      var draftSaved = null, draftTouched = false;
+      try { draftSaved = W3.localStorage.getItem('sm_bt_form'); } catch (e) { /* noop */ }
+      var sel3 = await waitFor(function () {
+        var s = D3.querySelector('#bt-universe');
+        return s && [].slice.call(s.options).some(function (o) { return o.value === '__custom__'; })
+          ? s : null;
+      }, 30000, 200).catch(function () { return null; });
+      ok('回测页的池下拉可选「自定义条件池…」（后面几步的前提）', !!sel3);
+      var chip = null;
+      if (sel3) {
+        sel3.value = '__custom__';
+        sel3.dispatchEvent(new W3.Event('change', { bubbles: true }));
+        draftTouched = true;
+        chip = await waitFor(function () {
+          var c = D3.querySelector('#bt-pool .pool-help .chip[data-f]');
+          return c || null;
+        }, 20000, 200).catch(function () { return null; });
+      }
+      ok('池面板的「可用字段」chip 带字段名（可点）', !!chip,
+         chip ? chip.getAttribute('data-f') : '没找到 chip');
+      var before3 = W3.location.href;
+      if (chip) {
+        var cf = chip.getAttribute('data-f');
+        chip.click();
+        var m3 = await waitFor(function () { return D3.querySelector('.modal-bg') || null; },
+                               10000, 100).catch(function () { return null; });
+        ok('点字段 chip 也弹出取值示例（同一个入口）',
+           !!m3 && m3.querySelector('.modal-head h3').textContent.indexOf(cf) >= 0,
+           m3 ? m3.querySelector('.modal-head h3').textContent : '没弹窗');
+        ok('外层没被带走（还在回测页，配置没丢）',
+           W3.location.href === before3 && W3.location.pathname === '/backtest',
+           W3.location.pathname);
+        if (m3) m3.querySelector('.modal-foot [data-close]').click();
+      } else {
+        ok('点字段 chip 也弹出取值示例（同一个入口）', false, '没有 chip 可点');
+        ok('外层没被带走（还在回测页，配置没丢）', false, '没有 chip 可点');
+      }
+      if (draftTouched) {                       // 还原本机草稿 + 重载，别污染使用者的配置
+        try {
+          if (draftSaved === null) W3.localStorage.removeItem('sm_bt_form');
+          else W3.localStorage.setItem('sm_bt_form', draftSaved);
+          W3.location.reload();
+        } catch (e) { /* noop */ }
+      }
+
+      /* ---------------- 买卖策略页 /strategies：同一套渲染 ---------------- */
+      var f2 = await loadPage('/strategies');
+      var W2 = f2.contentWindow, D2 = f2.contentDocument;
+      var rows2 = await openHelp(D2, W2, '#help-fields .fieldhelp').catch(function () { return null; });
+      ok('买卖策略页的「可用字段与函数参考」也有「示例」链接',
+         !!rows2 && rows2.length > 100, rows2 ? rows2.length + ' 行' : '没有');
+      var au2 = auditRows(D2, W2, '#help-fields .fieldhelp');
+      ok('那一页的链接同样是「逐字段一个」且字段名对得上',
+         au2.naughty === 0 && au2.broken.length === 0 && au2.withLink > 100
+           && au2.withLink === au2.total - au2.headers,
+         au2.withLink + '/' + au2.total + '（说明行 ' + au2.headers + '，可疑 '
+           + au2.naughty + '）坏 ' + au2.broken.slice(0, 3).join(','));
+      ok('两页的字段集合一致（都用 condition_field_help 那一份，不再各拼一套）',
+         au.withLink === au2.withLink && !!W2.fieldHelpRow && !!W2.bindFieldHelp,
+         au.withLink + ' vs ' + au2.withLink);
+
+      /* ---------------- 函数参考那栏不该混进「示例」 ---------------- */
+      var funcs = D2.querySelectorAll('#help-funcs .fh-ex');
+      ok('「函数参考」里没有「示例」链接（那是字段才有的值）', funcs.length === 0,
+         funcs.length + ' 个');
+    } catch (e) {
+      ok('探针执行完成', false, (e && e.message) || String(e));
+    }
+    out.textContent = JSON.stringify({ done: true, checks: CHECKS }, null, 1);
+  })();
+})();
+</script>
+</body>
+</html>

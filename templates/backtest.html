@@ -1,0 +1,1003 @@
+{% extends "base.html" %}
+{% block title %}策略回测 · 短线选股{% endblock %}
+{% block pagetitle %}策略回测{% endblock %}
+{% block pagedesc %}组合级历史回测：选股策略圈出候选池 × 买卖策略决定买卖时点 · 次日开盘成交 · 含手续费与滑点{% endblock %}
+
+{% block content %}
+<div class="hintbox" style="margin-bottom:14px">
+  回测 = <b>选股策略</b>（在哪些股票里挑）× <b>买卖策略</b>（什么时候买、什么时候卖）。
+  选股票的条件、剔 ST、板块过滤都在<b>选股策略</b>里；<b>买卖策略</b>只管买卖时点。
+  两个下拉一配就能跑，不用在策略里再写一遍选股逻辑。
+</div>
+<div class="card">
+  <!-- 卡片头右侧那个小标记：本机记住了上一套配置时才会出现（见下面的「本地草稿」一节）。
+       给个明确的出口，免得用户哪天想「回到干净状态」却找不到地方。 -->
+  <div class="card-head">
+    <div class="card-title">回测配置</div>
+    <div class="flex">
+      <span class="small muted" id="bt-draft-tip" style="display:none">已记住上次的配置（存本机）</span>
+      <button class="btn sm ghost" id="btn-draft-clear" style="display:none">清除</button>
+    </div>
+  </div>
+  <div class="card-body" id="bt-form">
+    <div class="row">
+      <div class="field" style="flex:1.6;min-width:220px"><label class="lb">买卖策略
+        <span class="hint">什么时候买 / 什么时候卖（<a href="/strategies" target="_blank">管理</a>）</span></label>
+        <select id="bt-strategy"></select></div>
+      <div class="field" style="flex:2;min-width:260px"><label class="lb">选股策略
+        <span class="hint">买哪些票（<a href="/pools" target="_blank">管理</a>）；也可选静态股票池或临时写条件</span></label>
+        <select id="bt-universe"></select></div>
+    </div>
+    <div id="bt-pool"></div>
+    <div class="row">
+      <div class="field"><label class="lb">开始日期</label><input type="date" id="bt-start" value="2023-01-01"></div>
+      <div class="field"><label class="lb">结束日期</label><input type="date" id="bt-end"></div>
+      <div class="field"><label class="lb">初始资金（元）</label><input type="number" id="bt-cash" value="1000000" step="100000"></div>
+    </div>
+    <div class="row">
+      <div class="field"><label class="lb">最大持仓只数</label><input type="number" id="bt-maxpos" value="10" step="1"></div>
+      <div class="field"><label class="lb">单票仓位 %<span class="hint">0=按最大持仓等分</span></label><input type="number" id="bt-pospct" value="10" step="1"></div>
+      <div class="field"><label class="lb">佣金（单边）</label><input type="number" id="bt-comm" value="0.00025" step="0.00005"></div>
+      <div class="field"><label class="lb">印花税（卖出）</label><input type="number" id="bt-tax" value="0.0005" step="0.0001"></div>
+      <div class="field"><label class="lb">滑点 %<span class="hint" id="bt-slip-hint">策略未设时用此值</span></label>
+        <input type="number" id="bt-slip" step="0.05" placeholder="0.1"></div>
+    </div>
+    <div class="flex" style="margin-top:6px">
+      <button class="btn primary" id="btn-run">开始回测</button>
+      <button class="btn" id="btn-reset">恢复默认参数</button>
+      <span class="spacer"></span>
+      <span class="pill" id="bt-hint">选择策略后开始</span>
+    </div>
+    <div id="bt-job" style="display:none;margin-top:14px">
+      <div class="flex between" style="margin-bottom:6px">
+        <span class="small" id="bt-msg">准备中…</span><span class="small mono" id="bt-pct">0%</span>
+      </div>
+      <div class="progress"><i id="bt-bar"></i></div>
+      <div class="logbox" id="bt-log" style="margin-top:10px;max-height:140px"></div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-head"><div class="card-title">历史回测记录</div><button class="btn sm" id="btn-reload-runs">刷新</button></div>
+  <!-- tbl-wrap：列多的表给一层横向滚动兜底。没有它的话，超宽的表会被 .card 的
+       overflow:hidden 直接裁掉右半边 —— 「查看 / 删」两个按钮会变得点都点不到。 -->
+  <div class="card-body tight"><div class="tbl-wrap" id="runs-list"><div class="empty">加载中…</div></div></div>
+</div>
+
+<div id="result" style="display:none">
+  <div class="grid g5" id="metric-cards"></div>
+
+  <div class="card">
+    <div class="card-head">
+      <div class="card-title">资金曲线 <span class="tag" id="eq-tag"></span></div>
+      <div class="flex"><span class="small muted" id="eq-note"></span></div>
+    </div>
+    <div class="card-body"><div class="chart lg" id="chart-equity"></div></div>
+  </div>
+
+  <div class="grid g2">
+    <div class="card"><div class="card-head"><div class="card-title">月度收益 %</div></div>
+      <div class="card-body"><div class="chart sm" id="chart-monthly"></div></div></div>
+    <div class="card"><div class="card-head"><div class="card-title">离场原因分布</div></div>
+      <div class="card-body"><div class="chart sm" id="chart-reasons"></div></div></div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <div class="card-title">交易明细 <span class="tag" id="trade-tag"></span></div>
+      <div class="flex">
+        <select id="trade-filter" style="width:110px"><option value="">全部</option><option value="win">仅盈利</option><option value="lose">仅亏损</option></select>
+        <button class="btn sm" id="btn-export">导出 CSV</button>
+      </div>
+    </div>
+    <div class="card-body tight"><div id="trades-list"></div></div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let curRun = null, curTrades = [], curTradesRaw = [], curEquity = [], curStats = null;
+let poolEd = null;   // 条件股票池编辑器（DOMContentLoaded 里构造）
+let UNIVERSES = {};  // 静态池 code → 中文名（启动时从 /api/universes 灌，股票池列悬浮要用）
+let POOLS = [];      // 选股策略清单：重测时要判「这条记录引用的池还在不在」
+
+/* 交易明细排序：**默认按买入日从近到远**（dir=-1 降序）。服务端的默认顺序也是
+   buy_date DESC（app.py 的 /trades），两边口径一致；这里显式写 key='buy_date'
+   是为了让表头箭头和「按买入日降序」的标签文案立刻反映当前排序。 */
+let tradeSort = { key: 'buy_date', dir: -1 };
+/* 交易明细分页：一次把该回测的交易拉全（服务端上限 3000 笔），**排序/筛选作用于
+   整份数据，只有渲染按页切片** —— 所以翻页不会丢笔数，导出仍是全部（见 curTrades）。 */
+const TRADE_PAGE_SIZE = 100;
+let tradePage = 1;
+const SORT_LABEL = {
+  ts_code:'代码', buy_date:'买入日', buy_price:'买入价', sell_date:'卖出日', sell_price:'卖出价',
+  shares:'数量', fee:'手续费', pnl:'盈亏', pnl_pct:'收益率', hold_days:'持有'
+};
+const SORT_DATE = { buy_date: 1, sell_date: 1 };   // 字符串日期按字典序即可
+
+function numOr(v, d) { return v === null || v === undefined || isNaN(v) ? (d === undefined ? 0 : d) : Number(v); }
+
+function sortTrades(rows) {
+  const k = tradeSort.key, dir = tradeSort.dir;
+  if (!k) return rows.slice();
+  return rows.slice().sort((a, b) => {
+    let x = a[k], y = b[k];
+    if (k === 'ts_code') { x = String(x || ''); y = String(y || ''); return x < y ? -dir : (x > y ? dir : 0); }
+    if (SORT_DATE[k]) { x = String(x || ''); y = String(y || ''); return x < y ? -dir : (x > y ? dir : 0); }
+    const xn = (x === null || x === undefined || x === '') ? NaN : Number(x);
+    const yn = (y === null || y === undefined || y === '') ? NaN : Number(y);
+    const xb = isNaN(xn), yb = isNaN(yn);
+    if (xb && yb) return 0;
+    if (xb) return 1;      // 空值恒排最后
+    if (yb) return -1;
+    return (xn - yn) * dir;
+  });
+}
+
+function sortStateText() {
+  if (!tradeSort.key) return '';
+  return ' · 按' + (SORT_LABEL[tradeSort.key] || tradeSort.key) + (tradeSort.dir > 0 ? '升序' : '降序');
+}
+
+/* 状态格：running 后面缀上**进度百分比**（进度存在回测记录里，刷新页面照样在）；
+   error 把失败原因/中断说明挂在 title 上 —— 鼠标一放就知道为什么挂，不用点进去翻日志。 */
+function statusCell(r){
+  const cls = r.status==='done' ? 'g' : (r.status==='running' ? 'y' : 'r');
+  const tip = r.progress_msg ? ` title="${esc(r.progress_msg)}"` : '';
+  // data-pct：进度条那边的 paintJob 会按它把百分比就地更新（见 paintJob）——
+  // 不加这个，列表里那个数就只是「打开页面那一刻的快照」，和进度条对不上。
+  const pct = r.status==='running'
+    ? `<span class="st-pct" data-pct="${r.id}"${tip}>${Math.round(numOr(r.progress,0)*100)}%</span>`
+    : '';
+  return `<span class="tag ${cls}"${tip}>${esc(r.status)}</span>${pct}`;
+}
+
+/* 回测配置列：这次**真正用到的**合成参数（初始资金、最大持仓只数、佣金、滑点…）原样 JSON。
+   一行装不下就由 CSS 截断成「…」，悬浮看全（浮层见 bindCellTips —— 别用 title，多行 JSON 在
+   原生提示框里挤成一团）。
+   ⚠ 这里不做中文键名映射：界面显示的就是库里那份 params，改口径只该改 resolve_params 一处。 */
+function cfgCell(r){
+  const p = r.params || {};
+  if (!Object.keys(p).length) return '<span class="muted">—</span>';
+  const txt = JSON.stringify(p);
+  return `<span class="json-cell tip-cell" data-cfg="${esc(txt)}">${esc(txt)}</span>`;
+}
+
+/* ---------------- 「股票池」列：悬浮看**当时**的选股条件 ----------------
+ * 池名只有一句人话（「ALL · 昨日涨停今日大阴」），池子一改，标签背后的条件就跟这次回测
+ * 无关了。所以条件来自回测记录自带的快照 universe_spec（后端在启动那一刻存下、引用已展开）；
+ * 老记录没快照，后端会按池名反查**当前**池子并打 derived 标记 —— 这里老实标注出来。
+ * 静态过滤项的中文名只映射这里一处，回归里锁住它与后端 universe.DEFAULT_FILT 的键集合一致。 */
+const FILT_TEXT = {
+  exclude_st:'剔除 ST', exclude_kcb:'剔除科创板', exclude_cyb:'剔除创业板',
+  exclude_bj:'剔除北交所', min_amount:'最小日成交额', min_list_days:'最小上市天数'
+};
+function baseName(code){
+  if (code === null || code === undefined || code === '') return '全部A股';
+  return (UNIVERSES && UNIVERSES[code]) || String(code);
+}
+function poolTipText(r){
+  const head = '股票池：' + (r.universe || '—');
+  const s = r.universe_spec;
+  if (!s) return head;                 // 老记录 + 反查不到 → 至少给出池名
+  const L = [head, '基础池：' + baseName(s.base)];
+  const w = s.where || [];
+  if (s.kind === 'static' || !w.length) {
+    L.push('入池条件：无（静态股票池，按代码名单取）');
+  } else {
+    L.push(`入池条件（${w.length} 条，逐日全部成立才算入池）：`);
+    w.forEach((e, i) => L.push(`  ${i + 1}. ${e}`));
+  }
+  const f = s.filt || {}, fl = [];
+  ['exclude_st','exclude_kcb','exclude_cyb','exclude_bj'].forEach(k => { if (f[k]) fl.push(FILT_TEXT[k]); });
+  if (numOr(f.min_amount, 0) > 0) fl.push(`${FILT_TEXT.min_amount} ≥ ${f.min_amount} 千元`);
+  if (numOr(f.min_list_days, 0) > 0) fl.push(`${FILT_TEXT.min_list_days} ≥ ${f.min_list_days} 天`);
+  if (fl.length) L.push('静态过滤：' + fl.join(' · '));
+  if (s.pool_id) L.push(`引用选股策略 #${s.pool_id}${s.pool_name ? '（' + s.pool_name + '）' : ''}`);
+  if (s.derived) L.push('⚠ 该记录未存条件快照，以上是按池名反查的「当前」条件，池子可能已改过');
+  return L.join('\n');
+}
+function poolCell(r){
+  return `<span class="pool-name tip-cell" data-tip="${esc(poolTipText(r))}">`
+    + esc(r.universe || '—') + '</span>';
+}
+
+async function loadRuns(){
+  /* 取数期间先摆「加载中」，失败把后端原话摊在卡片里。
+     以前这张卡只有首屏那一次静态占位，点「刷新」后一直停在旧内容上 ——
+     到底在拉还是拉挂了，用户看不出来，只能等；失败更是只弹个 toast 就没了。 */
+  const box = $('#runs-list');
+  boxState(box, 'loading', '加载中…');
+  let runs;
+  try {
+    runs = await apiGet('/api/backtest/runs?limit=60');
+  } catch (e) {
+    boxState(box, 'error', '回测记录没取到', e.message);
+    throw e;          // ⚠ 保持「抛给调用方」的语义：接回进度条那处靠它区分成功/失败
+  }
+  // data sm：比默认表更紧凑（列从 12 涨到 14，不瘦一圈就会把「状态 / 操作」挤出卡片）
+  box.innerHTML = runs.length ? `<table class="data sm runs-tbl"><thead><tr>
+    <th>#</th><th>策略</th><th>股票池</th><th>区间</th><th class="num">总收益</th>
+    <th class="num">年化</th><th class="num">基准</th><th class="num">超额</th>
+    <th class="num">最大回撤</th><th class="num">胜率</th><th class="num">交易</th>
+    <th>回测配置</th><th>状态</th><th></th>
+    </tr></thead><tbody>${runs.map(r=>`<tr>
+      <td class="mono small">${r.id}</td>
+      <td>${esc(r.strategy_name)}<div class="small muted run-name" title="${esc(r.name||'')}">${esc(r.name||'')}</div></td>
+      <td class="small">${poolCell(r)}</td>
+      <td class="mono small">${esc(r.start_date)} ~ ${esc(r.end_date)}</td>
+      <td class="num ${fmt.cls(r.total_return)}">${fmt.pct(r.total_return)}</td>
+      <td class="num ${fmt.cls(r.annual_return)}">${fmt.pct(r.annual_return)}</td>
+      <td class="num">${fmt.pct(r.benchmark_return)}</td>
+      <td class="num ${fmt.cls(r.alpha)}">${fmt.pct(r.alpha)}</td>
+      <td class="num down">${fmt.pct(r.max_drawdown)}</td>
+      <td class="num">${fmt.pct(r.win_rate,1)}</td>
+      <td class="num">${fmt.int(r.trade_count)}</td>
+      <td>${cfgCell(r)}</td>
+      <td>${statusCell(r)}</td>
+      <td><div class="flex">
+        <button class="btn sm" data-view="${r.id}">查看</button>
+        <button class="btn sm" data-retest="${r.id}" title="按这条记录存下的买卖策略、选股条件快照、区间与参数原样再跑一次">重测</button>
+        <button class="btn sm danger" data-del="${r.id}">删</button></div></td></tr>`).join('')}
+    </tbody></table>` : '<div class="empty"><span class="big">↗</span>暂无回测记录</div>';
+
+  $$('[data-view]').forEach(b=>b.onclick=guardClick(b, ()=>showRun(b.dataset.view)));
+  $$('[data-retest]').forEach(b=>b.onclick=guardClick(b, ()=>retestRun(b.dataset.retest)));
+  $$('[data-del]').forEach(b=>b.onclick=guardClick(b, async()=>{
+    if(!confirm('删除该回测记录？'))return;
+    await apiPost('/api/backtest/runs/'+b.dataset.del+'/delete',{});
+    toast('已删除','ok'); loadRuns(); $('#result').style.display='none';
+  }));
+  return runs;      // 调用方要用来找「还在跑的那条」（见 resumeRunning）
+}
+
+/* ---------------- 单元格悬浮浮层（回测配置 / 股票池，共用这一个） ----------------
+   表格所在的 .card 是 overflow:hidden，absolute 浮层会被裁掉 → 用 fixed + 视口坐标，
+   和自动补全弹层（static/js/ac.js 的 .ac-pop）同一套做法；滚动就收起（浮层会跟丢位置）。
+   两类单元格：`.json-cell` 存的是原始 JSON（data-cfg，显示时格式化）、
+   `.tip-cell` 存的就是要显示的文本（data-tip，换行靠浮层的 white-space:pre）。
+   都用 textContent 写入 —— 条件是用户自己写的表达式，能拼 HTML 的地方就少拼一个。 */
+function prettyJson(txt){
+  try { return JSON.stringify(JSON.parse(txt), null, 2); } catch (e) { return txt || ''; }
+}
+function cellTipText(cell){
+  if (cell.dataset.cfg !== undefined) return prettyJson(cell.dataset.cfg);
+  return cell.dataset.tip || '';
+}
+function bindCellTips(){
+  const box = $('#runs-list');
+  if (!box) return;
+  const tip = document.createElement('div');
+  tip.className = 'json-pop';
+  tip.style.display = 'none';
+  document.body.appendChild(tip);
+  const hide = () => { tip._cell = null; tip.style.display = 'none'; };
+  const tipCellOf = e => (e.target.closest ? e.target.closest('.json-cell,.tip-cell') : null);
+  box.addEventListener('mouseover', e => {
+    const cell = tipCellOf(e);
+    if (!cell || cell === tip._cell) return;
+    tip._cell = cell;
+    tip.textContent = cellTipText(cell);
+    tip.style.display = 'block';
+    // 位置：优先贴单元格下方；下方放不下就翻到上方；两头都不够就贴着视口边 ——
+    // 关键是**整个浮层**都要留在视口内，只判「上沿进没进来」会让下半截被切掉
+    // （实测就踩过：单元格在视口底部时浮层下沿超出 innerHeight，看着像只画了一半）。
+    const c = cell.getBoundingClientRect(), t = tip.getBoundingClientRect();
+    let top = c.bottom + 6;
+    if (top + t.height > window.innerHeight - 6) top = c.top - t.height - 6;
+    top = Math.max(6, Math.min(top, window.innerHeight - t.height - 6));
+    tip.style.top = top + 'px';
+    tip.style.left = Math.max(6, Math.min(c.left, window.innerWidth - t.width - 6)) + 'px';
+  });
+  box.addEventListener('mouseout', e => { if (tipCellOf(e)) hide(); });
+  window.addEventListener('scroll', hide, true);
+}
+
+function metricCard(label, value, cls, sub){
+  return `<div class="stat"><div class="label">${label}</div>
+    <div class="value ${cls||''}">${value}</div><div class="sub">${sub||''}</div></div>`;
+}
+
+async function showRun(id){
+  const run = await apiGet('/api/backtest/runs/' + id);
+  if (run.status !== 'done') { toast('该回测状态：' + run.status, 'warn'); }
+  const m = run.metrics || {};
+  curRun = run;
+  $('#result').style.display = '';
+  $('#bt-hint').textContent = '#' + run.id + ' ' + run.name;
+  // 看一条**还在跑**的记录：把进度条接上，跑完自动出结果（刷新页面走的是同一条逻辑）
+  if (run.status === 'running') watchRun(run.id);
+
+  if (m.error) { $('#metric-cards').innerHTML = `<div class="hintbox warn" style="grid-column:1/-1">回测未产生结果：${esc(m.error)}</div>`; return; }
+
+  // 交易成本 = 手续费（佣金+印花税）+ 滑点亏损。老记录（本次改动前跑的）没有单列滑点，
+  // 就只显示手续费并说明，别拿 0 顶替 —— 那会让人以为滑点「不要钱」。
+  const feeSum = numOr(m.total_fee, 0);
+  const slipSum = (m.slippage_cost === undefined || m.slippage_cost === null) ? null : Number(m.slippage_cost);
+  const costSum = (m.total_cost === undefined || m.total_cost === null) ? feeSum : Number(m.total_cost);
+  const costPct = (m.cost_pct_of_init === undefined || m.cost_pct_of_init === null)
+    ? numOr(m.fee_pct_of_init, 0) : Number(m.cost_pct_of_init);
+  const avgCost = (m.avg_cost === undefined || m.avg_cost === null) ? m.avg_fee : m.avg_cost;
+  const costSub = '占初始资金 ' + costPct.toFixed(2) + '% · 手续费 ' + fmt.money(feeSum)
+    + (slipSum === null ? '（旧记录未单列滑点）' : ' + 滑点 ' + fmt.money(slipSum))
+    + ' · 单笔均 ' + fmt.money(avgCost);
+
+  $('#metric-cards').innerHTML = [
+    metricCard('总收益', fmt.pct(m.total_return), fmt.cls(m.total_return), '期末资产 ' + fmt.money(m.final_asset)),
+    metricCard('年化收益', fmt.pct(m.annual_return), fmt.cls(m.annual_return), '区间 ' + (m.days||0) + ' 天'),
+    metricCard('最大回撤', fmt.pct(m.max_drawdown), 'down', (m.max_dd_start||'') + ' ~ ' + (m.max_dd_end||'')),
+    metricCard('超额收益', fmt.pct(m.alpha), fmt.cls(m.alpha), '基准 ' + fmt.pct(m.benchmark_return)),
+    metricCard('夏普比率', numOr(m.sharpe).toFixed(2), '', '年化波动 ' + fmt.pct(m.annual_volatility, 1)),
+    metricCard('胜率', fmt.pct(m.win_rate, 1), '', (m.win_count||0) + ' 盈 / ' + (m.lose_count||0) + ' 亏'),
+    metricCard('盈亏比', m.profit_factor === null || m.profit_factor === undefined ? '—' : Number(m.profit_factor).toFixed(2), '', '毛利 ' + fmt.money(m.gross_profit)),
+    metricCard('交易次数', fmt.int(m.trade_count), '', '月均 ' + numOr(m.trades_per_month).toFixed(1) + ' 笔'),
+    metricCard('平均持仓', numOr(m.avg_hold_days).toFixed(1) + ' 天', '', '单笔均值 ' + fmt.pct(m.avg_pnl_pct)),
+    metricCard('最大单笔', fmt.pct(m.max_win_pct), 'up', '最差 ' + fmt.pct(m.max_lose_pct)),
+    metricCard('交易成本', fmt.money(costSum), '', costSub),
+  ].join('');
+
+  const eq = await apiGet('/api/backtest/runs/' + id + '/equity');
+  curEquity = eq;
+  drawEquity(eq);
+
+  curStats = await apiGet('/api/backtest/stats?run_id=' + id);
+  drawMonthly(curStats.monthly || []);
+  drawReasons(curStats.reasons || []);
+
+  // 换一条回测：排序与页码一起回到**默认**（与刚进页面时一致）。
+  // 默认 = 按买入日从近到远（服务端 /trades 的默认顺序也是它，两端同口径）。
+  tradeSort = { key: 'buy_date', dir: -1 };
+  tradePage = 1;
+  await loadTrades(id, '');
+  $('#result').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function drawEquity(eq){
+  if (!eq.length) return;
+  const dates = eq.map(e=>e.date);
+  const nav = eq.map(e=>(e.nav-1)*100);
+  const bench = eq.map(e=>e.benchmark===null?null:(e.benchmark-1)*100);
+  const hold = eq.map(e=>e.hold);
+  const dd = [];
+  let peak = -1e9;
+  eq.forEach(e=>{ peak = Math.max(peak, e.nav); dd.push((e.nav/peak-1)*100); });
+  $('#eq-tag').textContent = eq.length + ' 个交易日';
+  mkChart('#chart-equity', {
+    tooltip: Object.assign({}, tooltipBase, { formatter: p => {
+      const i = p[0].dataIndex;
+      return `<b>${dates[i]}</b><br/>策略 ${fmt.pct(nav[i])}　基准 ${bench[i]===null?'—':fmt.pct(bench[i])}<br/>回撤 ${fmt.pct(dd[i])}　持仓 ${hold[i]} 只`;
+    }}),
+    legend: { data:['策略','基准','回撤'], right:0, top:0, textStyle:{fontSize:11,color:'#9aa6ba'} },
+    grid: { left:54, right:56, top:30, bottom:46 },
+    xAxis: Object.assign({ type:'category', data:dates, boundaryGap:false }, baseAxis),
+    yAxis: [
+      Object.assign({ type:'value', name:'累计收益 %', nameTextStyle:{fontSize:11,color:'#8b95a9'}, axisLabel:{formatter:'{value}%',color:'#8b95a9',fontSize:11} }, baseAxis),
+      Object.assign({ type:'value', name:'回撤 %', position:'right', axisLabel:{formatter:'{value}%',color:'#8b95a9',fontSize:11} }, baseAxis, {splitLine:{show:false}})
+    ],
+    dataZoom: [{ type:'inside' }, { type:'slider', height:16, bottom:12, borderColor:'#2a3444', fillerColor:'rgba(75,131,255,.14)' }],
+    series: [
+      { name:'策略', type:'line', data:nav, showSymbol:false, lineStyle:{width:2,color:'#4b83ff'},
+        areaStyle:{color:{type:'linear',x:0,y:0,x2:0,y2:1,colorStops:[{offset:0,color:'rgba(75,131,255,.30)'},{offset:1,color:'rgba(75,131,255,0)'}]}} },
+      { name:'基准', type:'line', data:bench, showSymbol:false, lineStyle:{width:1.4,color:'#8792a5',type:'dashed'}, connectNulls:true },
+      { name:'回撤', type:'line', yAxisIndex:1, data:dd, showSymbol:false, lineStyle:{width:1,color:'#e5352b'},
+        areaStyle:{color:'rgba(229,53,43,.16)'} }
+    ]
+  });
+}
+
+function drawMonthly(list){
+  if (!list.length) { $('#chart-monthly').innerHTML='<div class="empty">无数据</div>'; return; }
+  mkChart('#chart-monthly', {
+    tooltip: Object.assign({}, tooltipBase, { formatter: p => `${p[0].axisValue}<br/>收益 ${fmt.pct(p[0].value)}` }),
+    grid: { left:50, right:16, top:16, bottom:40 },
+    xAxis: Object.assign({ type:'category', data:list.map(x=>x.month), axisLabel:{color:'#8b95a9',fontSize:10,rotate:45} }, baseAxis),
+    yAxis: Object.assign({ type:'value', axisLabel:{formatter:'{value}%',color:'#8b95a9',fontSize:11} }, baseAxis),
+    series: [{ type:'bar', data:list.map(x=>({value:x.ret, itemStyle:{color: x.ret>=0?'#e5352b':'#12a06a', borderRadius:[3,3,0,0]}})), barMaxWidth:22 }]
+  });
+}
+
+function drawReasons(list){
+  if (!list.length) { $('#chart-reasons').innerHTML='<div class="empty">无数据</div>'; return; }
+  const colors = { signal:'#4b83ff', stop_loss:'#12a06a', take_profit:'#e5352b', max_hold:'#e08a00', end:'#8b95a9' };
+  mkChart('#chart-reasons', {
+    tooltip: Object.assign({}, tooltipBase, { formatter: p => `${p.name}<br/>${p.value} 笔 (${p.percent}%)` }),
+    legend: { orient:'vertical', right:6, top:'center', textStyle:{fontSize:11,color:'#9aa6ba'} },
+    series: [{ type:'pie', radius:['46%','72%'], center:['38%','50%'], avoidLabelOverlap:true,
+      itemStyle:{borderColor:'#151a22',borderWidth:2},
+      label:{show:false}, labelLine:{show:false},
+      data:list.map(r=>({name:reasonText[r.sell_reason]||r.sell_reason, value:r.c,
+        itemStyle:{color:colors[r.sell_reason]||'#8b95a9'}})) }]
+  });
+}
+
+async function loadTrades(id, filter){
+  const rows = await apiGet('/api/backtest/runs/' + id + '/trades' + (filter?('?result='+filter):''));
+  curTradesRaw = rows;
+  tradePage = 1;        // 换回测 / 换筛选：笔数变了，回第一页（否则可能停在一个已经不存在的页）
+  renderTrades();
+}
+
+const TH = (label, key, cls) => `<th class="${cls||''} sortable" data-sort="${key}" title="点击按「${label}」排序">${label}<span class="sarrow"></span></th>`;
+
+/* 分页条：只有一页就不摆控件（省地方）。页码与笔数都用调用方算好的同一份值，别各算一份。 */
+function pagerHtml(total, pages, from, shown){
+  if (pages <= 1) return '';
+  const btn = (label, page, off) =>
+    `<button class="btn sm" data-page="${page}"${off ? ' disabled' : ''}>${label}</button>`;
+  const first = tradePage === 1, last = tradePage === pages;
+  return `<div class="pager">
+    <span class="small muted">第 ${from + 1}–${from + shown} 条 · 共 ${total} 条 · 每页 ${TRADE_PAGE_SIZE}</span>
+    <div class="pager-btns">
+      ${btn('« 首页', 1, first)}${btn('‹ 上一页', tradePage - 1, first)}
+      <span class="pager-cur">${tradePage} / ${pages}</span>
+      ${btn('下一页 ›', tradePage + 1, last)}${btn('末页 »', pages, last)}
+    </div>
+  </div>`;
+}
+
+function renderTrades(){
+  // 排序作用于**整份**数据（导出用的也是它），分页只切渲染窗口 —— 两者互不干扰。
+  const rows = sortTrades(curTradesRaw);
+  curTrades = rows;   // 导出顺序与页面展示一致（仍是全部，不受分页影响）
+  const total = rows.length;
+  const pages = Math.max(1, Math.ceil(total / TRADE_PAGE_SIZE));
+  if (tradePage > pages) tradePage = pages;   // 筛选后笔数变少 → 收敛到有效页，别停在空页
+  if (tradePage < 1) tradePage = 1;
+  const from = (tradePage - 1) * TRADE_PAGE_SIZE;
+  const view = rows.slice(from, from + TRADE_PAGE_SIZE);
+
+  // 标签只说真话：笔数 = 当前筛选后的实际条数；真被服务端上限截断（仅无筛选时可比）
+  // 就明说，别让「6051 笔的回测显示 20000 上限」这种口径悄悄失真。
+  const tr = curRun && curRun.metrics ? numOr(curRun.metrics.trade_count, 0) : 0;
+  const capped = (!$('#trade-filter').value && tr > total) ? ' · 已达接口上限' : '';
+  $('#trade-tag').textContent = total + ' 笔' + capped + sortStateText();
+  $('#trades-list').innerHTML = total ? `<table class="data"><thead><tr>
+    ${TH('代码','ts_code')}<th>名称</th>
+    ${TH('买入日','buy_date')}${TH('买入价','buy_price','num')}
+    ${TH('卖出日','sell_date')}${TH('卖出价','sell_price','num')}${TH('数量','shares','num')}
+    ${TH('手续费','fee','num')}${TH('滑点','slip_cost','num')}${TH('盈亏','pnl','num')}${TH('收益率','pnl_pct','num')}${TH('持有','hold_days','num')}
+    <th>离场原因</th>
+    <th>K线</th>
+    </tr></thead><tbody>${view.map(t=>`<tr>
+      <td class="mono">${esc(t.ts_code)}</td><td>${esc(t.name||'')}</td>
+      <td class="mono small">${esc(t.buy_date)}</td><td class="num">${fmt.price(t.buy_price)}</td>
+      <td class="mono small">${esc(t.sell_date)}</td><td class="num">${fmt.price(t.sell_price)}</td>
+      <td class="num">${fmt.int(t.shares)}</td>
+      <td class="num muted">${fmt.money(t.fee)}</td>
+      <td class="num muted" title="买入上浮 + 卖出下调 合计（已经扣在成交价里）">${fmt.money(t.slip_cost)}</td>
+      <td class="num ${fmt.cls(t.pnl)}">${fmt.sign(t.pnl)}</td>
+      <td class="num ${fmt.cls(t.pnl_pct)}">${fmt.pct(t.pnl_pct)}</td>
+      <td class="num">${t.hold_days}</td>
+      <td><span class="tag ${reasonTag(t.sell_reason)}">${reasonText[t.sell_reason]||t.sell_reason}</span></td>
+      <td><button class="btn sm" data-kline="${t.id}" title="查看该笔交易的K线与买卖点">📈</button></td>
+      </tr>`).join('')}</tbody></table>` + pagerHtml(total, pages, from, view.length)
+    : '<div class="empty">该条件下无交易</div>';
+
+  $$('[data-kline]', $('#trades-list')).forEach(b => b.onclick = guardClick(b, () => showTradeKline(b.dataset.kline)));
+  $$('th[data-sort]', $('#trades-list')).forEach(th => th.onclick = () => toggleSort(th.dataset.sort));
+  $$('[data-page]', $('#trades-list')).forEach(b => b.onclick = () => gotoPage(Number(b.dataset.page)));
+  paintSortArrow();
+}
+
+function gotoPage(p){
+  tradePage = p;
+  renderTrades();
+  // 翻页按钮在表格下方、新内容在上方 —— 不滚一下用户会以为「点了没反应」。
+  // 手算偏移量而不用 scrollIntoView：后者在无头/iframe 验证里会挂起（踩过）。
+  const el = $('#trades-list');
+  if (el) window.scrollTo({top: Math.max(0, el.getBoundingClientRect().top + window.scrollY - 76),
+                           behavior: 'smooth'});
+}
+
+function toggleSort(key){
+  if (!key) return;
+  if (tradeSort.key === key) tradeSort.dir = -tradeSort.dir;         // 再点同一列：切换升降序
+  else tradeSort = { key: key, dir: (SORT_DATE[key] || key === 'ts_code') ? 1 : -1 };  // 换列：日期/代码默认升序，数值默认降序
+  tradePage = 1;    // 换排序：回第一页（否则「第一页」的含义跟着排序变，看着像没生效）
+  renderTrades();
+}
+
+function paintSortArrow(){
+  $$('th[data-sort]', $('#trades-list')).forEach(th => {
+    th.classList.remove('sort-asc', 'sort-desc');
+    if (th.dataset.sort === tradeSort.key) th.classList.add(tradeSort.dir > 0 ? 'sort-asc' : 'sort-desc');
+  });
+}
+
+async function showTradeKline(tid){
+  if (!curRun) return;
+  let res;
+  try {
+    res = await apiGet('/api/backtest/runs/' + curRun.id + '/trades/' + tid + '/kline?before=40&after=25');
+  } catch (e) { return toast(e.message, 'err'); }
+
+  const t = res.trade || {};
+  const cid = 'tk' + Date.now() + Math.floor(Math.random() * 1000);
+  const selId = cid + 's', noteId = cid + 'n';
+  let el = null, chart = null, indKey = '', zoom = null;
+  /* 下挂指标能选哪些**全部来自接口目录**（与个股诊断页同一份 core.indicators.chart_catalog）
+     —— 前端不写指标清单：本地没同步某项数据时后端会标 empty，这里照实说「（无数据）」，
+     而不是给一个画出来是空线的选项。 */
+  const cat = res.indicators || [];
+  const picks = cat.map(g => ({ key: g.key, name: g.name + (g.empty ? '（无数据）' : '') }));
+  const firstOk = cat.find(g => g.key === 'macd' && !g.empty)
+               || cat.find(g => !g.empty) || cat[0];
+  indKey = firstOk ? firstOk.key : '';
+
+  const body = `
+    <div class="flex wrap" style="gap:8px 30px;margin-bottom:12px;align-items:flex-start">
+      <div class="kv">
+        <div class="k">标的</div><div class="v">${esc(res.ts_code)} ${esc(res.name || '')}</div>
+        <div class="k">买入</div><div class="v">${esc(t.buy_date)} @ ${fmt.price(t.buy_price)}</div>
+        <div class="k">卖出</div><div class="v">${esc(t.sell_date || '—')} @ ${fmt.price(t.sell_price)}</div>
+      </div>
+      <div class="kv">
+        <div class="k">盈亏</div><div class="v ${fmt.cls(t.pnl)}">${fmt.sign(t.pnl)}（${fmt.pct(t.pnl_pct)}）</div>
+        <div class="k">数量 / 持有</div><div class="v">${fmt.int(t.shares)} 股 · ${t.hold_days} 天</div>
+        <div class="k">手续费</div><div class="v">${fmt.money(t.fee)}</div>
+        <div class="k">滑点成本</div><div class="v">${fmt.money(t.slip_cost)}</div>
+      </div>
+      <div class="kv">
+        <div class="k">离场原因</div><div class="v">${esc(reasonText[t.sell_reason] || t.sell_reason || '—')}</div>
+        <div class="k">复权口径</div><div class="v">前复权 · 回测区间 ${esc((res.range.run_start||'').slice(2))}~${esc((res.range.run_end||'').slice(2))}</div>
+        <div class="k">展示区间</div><div class="v">${esc(res.range.shown_from)} ~ ${esc(res.range.shown_to)}</div>
+      </div>
+    </div>
+    <div class="hintbox" style="margin-bottom:10px">
+      图中 <b style="color:#e5352b">B</b> 为买入、<b style="color:#12a06a">S</b> 为卖出，标记价为<b>实际成交价</b>（含滑点）；
+      蓝点为该股在展示区间内其它触发信号的日子。K 线为前复权，与交易明细里的买卖价同口径
+      （买入价 ÷ 当日开盘价 − 1 即为滑点）。持有段的收益 / 天数标在 K 线格<b>上方</b>，
+      图中那条连线就是它指的区间；下挂指标格与 K 线格同一条时间轴，拖动即一起缩放。
+    </div>
+    <div class="flex" style="align-items:center;gap:10px;margin:0 0 6px">
+      <span class="small muted">下挂指标</span>
+      <select id="${selId}" style="max-width:240px"></select>
+      <span class="small muted" id="${noteId}"></span>
+    </div>
+    <div class="chart tk" id="${cid}"></div>`;
+
+  mkModal(res.ts_code + ' ' + (res.name || '') + ' · 买卖点复盘', body,
+    `<span class="small muted">拖动时间轴可缩放 · 下挂指标可切换</span><button class="btn" data-close>关闭</button>`,
+    () => { disposeChart(el); }, true);
+
+  el = document.getElementById(cid);
+  const sel = $('#' + selId);
+  fillSelect(sel, picks, 'key', 'name', indKey);
+  sel.onchange = () => {
+    zoom = readChartZoom(chart);   // 先记住窗口：setOption(notMerge) 会把它重置回全览
+    indKey = sel.value;
+    draw();
+  };
+  draw();
+
+  function draw(){
+    chart = drawTradeReview(el, res, indKey, zoom);
+    const g = cat.find(x => x.key === indKey);
+    $('#' + noteId).textContent = (g && g.empty) ? '本地没有「' + g.name + '」的数据，画不出来' : '';
+    if (chart) chart.resize();     // 换成没数据的指标时整块变矮，得让它重读尺寸
+  }
+}
+
+/* 读图表当前的缩放窗口（切指标时回传 —— 否则用户拖过的位置会被重置回全览） */
+function readChartZoom(chart){
+  if (!chart) return null;
+  const z = (chart.getOption().dataZoom || [])[0];
+  if (!z || z.start === undefined || z.end === undefined) return null;
+  return [z.start, z.end];
+}
+
+/* ---------- 滑点：买卖策略优先 ----------
+   滑点是**买卖策略自带**的成交假设（策略编辑页里设）。所以：
+     · 所选策略设了滑点 → 这里自动填上并置灰，标签写「跟随买卖策略」——
+       免得出现「改了框里的数跑出来没变」这种看不见的坑；
+     · 策略没设 → 这个框可用，值就是本次回测的滑点。
+   界面填的是**百分数**（0.1 = 0.1%），提交前用 SLIP 转回小数。
+   上下限由后端给（/api/config.slippage_range），别在这里写死。 */
+let CFG = {};            // /api/config（默认值 + 滑点上下限）
+let STRATEGIES = [];     // 买卖策略列表（滑点跟随判定用）
+function slipOf(s){
+  const v = ((s && s.config && s.config.exec) || {}).slippage;
+  return (v === null || v === undefined || v === '') ? null : Number(v);
+}
+function syncSlipFromStrategy(){
+  const s = STRATEGIES.find(x => String(x.id) === $('#bt-strategy').value);
+  const v = slipOf(s);
+  const inp = $('#bt-slip');
+  if (v === null) {
+    inp.disabled = false;
+    inp.value = SLIP.fromCfg(numOr(CFG.defaults && CFG.defaults.slippage, 0.001));
+    inp.title = '买卖策略没设滑点，本次回测用这个值';
+    $('#bt-slip-hint').textContent = '策略未设时用此值';
+  } else {
+    inp.disabled = true;
+    inp.value = SLIP.fromCfg(v);
+    inp.title = '该买卖策略自带滑点，改它要去策略编辑页';
+    $('#bt-slip-hint').textContent = '跟随买卖策略';
+  }
+}
+function applySlipRange(){
+  const rng = (CFG.slippage_range) || {};
+  const inp = $('#bt-slip');
+  const lo = SLIP.fromCfg(rng.min === undefined ? 0 : rng.min);
+  const hi = SLIP.fromCfg(rng.max === undefined ? 0.03 : rng.max);
+  inp.min = lo; inp.max = hi; inp.step = SLIP.STEP;
+}
+
+/* ---------- 回测进度条 ----------
+   数据源**只有一个**：回测记录本身（/api/backtest/runs/<id>）。服务端会把内存里活任务的
+   实时进度 / 阶段说明 / 日志并进这个接口，任务不在了（服务重启过）就退回库里最后落的那一帧。
+   于是「刚点开始」和「刷新页面」走的是同一条路 —— 刷新不再把进度条弄丢，换个标签页、甚至
+   换台机器打开也照样接得上；也**不需要**前端存 job_id。 */
+let runTimer = null, watchingRunId = null;
+
+function stopRunWatch(){
+  if (runTimer) { clearInterval(runTimer); runTimer = null; }
+  watchingRunId = null;
+}
+
+function paintJob(run){
+  // 终态由**状态**定格：done 就是 100%。后端已在出口上保证这件事，这里再兜一层 ——
+  // 「状态写着 done、进度条却停在 97%」这种自相矛盾不该有机会出现在画面上。
+  const done = run.status === 'done';
+  const pr = done ? 1 : Math.max(0, Math.min(1, numOr(run.progress, 0)));
+  const txt = Math.round(pr * 100) + '%';
+  $('#bt-job').style.display = '';
+  // ⚠ done 是在「往库写交易明细**之前**」落的：那几秒里说「完成」是句提前话
+  //   （点进明细还是空的）。后端用 writing 标着，这里如实显示。
+  $('#bt-msg').textContent = run.writing ? '回测完成，正在写库…'
+    : (run.progress_msg || (done ? '完成' : ''));
+  $('#bt-pct').textContent = txt;
+  $('#bt-bar').style.width = (pr * 100) + '%';
+  if (run.logs && run.logs.length) $('#bt-log').textContent = run.logs.join('\n');
+  // 列表里那条记录的状态格跟着走 —— 否则列表（页面打开时的快照）与进度条各写一个数，
+  // 看着像两个不同的东西在跑（实测就撞见过 17% vs 20%）。
+  const row = $('#runs-list [data-pct="' + run.id + '"]');
+  if (row) { row.textContent = txt; row.title = run.progress_msg || ''; }
+}
+
+/* 这条记录**真的**结束了：终态 + 后端已经把交易明细写进库（`writing=false`）。
+   `status='done'` 是在写库**之前**落的库，那几秒里明细表还是空的 —— 所以等 `writing`
+   落下来再说「完成」，别让用户兴冲冲点进去看到空表（2026-09-20 同一个 bug 的伴生现象）。 */
+function runFinished(run){
+  return run.status !== 'running' && !run.writing;
+}
+
+function watchRun(runId){
+  stopRunWatch();
+  watchingRunId = runId;
+  const tick = async () => {
+    let run;
+    try { run = await apiGet('/api/backtest/runs/' + runId); }
+    catch (e) { stopRunWatch(); return; }        // 接口挂了就停，别刷屏
+    if (watchingRunId !== runId) return;         // 已被别的回测接管
+    paintJob(run);
+    if (!runFinished(run)) return;               // 还在跑 / 还在写库 → 下一轮再说
+    stopRunWatch();
+    if (run.status === 'done') {
+      toast('回测完成', 'ok');
+      await loadRuns();
+      await showRun(runId);
+    } else {
+      toast('回测失败：' + (run.progress_msg || '见运行日志'), 'err', 8000);
+      await loadRuns();
+    }
+  };
+  tick();                                        // 立刻画一次，不空等一个轮询周期
+  runTimer = setInterval(tick, 1200);
+}
+
+/* 刷新 / 重新打开页面时，库里若还有一条 running 的回测，就把进度条接回来 */
+function resumeRunning(runs){
+  const r = (runs || []).find(x => x.status === 'running');
+  if (!r) return;                 // 列表按 id 倒序，命中的就是最近提交的那条
+  paintJob(r);
+  toast('回测 #' + r.id + ' 正在运行，继续显示进度', 'ok');
+  watchRun(r.id);
+}
+
+/* ---------- 回测配置的本地草稿（刷新不重置） ----------
+   表单里那一套（买卖策略 / 选股策略 / 区间 / 资金 / 持仓 / 费率 / 滑点）是**一格一格调出来的**，
+   刷新一次却全回到写死在 HTML 里的默认值（`value="1000000"`、结束日期扑到最新交易日）——
+   尤其是跑完一轮回来看结果、或换个标签页回来的时候，最恼人。所以整份存本机：
+
+     写：表单任何改动（防抖 300ms）、选股策略变更（PoolEditor 的 onChange）、点「开始回测」，
+         外加 `pagehide` 兜一次（防抖窗口里那 300ms 不能丢）；
+     读：进页面时**后于**默认值铺一层 —— 但 URL 上的 `?strategy_id=` 压过它（那是明确指定要跑的）；
+     清：「恢复默认参数」会连它一起清掉（不然一刷新参数又自己回来了）；卡片头上另有个「清除」。
+
+   只存**提交时真会发出去的那几项**（与 POST /api/backtest/start 的 body 一一对应），
+   这样「刷新回来看到的」和「上次跑出去的」不会各说各话。
+   ⚠ 滑点特殊：买卖策略自带滑点时那个框是**跟随策略、置灰**的，草稿在这一项上不作数 ——
+     只在框可用（策略没设）时才恢复它。
+   ⚠ 存不进去（隐私模式 / 配额满）就当没有缓存，绝不让它挡住回测。 */
+const BT_DRAFT_KEY = 'sm_bt_form';      // 沿用 monitor.html 的 sm_ 前缀，一眼能认出是本机缓存
+const BT_DRAFT_V = 1;                   // 结构版本：将来改结构靠它兜（老结构读不出来就忽略）
+let draftReady = false;                 // 恢复流程走完前不记录 —— 否则初始化那几次 onChange 会把草稿冲成默认值
+let draftMuted = false;                 // 用户点过「清除」→ 本页别再自动写回（否则一离开页面就复活）
+let draftTimer = null;
+
+function readBtForm(){
+  return {
+    v: BT_DRAFT_V,
+    strategy_id: $('#bt-strategy').value || '',
+    // 池是「静态 code / {pool_id} / {base,where,filt}」三种形态之一，原样存 ——
+    // 只有 PoolEditor 知道该怎么解释它，这里别自己拆
+    universe: poolEd ? poolEd.value() : $('#bt-universe').value,
+    start: $('#bt-start').value, end: $('#bt-end').value,
+    cash: $('#bt-cash').value, maxpos: $('#bt-maxpos').value, pospct: $('#bt-pospct').value,
+    comm: $('#bt-comm').value, tax: $('#bt-tax').value,
+    slip: $('#bt-slip').disabled ? null : $('#bt-slip').value,
+    at: Date.now()
+  };
+}
+
+/* force=true 表示「这是用户明确要留下的配置」（点了开始回测）—— 连「清除」都拦不住它；
+   不 force 的（pagehide 那记兜底）在清除之后一律不写。 */
+function saveBtForm(force){
+  if (!draftReady) return;                 // 初始化还没走完：此时的表单是默认值，写下去就把草稿冲了
+  if (draftMuted && !force) return;        // 刚点过「清除」：别再自己写回来
+  draftMuted = false;
+  try { localStorage.setItem(BT_DRAFT_KEY, JSON.stringify(readBtForm())); }
+  catch (e) { /* 隐私模式 / 配额满：当作没有缓存 */ }
+  paintDraftTip();
+}
+
+function saveBtFormSoon(){
+  if (!draftReady) return;
+  draftMuted = false;                      // 用户又在动表单了 → 「清除」不再拦着记录
+  if (draftTimer) clearTimeout(draftTimer);
+  draftTimer = setTimeout(() => { draftTimer = null; saveBtForm(); }, 300);
+}
+
+function loadBtForm(){
+  try {
+    const o = JSON.parse(localStorage.getItem(BT_DRAFT_KEY) || 'null');
+    return (o && typeof o === 'object' && !Array.isArray(o)) ? o : null;
+  } catch (e) { return null; }          // 草稿坏了就当没有 —— 绝不让它拦住页面
+}
+
+function clearBtForm(){
+  if (draftTimer) { clearTimeout(draftTimer); draftTimer = null; }
+  // ⚠ 静音是必须的：清完这一下，离开页面时 `pagehide` 那记兜底保存会照着**当时的表单**把
+  //   草稿原样写回来 —— 探针里实测撞到过（清除后 600ms 又出现，刷新后配置也回来了）。
+  //   静音只拦「自动」写；用户接着改一格（saveBtFormSoon）或点「开始回测」（force）都会解除。
+  draftMuted = true;
+  try { localStorage.removeItem(BT_DRAFT_KEY); } catch (e) { /* ignore */ }
+  paintDraftTip();
+}
+
+function paintDraftTip(){
+  const has = !!loadBtForm();
+  [$('#bt-draft-tip'), $('#btn-draft-clear')].forEach(el => {
+    if (el) el.style.display = has ? '' : 'none';
+  });
+}
+
+/* 把草稿铺回表单，返回**真正用上了**几项 —— 一项都没用上（策略与池都已不存在）就当没有草稿，
+   免得顶着一个「已记住上次配置」的标记却什么都没恢复。
+   逐项从宽校验：哪一项不合法就跳过哪一项，别让一格坏数据废掉整份草稿。 */
+function applyBtForm(d){
+  if (!d) return 0;
+  let n = 0;
+  const sid = (d.strategy_id === null || d.strategy_id === undefined) ? '' : String(d.strategy_id);
+  if (sid && STRATEGIES.some(s => String(s.id) === sid)) { $('#bt-strategy').value = sid; n++; }
+  // 池在 PoolEditor 构造时就当 default 传进去了（那里才知道选项全不全）
+  if (d.universe !== null && d.universe !== undefined && poolEd) n++;
+  ['start', 'end'].forEach(k => {
+    const v = d[k];
+    if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v)) { $('#bt-' + k).value = v; n++; }
+  });
+  [['cash', '#bt-cash'], ['maxpos', '#bt-maxpos'], ['pospct', '#bt-pospct'],
+   ['comm', '#bt-comm'], ['tax', '#bt-tax']].forEach(pair => {
+    const raw = d[pair[0]];
+    if (raw === null || raw === undefined || raw === '') return;
+    const v = Number(raw);
+    if (isFinite(v)) { $(pair[1]).value = v; n++; }
+  });
+  return n;
+}
+
+/* 滑点单列一条：草稿里存着也要看框能不能用 —— 买卖策略自带滑点时它是跟策略走的（置灰），
+   把草稿值塞进去只会骗人。所以调用顺序必须是「先 syncSlipFromStrategy，再铺草稿」。 */
+function applyDraftSlip(d){
+  if (!d || d.slip === null || d.slip === undefined || d.slip === '') return false;
+  const inp = $('#bt-slip');
+  if (inp.disabled) return false;
+  const v = Number(d.slip);
+  if (!isFinite(v)) return false;
+  inp.value = v;
+  return true;
+}
+
+function bindBtFormDraft(){
+  const box = $('#bt-form');
+  if (box) {
+    // input 与 change 都挂：select 走 change、数字/日期框走 input；同一个 handler，幂等
+    box.addEventListener('input', saveBtFormSoon);
+    box.addEventListener('change', saveBtFormSoon);
+  }
+  // ⚠ 别写成 `addEventListener('pagehide', saveBtForm)`：addEventListener 会把事件对象当第一个
+  //   实参传进来，而第一个形参是 force ⇒ 每次关页都变成一次「强制保存」，把「清除」那道静音绕过去。
+  window.addEventListener('pagehide', () => saveBtForm());
+  const btn = $('#btn-draft-clear');
+  if (btn) btn.onclick = () => { clearBtForm(); toast('已清除本地缓存，刷新后回到默认配置', 'ok'); };
+}
+
+/* ---------- 运行回测 ---------- */
+
+/* 表单 → 提交体。只取与 POST /api/backtest/start 一一对应的那几项；风控 / 上限
+   由后端按策略自带口径合成（`bt.resolve_params`）—— 前端不自己再拼一套参数。 */
+function formBody(){
+  const sid = $('#bt-strategy').value;
+  if (!sid) return null;
+  return {
+    strategy_id: Number(sid),
+    universe: poolEd ? poolEd.value() : $('#bt-universe').value,
+    start: $('#bt-start').value, end: $('#bt-end').value,
+    params: {
+      init_cash: Number($('#bt-cash').value),
+      max_positions: Number($('#bt-maxpos').value),
+      position_pct: Number($('#bt-pospct').value),
+      commission: Number($('#bt-comm').value),
+      stamp_tax: Number($('#bt-tax').value),
+      slippage: SLIP.toCfg($('#bt-slip').value),   // 界面 % → 小数
+    }
+  };
+}
+
+/* 「开始回测」与「重测」共用这一条提交路径 —— 分成两份的话，一边改了另一边会悄悄落后。
+   提交完就把进度条接到这条新记录上（watchRun 是唯一的进度来源）。 */
+async function submitBacktest(b, okMsg){
+  const r = await apiPost('/api/backtest/start', b);
+  toast(okMsg || '回测已启动', 'ok');
+  watchRun(r.run_id);
+  return r;
+}
+
+/* ---------- 重测：拿一条历史记录**原样**再跑一遍 ----------
+   「重测」的语义是复现，所以配置来源是这条记录自己存下来的那份，而不是表单当前的值：
+     · 买卖策略 → strategy_id；策略已不存在就明确拒绝 —— 静默换一个策略跑出来的数字毫无意义
+     · 选股条件 → universe_spec（启动那一刻的快照；池子后来改过也不跟着变，否则就不是「重测」了）
+     · 区间 / 资金 / 持仓 / 费率 / 滑点 → 记录里的 params
+   快照里带 pool_id 时：池还在就留着（记录里能看出引用了谁），池已被删就去掉那个 id、
+   只按快照的条件跑 —— 否则后端按「引用的选股策略已不存在」直接 400 拒掉。 */
+function retestBody(run){
+  const sid = Number(run.strategy_id || 0);
+  if (!sid || !STRATEGIES.some(s => Number(s.id) === sid)) {
+    toast('该记录用的买卖策略已不存在（或这条记录是临时策略跑的），无法重测', 'err', 8000);
+    return null;
+  }
+  const spec = run.universe_spec;
+  if (!spec) { toast('该记录没有存下选股条件快照，无法重测', 'err', 8000); return null; }
+  let universe = spec.base || 'all';
+  if (spec.kind === 'cond') {
+    universe = { base: spec.base || 'all', where: (spec.where || []).slice() };
+    if (spec.filt) universe.filt = spec.filt;
+    const pid = Number(spec.pool_id || 0);
+    if (pid && POOLS.some(p => Number(p.id) === pid)) universe.pool_id = pid;
+  }
+  const p = run.params || {};
+  return {
+    strategy_id: sid, universe: universe,
+    start: String(run.start_date).slice(0, 10), end: String(run.end_date).slice(0, 10),
+    params: {
+      init_cash: numOr(p.init_cash, 1000000),
+      max_positions: numOr(p.max_positions, 10),
+      position_pct: numOr(p.position_pct, 10),
+      commission: numOr(p.commission, 0.00025),
+      stamp_tax: numOr(p.stamp_tax, 0.0005),
+      slippage: numOr(p.slippage, 0),
+    },
+    // 名字带后缀，列表里一眼能认出哪几条是重测出来的（name 有 160 字符上限）
+    name: ((run.name || '回测') + ' · 重测').slice(0, 160),
+  };
+}
+
+async function retestRun(id){
+  let run;
+  try { run = await apiGet('/api/backtest/runs/' + id); }
+  catch (e) { return toast(e.message, 'err'); }
+  if (run.status === 'running') return toast('#' + id + ' 还在跑，跑完再重测', 'warn');
+  const b = retestBody(run);
+  if (!b) return;
+  try { await submitBacktest(b, '已按 #' + id + ' 的配置重测'); }
+  catch (e) { toast(e.message, 'err', 7000); }
+}
+
+$('#btn-run').onclick = guardClick($('#btn-run'), async () => {
+  const body = formBody();
+  if (!body) return toast('请先选择策略', 'warn');
+  try {
+    saveBtForm(true);    // 提交这一刻的配置就是「要记住的那一份」，别等防抖、也别被「清除」拦下
+    await submitBacktest(body);
+  } catch (e) { toast(e.message, 'err', 7000); }
+});
+
+$('#btn-reload-runs').onclick = guardClick($('#btn-reload-runs'), loadRuns);
+$('#trade-filter').onchange = () => { if (curRun) loadTrades(curRun.id, $('#trade-filter').value); };
+$('#btn-reset').onclick = () => {
+  const d = CFG.defaults || {};
+  $('#bt-cash').value = numOr(d.init_cash, 1000000);
+  $('#bt-maxpos').value = numOr(d.max_positions, 10);
+  $('#bt-pospct').value = numOr(d.position_pct, 10);
+  $('#bt-comm').value = numOr(d.commission, 0.00025);
+  $('#bt-tax').value = numOr(d.stamp_tax, 0.0005);
+  syncSlipFromStrategy();     // 滑点框：策略设了就还跟着策略，没设才回落到默认值
+  // 本机草稿一起清掉 —— 否则「恢复默认」后一刷新，参数又自己回来了（更费解）
+  clearBtForm();
+  toast('已恢复默认参数，本地缓存已清除', 'ok');
+};
+$('#btn-export').onclick = guardClick($('#btn-export'), () => {
+  if (!curTrades.length) return toast('无交易可导出', 'warn');
+  const head = ['代码','名称','买入日','买入价','卖出日','卖出价','数量','成本','收入','手续费','滑点成本','盈亏','收益率%','持有天数','离场原因'];
+  const lines = [head.join(',')].concat(curTrades.map(t=>[
+    t.ts_code, t.name, t.buy_date, t.buy_price, t.sell_date, t.sell_price, t.shares,
+    t.cost, t.revenue, t.fee, t.slip_cost, t.pnl, t.pnl_pct, t.hold_days, t.sell_reason
+  ].join(',')));
+  const blob = new Blob(['\ufeff' + lines.join('\n')], {type:'text/csv;charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'backtest_' + (curRun?curRun.id:'') + '_trades.csv';
+  a.click();
+});
+
+document.addEventListener('DOMContentLoaded', async () => {
+  const [strategies, universes, cfg] = await Promise.all([
+    apiGet('/api/strategies'), apiGet('/api/universes'), apiGet('/api/config')
+  ]);
+  const [presets, fields, pools] = await Promise.all([
+    apiGet('/api/universe/presets').catch(()=>[]),
+    apiGet('/api/universe/fields').catch(()=>[]),
+    apiGet('/api/pools').catch(()=>[])
+  ]);
+  // 本机草稿先读出来，等默认值铺完了再压上去（顺序反了就被默认值盖掉）
+  const draft = loadBtForm();
+  fillSelect($('#bt-strategy'), strategies.map(s=>({id:s.id, label:s.name + (s.builtin?'（样例）':'')})), 'id', 'label');
+  STRATEGIES = strategies;
+  CFG = cfg || {};
+  // 静态池 code → 中文名：股票池列的悬浮里「基础池：全部A股」要用它翻译（不翻译就只有 000300.SH）
+  UNIVERSES = {};
+  universes.forEach(u => { UNIVERSES[u.code] = u.name; });
+  POOLS = pools || [];
+  applySlipRange();
+  $('#bt-strategy').onchange = syncSlipFromStrategy;
+  poolEd = new PoolEditor({
+    select: '#bt-universe', panel: '#bt-pool', date: '#bt-end',
+    universes: universes, pools: pools, presets: presets, fields: fields,
+    // 池的草稿在这里铺（PoolEditor 才知道选项全不全：引用的选股策略被删了它会自己退回静态池），
+    // 别的字段由下面的 applyBtForm 负责
+    default: (draft && draft.universe !== null && draft.universe !== undefined)
+      ? draft.universe
+      : (universes.find(u=>u.code==='000300.SH') ? '000300.SH' : (universes[0]||{}).code),
+    onChange: saveBtFormSoon      // 选了/改了池子 → 记进草稿（draftReady 之前它会自己忽略）
+  });
+  $('#bt-end').value = cfg.latest_trade_date || cfg.today;
+  if (poolEd.dateEl) poolEd.dateEl.value = $('#bt-end').value;   // 试跑默认看最新交易日
+  // 草稿压在默认值之上（策略 / 区间 / 资金 / 费率）；池已在 PoolEditor 里铺过了
+  // ⚠ 必须是 let：下面滑点那一项还要 `restored++`。写成 const 的话「有草稿」这条路上会抛
+  //   TypeError（Assignment to constant variable），而它发生在 DOMContentLoaded 的中后段 ——
+  //   表单已经铺好、表格也渲染了，看着一切正常，只有它后面那几行（记草稿的开关、进度条接回）
+  //   静默不执行。`node --check` 查不出来，只有真跑一遍页面才看得见（探针抓到的）。
+  let restored = applyBtForm(draft);
+  // 列表拉失败也不该拖垮这一页 —— 接回进度条、记草稿、`?run_id=` 都在它后面，
+  // 接口抖一下就整段不执行的话，用户看到的是「配置记不住了」这种莫名其妙的症状
+  const runs = await loadRuns().catch(() => []);
+  bindCellTips();              // 单元格悬浮浮层（回测配置 / 股票池，挂一次即可，换 innerHTML 不影响）
+  const qs = new URLSearchParams(location.search);
+  if (qs.get('strategy_id')) $('#bt-strategy').value = qs.get('strategy_id');
+  syncSlipFromStrategy();      // 选了策略再定滑点框（策略自带 → 置灰跟随）
+  // 滑点的草稿必须**在这之后**铺：框此刻才知道自己该不该跟随策略（跟随就不用草稿值）
+  if (restored && applyDraftSlip(draft)) restored++;
+  bindBtFormDraft();           // 从这一刻起，改一格就记一格
+  draftReady = true;
+  paintDraftTip();
+  if (restored) $('#bt-hint').textContent = '已恢复上次的回测配置';
+  if (qs.get('run_id')) showRun(qs.get('run_id'));
+  // 刷新页面（或重新打开）时库里可能还有一条正在跑的回测 —— 把进度条接回来。
+  // 显式指定 run_id 的人是在看某条记录，就别抢他的画面。
+  else resumeRunning(runs);
+});
+</script>
+{% endblock %}

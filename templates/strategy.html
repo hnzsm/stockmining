@@ -1,0 +1,447 @@
+{% extends "base.html" %}
+{% block title %}买卖策略 · 短线选股{% endblock %}
+{% block pagetitle %}买卖策略{% endblock %}
+{% block pagedesc %}只管「什么时候买、什么时候卖」· 选哪些票交给「选股策略」，回测时两者关联{% endblock %}
+
+{% block content %}
+<div class="hintbox" style="margin-bottom:14px">
+  <b>买卖策略</b>只描述<b>买卖时点</b>：次日什么条件下买、持仓期间什么条件下卖、风控与成交价口径。
+  它<b>不含选股条件</b> —— 「买什么票」由<b>选股策略</b>负责（<a href="/pools">选股策略</a>页面上写条件、剔 ST、选板块）。
+  回测 / 选股时把「选股策略 × 买卖策略」两个下拉一配，就是一条完整策略。
+</div>
+
+<div class="grid" style="grid-template-columns:300px minmax(0,1fr);align-items:start">
+  <div class="card" style="margin-bottom:0">
+    <div class="card-head">
+      <div class="card-title">买卖策略</div>
+      <button class="btn sm primary" id="btn-new">新建</button>
+    </div>
+    <div class="card-body tight">
+      <div id="strat-list"><div class="empty">加载中…</div></div>
+      <div class="hr"></div>
+      <button class="btn sm" id="btn-builtins" style="width:100%">恢复内置样例（1 条）</button>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:0">
+    <div class="card-head">
+      <div class="card-title" id="ed-title">买卖策略编辑</div>
+      <div class="flex">
+        <span class="pill" id="ed-status">未保存</span>
+        <button class="btn sm" id="btn-validate">校验</button>
+        <button class="btn sm" id="btn-save-as">另存为</button>
+        <button class="btn sm primary" id="btn-save">保存</button>
+      </div>
+    </div>
+    <div class="card-body">
+      <div id="ed-errs"></div>
+      <div id="ed-legacy"></div>
+      <div class="row">
+        <div class="field" style="flex:2"><label class="lb">策略名称</label><input type="text" id="ed-name" placeholder="例如：开盘确认"></div>
+        <div class="field" style="flex:1;min-width:150px"><label class="lb">主K线周期</label>
+          <select id="ed-timeframe"><option value="daily">日K</option><option value="weekly">周K</option></select>
+        </div>
+      </div>
+      <div class="field"><label class="lb">策略说明 <span class="hint">记录逻辑，便于回溯</span></label>
+        <textarea id="ed-note" style="min-height:46px"></textarea></div>
+
+      <div class="hr"></div>
+
+      <div class="field">
+        <label class="lb">① 买入触发 <span class="hint">T+1 日开盘判断，全部满足才买入；留空=次日无条件买入；
+          一行里 <code>#</code> 之后是注释（不算条件，只是批注）</span></label>
+        <div class="cond-list" id="ed-buy_trigger"></div>
+        <div class="add-cond" data-add="buy_trigger" style="margin-top:6px">+ 添加买入触发条件</div>
+      </div>
+
+      <div class="field">
+        <label class="lb">② 卖出信号 <span class="hint">持仓期间逐日判断，满足即卖出（按下方成交价）；留空=只靠风控离场</span></label>
+        <div class="cond-list" id="ed-sell_signal"></div>
+        <div class="add-cond" data-add="sell_signal" style="margin-top:6px">+ 添加卖出信号</div>
+      </div>
+
+      <div class="field">
+        <label class="lb">③ 评分表达式（选填） <span class="hint">用于多标的排序，数值越大越优先，如 <code>-boll_pos</code></span></label>
+        <input type="text" id="ed-score" class="mono" placeholder="留空 → 按代码顺序（当选股命中多于持仓名额时，买的就是代码最小的那几只）">
+      </div>
+
+      <div class="hr"></div>
+      <div class="grid g2">
+        <div>
+          <label class="lb">风控</label>
+          <div class="field"><label class="lb small">止损 %<span class="hint">如 -7</span></label><input type="number" id="ed-sl" step="0.5" placeholder="不启用"></div>
+          <div class="field"><label class="lb small">止盈 %<span class="hint">如 15</span></label><input type="number" id="ed-tp" step="0.5" placeholder="不启用"></div>
+          <div class="field"><label class="lb small">最长持有 K 线数</label><input type="number" id="ed-hold" step="1" placeholder="不启用"></div>
+        </div>
+        <div>
+          <label class="lb">成交价口径</label>
+          <div class="field"><label class="lb small">买入价</label><select id="ed-buyprice"><option value="open">次日开盘价</option><option value="close">次日收盘价</option></select></div>
+          <div class="field"><label class="lb small">信号卖出价</label><select id="ed-sellprice"><option value="open">当日开盘价</option><option value="close">当日收盘价</option></select></div>
+          <div class="field"><label class="lb small">到期卖出价</label><select id="ed-holdprice"><option value="close">当日收盘价</option><option value="open">当日开盘价</option></select></div>
+          <div class="field">
+            <label class="lb small" id="ed-slip-lb">滑点 %
+              <span class="hint" id="ed-slip-hint">留空 = 跟随回测页默认（千1）</span></label>
+            <input type="number" id="ed-slip" step="0.05" placeholder="跟随回测默认">
+          </div>
+        </div>
+      </div>
+      <div class="small muted" style="margin-top:8px">
+        滑点是<b>策略自带的成交假设</b>：买入按「价×(1+滑点)」成交、卖出按「价×(1−滑点)」成交，
+        也就是说回测里它<b>永远算成亏损</b>。回测时以这里的值为准（回测页那个滑点框会跟着变灰）；
+        留空才用回测页的值。填法是<b>百分数</b>：0.1 表示 0.1%（= 千分之1）。<br>
+        股票池过滤（剔 ST / 板块 / 上市天数 / 最小成交额）与入池条件都在<b>选股策略</b>里设置，
+        买卖策略这边不再重复。回测时若未选选股策略，按默认过滤项（剔 ST / 北交所 / 上市满 60 天）执行。
+      </div>
+
+      <div class="hr"></div>
+      <div class="flex between" style="cursor:pointer" id="toggle-help">
+        <span class="card-title" style="font-size:12.5px">可用字段与函数参考</span><span class="btn ghost sm" id="help-arrow">展开 ▾</span>
+      </div>
+      <div id="help-panel" style="display:none;margin-top:10px">
+        <div class="tabs" style="margin-bottom:10px">
+          <div class="tab active" data-htab="fields">字段</div>
+          <div class="tab" data-htab="funcs">函数</div>
+        </div>
+        <div id="help-fields"><div class="fieldhelp"></div></div>
+        <div id="help-funcs" style="display:none"><div class="fieldhelp"></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const COND = ['buy_trigger','sell_signal'];
+let strategies = [], currentId = null, fields = {}, funcs = [];
+
+function condRow(val, field){
+  const d = document.createElement('div');
+  d.className = 'cond-row';
+  d.innerHTML = `<span class="cond-idx"></span>
+    <textarea class="mono" spellcheck="false" placeholder="例如 open > ref(close, 1)">${esc(val||'')}</textarea>
+    <span class="ok" style="visibility:hidden">●</span>
+    <button class="btn ghost sm" data-del>✕</button>`;
+  d.querySelector('[data-del]').onclick = () => { d.remove(); renumber(); markDirty(); };
+  const ta = d.querySelector('textarea');
+  ta.addEventListener('input', () => { markDirty(); autoGrow(ta); });
+  if (window.ExprAC) window.ExprAC.attach(ta, { weekly: field === 'weekly_filter' });
+  return d;
+}
+function autoGrow(ta){ ta.style.height='38px'; ta.style.height=Math.max(38, ta.scrollHeight)+'px'; }
+function renumber(){
+  COND.forEach(f=>{
+    $$('#ed-' + f + ' .cond-row').forEach((r,i)=>{ r.querySelector('.cond-idx').textContent = (i+1) + '.'; });
+  });
+}
+function markDirty(){ $('#ed-status').textContent = '未保存'; $('#ed-status').className = 'pill'; }
+
+$$('[data-add]').forEach(b => b.onclick = () => {
+  const f = b.dataset.add;
+  const row = condRow('', f);
+  $('#ed-' + f).appendChild(row);
+  renumber(); markDirty();
+  row.querySelector('textarea').focus();
+});
+
+function setConds(field, arr){
+  const box = $('#ed-' + field);
+  box.innerHTML = '';
+  (arr||[]).forEach(v => box.appendChild(condRow(v, field)));
+}
+function getConds(field){
+  return $$('#ed-' + field + ' .cond-row textarea').map(t=>t.value.trim()).filter(Boolean);
+}
+
+/* ---------- 表单 <-> 配置 ---------- */
+/* ⚠ 买卖策略**不含选股逻辑**：不写 entry / entry_any / weekly_filter / pool 过滤项。
+   选股交给「选股策略」，回测/选股时由 strategy.selection_cfg() 在运行时把池子条件
+   抬进 entry。老配置里若还留着这些键，后端会原样优先，不会被这里覆盖掉 ——
+   但页面不再编辑它们（改选股请去 /pools）。 */
+function readForm(){
+  const numOrNull = (sel) => { const v = $(sel).value.trim(); return v === '' ? null : Number(v); };
+  return {
+    name: $('#ed-name').value.trim(),
+    note: $('#ed-note').value.trim(),
+    config: {
+      timeframe: $('#ed-timeframe').value,
+      buy_trigger: getConds('buy_trigger'),
+      sell_signal: getConds('sell_signal'),
+      score_expr: $('#ed-score').value.trim(),
+      risk: { stop_loss_pct: numOrNull('#ed-sl'), take_profit_pct: numOrNull('#ed-tp'), max_hold_days: numOrNull('#ed-hold') },
+      exec: { buy_price: $('#ed-buyprice').value, sell_price: $('#ed-sellprice').value,
+              max_hold_price: $('#ed-holdprice').value,
+              // 滑点：界面 % → 库里小数（0.1 → 0.001），换算在 app.js 的 SLIP 里
+              slippage: SLIP.toCfg($('#ed-slip').value) }
+    }
+  };
+}
+function writeForm(s){
+  const c = s.config || {};
+  $('#ed-title').textContent = s.id ? '买卖策略编辑 · ' + s.name : '买卖策略编辑 · 新建';
+  $('#ed-name').value = s.name || '';
+  $('#ed-note').value = s.note || '';
+  $('#ed-timeframe').value = c.timeframe === 'weekly' ? 'weekly' : 'daily';
+  COND.forEach(f => setConds(f, c[f] || []));
+  $('#ed-score').value = c.score_expr || '';
+  const r = c.risk || {}, e = c.exec || {};
+  $('#ed-sl').value = r.stop_loss_pct ?? '';
+  $('#ed-tp').value = r.take_profit_pct ?? '';
+  $('#ed-hold').value = r.max_hold_days ?? '';
+  $('#ed-buyprice').value = e.buy_price || 'open';
+  $('#ed-sellprice').value = e.sell_price || 'open';
+  $('#ed-holdprice').value = e.max_hold_price || 'close';
+  $('#ed-slip').value = SLIP.fromCfg(e.slippage);   // 小数 → 界面 %
+  const legacy = (c.entry||[]).length + (c.entry_any||[]).length + (c.weekly_filter||[]).length;
+  $('#ed-status').textContent = s.builtin ? '内置样例' : (s.id ? '已保存' : '新建');
+  $('#ed-status').className = 'pill' + (s.builtin ? '' : ' ok');
+  $('#ed-legacy').innerHTML = legacy
+    ? `<div class="hintbox warn" style="margin:0 0 10px">这条策略是老配置，里面还写着 <b>${legacy}</b> 条选股条件。
+         选股请改用「<a href="/pools">选股策略</a>」；此时回测仍会按老条件执行（买卖策略自带的选股条件优先）。</div>`
+    : '';
+  renumber();
+}
+
+/* ---------- 列表 ---------- */
+/* 拖拽排序（2026-10-09 需求）：同页换位、落库持久化。
+   ⚠ 参考模板是 monitor.html 的「同页换位」（不是 watch.html 的跨组换组）：
+     拖动中在目标卡片**左/右半**决定「插到它前面 / 后面」，用 `clientX` 判半
+     （⚠ 不用 `offsetX` —— 无头环境里合成事件的 offsetX 恒为 0，见 C17/C52）。
+   ⚠⚠ **重画 ⇒ 绑定全部重挂**：`renderList()` 换的是整块 innerHTML，
+     所以卡片点击 / 删除 / 拖拽三套绑定都必须在 renderList 里重新挂一遍。
+   ⚠ **本地瞬时动作不套 guardClick**（C38）：拖拽本身是即时反馈；
+     只有真发请求那一刻才通过 `guardClick` 无关的 `apiPost` 走（下面 commitOrder 自带防抖合并）。 */
+let DRAG_ID = null;              // 正在拖的策略 id（null = 没在拖）
+
+/* 把 DOM 当前顺序读成 id 数组。⚠ **含内置** —— 2026-10-10 起内置样例也能拖
+   （用户要求「MACD与KDJ共振 和 开盘确认买卖策略也可以拖动排序」）。 */
+function listedIds(){
+  return $$('#strat-list .strat-item').map(el => Number(el.dataset.id));
+}
+
+function clearDropMark(){
+  $$('#strat-list .strat-item').forEach(el => {
+    el.classList.remove('drop-l','drop-r','dragging');
+  });
+}
+
+/* 拖完把新顺序写库。⚠ 提交**全量** id（含内置 —— 内置也能拖，后端只改 sort、
+   不动 builtin 标记），顺序按 DOM 当前顺序。后端按这个顺序重写 sort，返回最新清单。
+   ⚠ `apiPost` 失败时是**抛异常**（不是返回 null）—— 不接住会变成未处理的 rejection，
+     卡片顺序留在本地、库却没改，刷新就打回原形且没有任何提示。 */
+async function commitOrder(){
+  const ids = listedIds();
+  try {
+    const r = await apiPost('/api/strategies/reorder', { ids });
+    if (r && r.strategies) {
+      strategies = r.strategies;
+      renderList();        // 用后端权威顺序重画（不是相信本地 DOM）
+    }
+  } catch (e) {
+    toast('顺序没能保存：' + e.message, 'err');
+    await load();          // 回到库里的真实顺序，别让画面骗人
+  }
+}
+
+function attachDrag(){
+  $$('#strat-list .strat-item').forEach(el => {
+    const id = Number(el.dataset.id);
+    const s = strategies.find(x => x.id === id);
+    if (!s) { el.draggable = false; return; }   // 兜底：清单里找不到的卡（不该出现）
+    el.draggable = true;                        // ⚠ 内置样例也给拖（2026-10-10 起）
+    el.addEventListener('dragstart', e => {
+      // 从卡片里的按钮 / 链接按下去不算「拖卡片」（否则点「回测」会变成拖拽）
+      if (e.target.closest && e.target.closest('button,a,input,select')) {
+        e.preventDefault(); return;
+      }
+      DRAG_ID = id;
+      el.classList.add('dragging');
+      document.body.classList.add('dragging');
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = 'move';
+        try { e.dataTransfer.setData('text/plain', String(id)); } catch (err) {}
+      }
+    });
+    el.addEventListener('dragend', () => { clearDropMark(); document.body.classList.remove('dragging'); DRAG_ID = null; });
+  });
+}
+
+function renderList(){
+  const box = $('#strat-list');
+  box.innerHTML = strategies.length ? strategies.map(s=>{
+    const slip = SLIP.fromCfg((s.config.exec||{}).slippage);
+    return `
+    <div class="strat-item" style="cursor:pointer" data-id="${s.id}" data-drag="1">
+      <div style="min-width:0">
+        <div class="nm">${esc(s.name)}</div>
+        <div class="nt">${s.builtin?'内置 · ':''}${s.timeframe==='weekly'?'周K':'日K'} · ${(s.config.buy_trigger||[]).length} 条买入触发 · ${(s.config.sell_signal||[]).length} 条卖出信号${slip===''?'':` · 滑点 ${slip}%`}</div>
+      </div>
+      <div class="strat-acts">
+        <a class="btn sm" href="/backtest?strategy_id=${s.id}" onclick="event.stopPropagation()">回测</a>
+        ${s.builtin?'':'<button class="btn sm danger" data-del="'+s.id+'">删</button>'}
+      </div>
+    </div>`;}).join('') : '<div class="empty">暂无买卖策略</div>';
+
+  // 拖动中在目标卡片上滑过：按 clientX 落在左半/右半决定插到它**前面/后面**
+  $$('#strat-list .strat-item').forEach(el => {
+    el.addEventListener('dragover', e => {
+      if (DRAG_ID === null) return;
+      const me = Number(el.dataset.id);
+      if (me === DRAG_ID) return;                 // 别跟自己比
+      e.preventDefault();                          // ⚠ 不挡默认行为浏览器根本不允许 drop
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+      const r = el.getBoundingClientRect();
+      const after = (e.clientX - r.left) > r.width / 2;
+      clearDropMark();
+      el.classList.add(after ? 'drop-r' : 'drop-l');
+    });
+    el.addEventListener('drop', e => {
+      if (DRAG_ID === null) return;
+      e.preventDefault();
+      const me = Number(el.dataset.id);
+      const from = DRAG_ID;
+      // ⚠ 先读走「落在左半还是右半」再收尾 —— 收尾会清掉 drop-l/drop-r
+      const after = el.classList.contains('drop-r');
+      clearDropMark(); document.body.classList.remove('dragging');
+      DRAG_ID = null;
+      if (me === from) return;
+      // 移动已选中的那张卡（只有一张在拖，不做多选）
+      const cur = listedIds();
+      const fromIdx = cur.indexOf(from);
+      if (fromIdx < 0) return;
+      cur.splice(fromIdx, 1);
+      let toIdx = cur.indexOf(me);
+      if (toIdx < 0) return;
+      cur.splice(after ? toIdx + 1 : toIdx, 0, from);
+      // 按新顺序重排 DOM（不整体重画 —— 重画会丢拖拽上下文、也闪一下）
+      const map = {};
+      $$('#strat-list .strat-item').forEach(x => { map[Number(x.dataset.id)] = x; });
+      cur.forEach(id => { if (map[id]) box.appendChild(map[id]); });
+      commitOrder();
+    });
+  });
+  // 拖到列表空白处：什么都不做（别把卡片丢出列表）
+  box.addEventListener('dragover', e => { if (DRAG_ID !== null) e.preventDefault(); });
+
+  $$('#strat-list .strat-item').forEach(el => el.onclick = () => {
+    const s = strategies.find(x=>String(x.id)===el.dataset.id);
+    if (s) { currentId = s.id; writeForm(s); clearErrs(); }
+  });
+  $$('#strat-list [data-del]').forEach(b => b.onclick = guardClick(b, async (e) => {
+    e.stopPropagation();
+    if (!confirm('确定删除该策略？')) return;
+    await apiDel('/api/strategies/' + b.dataset.del);
+    toast('已删除', 'ok'); await load();
+  }));
+  attachDrag();     // ⚠ 重画 ⇒ 拖拽绑定必须重挂，否则拖一次后再也拖不动
+}
+
+/* 滑点取值范围由后端给（core/strategy.SLIPPAGE_MIN/MAX，经 /api/config），
+   页面不写死上下限 —— 改范围只改后端一处。 */
+function applySlipRange(rng){
+  rng = rng || {};
+  const lo = SLIP.fromCfg(rng.min === undefined ? 0 : rng.min);
+  const hi = SLIP.fromCfg(rng.max === undefined ? 0.03 : rng.max);
+  const el = $('#ed-slip');
+  el.min = lo; el.max = hi; el.step = SLIP.STEP;
+  $('#ed-slip-hint').textContent = `填 ${lo}~${hi}，留空 = 跟随回测页默认`;
+}
+
+function clearErrs(){ $('#ed-errs').innerHTML = ''; }
+function showErrs(list){
+  $('#ed-errs').innerHTML = list && list.length ? `<div class="hintbox warn" style="margin-bottom:12px">
+    <b>校验未通过：</b><ul style="margin:6px 0 0 18px">${list.map(e=>`<li>${esc(e)}</li>`).join('')}</ul></div>` : '';
+}
+
+async function load(){
+  const box = $('#strat-list');
+  boxState(box, 'loading', '加载中…');
+  try { strategies = await apiGet('/api/strategies'); }
+  catch (e) { boxState(box, 'error', '策略列表没取到', e.message); return; }
+  renderList();
+  if (!currentId && strategies.length) { currentId = strategies[0].id; writeForm(strategies[0]); }
+  else if (currentId) { const s = strategies.find(x=>x.id===currentId); if (s) writeForm(s); }
+}
+
+/* ---------- 按钮 ---------- */
+$('#btn-new').onclick = () => { currentId = null; writeForm({ config: { buy_trigger:['open > ref(close, 1)'], sell_signal:['open < ref(close, 1)'], risk:{max_hold_days:10} } }); clearErrs(); };
+$('#btn-validate').onclick = guardClick($('#btn-validate'), async () => {
+  const f = readForm();
+  const r = await apiPost('/api/strategies/validate', { config: f.config });
+  showErrs(r.errors);
+  toast(r.valid ? '校验通过' : '校验未通过，共 ' + r.errors.length + ' 个问题', r.valid ? 'ok' : 'warn');
+});
+$('#btn-save').onclick = guardClick($('#btn-save'), async () => {
+  const f = readForm();
+  if (!f.name) return toast('请填写策略名称', 'warn');
+  try {
+    const cur = strategies.find(x=>x.id===currentId);
+    // 老配置里残留的选股字段要保住（后端 selection_cfg 会优先用它），别在保存时丢掉
+    const cfg = Object.assign({}, (cur && cur.config) || {}, f.config);
+    ['entry','entry_any','weekly_filter','pool','indicators'].forEach(k=>{
+      if (cur && cur.config && cur.config[k] !== undefined) cfg[k] = cur.config[k];
+    });
+    const r = await apiPost('/api/strategies', { id: currentId, name: f.name, note: f.note, config: cfg });
+    currentId = r.id; toast('已保存：' + r.name, 'ok'); clearErrs(); await load();
+  } catch (e) { showErrs([e.message]); toast(e.message, 'err', 6000); }
+});
+$('#btn-save-as').onclick = guardClick($('#btn-save-as'), async () => {
+  const f = readForm();
+  const name = prompt('新策略名称', f.name + ' 副本');
+  if (!name) return;
+  try {
+    const r = await apiPost('/api/strategies', { name: name, note: f.note, config: f.config });
+    currentId = r.id; toast('已另存为：' + name, 'ok'); await load();
+  } catch (e) { showErrs([e.message]); }
+});
+$('#btn-builtins').onclick = guardClick($('#btn-builtins'), async () => {
+  const r = await apiPost('/api/strategies/builtins', {});
+  toast('内置样例已补齐（新增 ' + (r.installed||0) + ' 个）', 'ok'); await load();
+});
+$('#toggle-help').onclick = () => {
+  const p = $('#help-panel');
+  const open = p.style.display !== 'none';
+  p.style.display = open ? 'none' : '';
+  $('#help-arrow').textContent = open ? '展开 ▾' : '收起 ▴';
+};
+$$('[data-htab]').forEach(t => t.onclick = () => {
+  $$('[data-htab]').forEach(x=>x.classList.remove('active'));
+  t.classList.add('active');
+  $('#help-fields').style.display = t.dataset.htab==='fields' ? '' : 'none';
+  $('#help-funcs').style.display = t.dataset.htab==='funcs' ? '' : 'none';
+});
+
+document.addEventListener('DOMContentLoaded', async () => {
+  const [f, cfg] = await Promise.all([apiGet('/api/fields'), apiGet('/api/config')]);
+  applySlipRange(cfg.slippage_range);
+  const help = f.field_help || {};
+  fields = f.fields || Object.keys(help);
+  funcs = f.functions || [];
+  // 字段行与「示例」链接走 app.js 的 fieldHelpRow（与选股策略页共用一份，
+  // 免得两页各写一遍列名与点法）。点「示例」→ 看该字段的实际取值。
+  const fh = n => window.fieldHelpRow(n, help[n]);
+  const daily = fields.filter(n => !/^w_/.test(n));
+  const weekly = fields.filter(n => /^w_/.test(n));
+  $('#help-fields .fieldhelp').innerHTML = daily.map(fh).join('')
+    + `<div class="fh" style="grid-column:1/-1;margin-top:8px;border-bottom:none">
+         <span class="n">周线字段（w_ 前缀 ${weekly.length} 个）</span>
+         <span class="d">同名指标的周线值；选股条件里的周线判断放在「选股策略」里更合适</span></div>`
+    + weekly.map(fh).join('');
+  $('#help-funcs .fieldhelp').innerHTML = funcs.map(x=>`<div class="fh" style="grid-column:1/-1"><span class="n">${esc(x.signature)}</span><span class="d">${esc(x.desc)}</span></div>`).join('');
+  window.bindFieldHelp($('#help-fields .fieldhelp'));
+  if (window.ExprAC) window.ExprAC.attach($('#ed-score'), { weekly: false });
+  await load();
+  const q = new URLSearchParams(location.search).get('id');
+  if (q) { const s2 = strategies.find(x=>String(x.id)===q); if (s2){ currentId = s2.id; writeForm(s2);} }
+
+  /* 无头探针（static/_probe_stratdrag.html）用的只读调试口。
+     ⚠ 只暴露**读**（清单 / 当前顺序），不给写 —— 探针真要改顺序就走真实拖拽事件或
+       公开接口，别在页面里开一个「随便改状态」的后门。 */
+  window.__stratDebug = {
+    list: () => strategies.map(s => ({ id: s.id, name: s.name, builtin: !!s.builtin, sort: s.sort })),
+    order: () => $$('#strat-list .strat-item').map(el => Number(el.dataset.id)),
+    dragging: () => DRAG_ID,
+  };
+});
+</script>
+{% endblock %}

@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>K线周期切换 · 探针</title>
+<style>
+body{font:13px/1.6 ui-monospace,Consolas,monospace;background:#0d1117;color:#e6ebf4;margin:0;padding:12px}
+iframe{width:100%;height:460px;border:1px solid #2a3444;background:#151a22}
+pre{white-space:pre-wrap;margin-top:10px}
+</style>
+</head>
+<body>
+<iframe id="fr" title="诊断页预览模式"></iframe>
+<pre id="out">（探针未运行）</pre>
+<script>
+/* 同源探针：把「K线预览弹窗」嵌的那一页（/stock/<code>?embed=1）真加载起来，
+   点 K 线卡片上的「日K / 周K」分段按钮，看四件事：
+     · 预览模式里这个按钮**看得见**（查询条件卡被隐藏了，别把按钮也一起藏掉）；
+     · 点了之后 `#st-freq` 写回去了、请求真的带上了 freq；
+     · 图**换了一份**（周K 的根数与日K 不同，不是把日K画稀一点）；
+     · 按钮选中态跟着真值走，且切回日K 也能切回去。
+   ⚠ 这些只有**真渲染**才验得出来：只看模板最多知道「按钮在 HTML 里」，
+   看不出它在预览模式里是否被一起隐藏、点击链路是否真的通。
+
+   跑法：/static/_probe_freq.html?run=1  →  读 <pre id="out"> 里的 JSON。 */
+(function () {
+  var CHECKS = [];
+  function log(name, ok, extra) { CHECKS.push({ name: name, ok: !!ok, extra: extra || '' }); }
+  var out = document.getElementById('out');
+  var fr = document.getElementById('fr');
+  var CODE = '600519.SH';
+  var EMBED = '/stock/' + CODE + '?embed=1&sel_only=1&bars=260';
+
+  function dump(done) { out.textContent = JSON.stringify({ done: !!done, checks: CHECKS }); }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function win() { return fr.contentWindow; }
+  function doc() { return fr.contentDocument; }
+  function loadFrame(src) {
+    return new Promise(function (res) {
+      fr.onload = function () { res(); };
+      fr.src = src;
+    });
+  }
+  function seg() { return doc().querySelector('#st-freq-seg'); }
+  function btn(f) { return doc().querySelector('#st-freq-seg [data-f="' + f + '"]'); }
+  function freqValue() { return doc().querySelector('#st-freq').value; }
+  function view() { try { return win().__stDebug.view(); } catch (e) { return null; } }
+  function bars() { try { return (win().__stDebug.option().xAxis[0].data || []).length; } catch (e) { return -1; } }
+  function lit() {                       // 按钮的选中态（不读 class，读真的亮点：aria-pressed）
+    var a = btn('daily'), b = btn('weekly');
+    if (!a || !b) return '?';
+    return (a.getAttribute('aria-pressed') === 'true' ? 'daily' : '') +
+           (b.getAttribute('aria-pressed') === 'true' ? 'weekly' : '') || 'none';
+  }
+  function detailUrls() {                // iframe 内发过的 detail 请求（XHR 也记在 resource 里）
+    try {
+      return win().performance.getEntriesByType('resource')
+        .filter(function (e) { return e.name.indexOf('/api/stock/') >= 0 && e.name.indexOf('/detail') >= 0; })
+        .map(function (e) { return e.name; });
+    } catch (e) { return []; }
+  }
+  async function waitFor(fn, ms) {
+    var t0 = Date.now();
+    while (Date.now() - t0 < (ms || 30000)) {
+      try { if (fn()) return true; } catch (e) {}
+      await sleep(150);
+    }
+    return false;
+  }
+  function pick(f) {                     // 点分段按钮（真事件，不是直接调函数）
+    var b = btn(f);
+    if (!b) return false;
+    b.click();
+    return true;
+  }
+
+  if (!new URLSearchParams(location.search).get('run')) { dump(false); return; }
+
+  (async function main() {
+    try {
+      // ---------- A. 预览模式（弹窗里的那一档） ----------
+      await loadFrame(EMBED);
+      var ok = await waitFor(function () { return view() && view().freq; }, 60000);
+      if (!ok) { log('预览模式能把 K 线数据取回来', false, '等了 60s 还没 view'); dump(true); return; }
+      log('预览模式能把 K 线数据取回来', true, 'view.freq=' + view().freq);
+
+      var s = seg();
+      var box = s ? s.getBoundingClientRect() : null;
+      log('分段按钮在预览模式里**看得见**（没被 embed 的隐藏名单带走）',
+          s && win().getComputedStyle(s).display !== 'none' && box && box.height > 0,
+          box ? ('高 ' + Math.round(box.height) + 'px') : '找不到 #st-freq-seg');
+      var qc = doc().querySelector('#st-card-query');
+      log('查询条件卡确实被藏了（所以这个按钮才是弹窗里唯一的周期入口）',
+          qc && win().getComputedStyle(qc).display === 'none');
+      log('两个按钮都在（日K / 周K）', !!btn('daily') && !!btn('weekly'));
+      log('进来自动切到 URL 上的周期：初始亮「日K」',
+          freqValue() === 'daily' && lit() === 'daily',
+          'freq=' + freqValue() + ' 亮=' + lit());
+
+      var b0 = bars(), n0 = detailUrls().length;
+      log('日K 有足够多的根数（作为对照）', b0 > 100, b0 + ' 根');
+
+      // ---------- B. 点「周K」 ----------
+      log('点得到「周K」按钮', pick('weekly'));
+      var ok2 = await waitFor(function () { return view() && view().freq === 'weekly'; }, 60000);
+      log('点周K 后视图真的换成周K（后端 view.freq=weekly，不是前端把日K画稀）',
+          ok2 && freqValue() === 'weekly', ok2 ? ('tag=' + view().tag) : '超时');
+      var urls = detailUrls();
+      log('这次请求真的带上了 freq=weekly（周期是发到后端重新取数的）',
+          urls.length > n0 && /[?&]freq=weekly(&|$)/.test(urls[urls.length - 1]),
+          (urls[urls.length - 1] || '').replace(/^.*\/detail/, '/detail'));
+      var b1 = bars();
+      log('图换了一份（周K 根数明显少于日K：' + b0 + ' → ' + b1 + '）', b1 > 0 && b1 < b0);
+      log('按钮选中态跟着真值走（亮的是「周K」）', lit() === 'weekly', '亮=' + lit());
+      log('卡片上的视图标签也换成了后端给的那句', /^周K/.test((view().tag || '')));
+      log('周K 的收益卡另算（recomputed 说明条件被搬到了周K上）',
+          view().recomputed === true, 'recomputed=' + view().recomputed);
+
+      // ---------- C. 切回日K ----------
+      pick('daily');
+      var ok3 = await waitFor(function () { return view() && view().freq === 'daily'; }, 60000);
+      log('还能切回日K（来回切不粘住）',
+          ok3 && freqValue() === 'daily' && lit() === 'daily' && bars() === b0,
+          '根数 ' + bars() + ' / 亮=' + lit());
+
+      // ---------- D. URL 直接带 freq=weekly 进来 ----------
+      await loadFrame(EMBED + '&freq=weekly');
+      var ok4 = await waitFor(function () { return view() && view().freq === 'weekly'; }, 60000);
+      log('URL 带 freq=weekly 进来时直接看周K，且按钮初始就亮在「周K」',
+          ok4 && freqValue() === 'weekly' && lit() === 'weekly',
+          'freq=' + freqValue() + ' 亮=' + lit());
+
+      dump(true);
+    } catch (e) {
+      log('探针整体跑通', false, (e && e.message) || String(e));
+      dump(true);
+    }
+  })();
+})();
+</script>
+</body>
+</html>

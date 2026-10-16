@@ -1,0 +1,390 @@
+{% extends "base.html" %}
+{% block title %}模型设置 · 短线选股{% endblock %}
+{% block pagetitle %}模型设置{% endblock %}
+{% block pagedesc %}大模型接入配置（可配多条、随时切换）· AI 分析语句模板{% endblock %}
+
+{% block content %}
+<div class="hintbox" id="ai-status">加载中…</div>
+
+<div class="card">
+  <div class="card-head">
+    <div class="card-title">模型配置 <span class="tag">可配多条 · 切一条就全站生效</span></div>
+    <button class="btn sm" id="btn-new-prof">新建配置</button>
+  </div>
+  <div class="card-body">
+    <!-- 列表单独占一整行：这张表有 6 列（配置/模型/地址/Key/状态/操作），
+         塞进原来「左右各半」的左半幅（563px）实际要 905px —— 会压到右边表单上。
+         表格本身再包一层 .tbl-wrap 兜底（窄屏/超长地址时横向滚动，不顶破卡片）。 -->
+    <div class="tbl-wrap" id="prof-list"><div class="empty">加载中…</div></div>
+
+    <div class="grid g2" style="margin-top:16px">
+      <div>
+        <div class="row" style="margin-bottom:8px">
+          <div class="field" style="flex:1;margin-bottom:0"><label class="lb">配置名（列表里靠它区分）</label>
+            <input type="text" id="prof-name" placeholder="例如 本地 Ollama / DeepSeek 主力"></div>
+          <div class="field" style="flex:1;margin-bottom:0"><label class="lb">接入预设</label>
+            <select id="ai-preset"></select></div>
+        </div>
+        <div class="row">
+          <div class="field" style="flex:1.2"><label class="lb">模型名</label>
+            <input type="text" id="ai-model" placeholder="qwen2.5:7b / deepseek-chat / glm-4-flash"></div>
+          <div class="field" style="flex:2"><label class="lb">接口地址</label>
+            <input type="text" id="ai-base" placeholder="http://127.0.0.1:11434"></div>
+        </div>
+        <div class="row">
+          <div class="field" style="flex:2"><label class="lb">API Key</label>
+            <input type="password" id="ai-key" autocomplete="new-password"
+                   placeholder="本地 Ollama 留空即可；已存过的 Key 不会回显"></div>
+          <div class="field" style="flex:0 0 auto;align-self:flex-end">
+            <label class="chk"><input type="checkbox" id="ai-clear-key"> 清除已保存的 Key</label></div>
+        </div>
+        <div class="field" style="margin-bottom:0;max-width:280px"><label class="lb">协议</label>
+          <select id="ai-kind">
+            <option value="ollama">ollama（/api/chat）</option>
+            <option value="openai">openai 兼容（/v1/chat/completions）</option>
+          </select></div>
+      </div>
+      <div>
+        <div class="row">
+          <div class="field" style="flex:0 0 130px"><label class="lb">temperature</label>
+            <input type="number" id="ai-temp" step="0.1" min="0" max="2"></div>
+          <div class="field" style="flex:0 0 150px"><label class="lb">max_tokens</label>
+            <input type="number" id="ai-mt" step="64" min="64" max="32768"></div>
+          <div class="field" style="flex:0 0 150px"><label class="lb">超时（秒）</label>
+            <input type="number" id="ai-tmo" step="10" min="5" max="600"></div>
+          <div class="field" style="flex:0 0 auto;align-self:flex-end">
+            <button class="btn" id="btn-reset-preset"
+                    title="把这个预设的默认地址与模型名填回表单（还没保存）">按预设填默认值</button></div>
+        </div>
+        <div class="field"><label class="lb">系统提示（每次分析都带上；「数据里没有的别编」这句就靠它）</label>
+          <textarea id="ai-system" rows="5"></textarea></div>
+        <div class="hintbox" id="ai-preset-note"></div>
+      </div>
+    </div>
+
+    <div class="flex wrap" style="gap:8px;align-items:center;margin-top:12px">
+      <button class="btn primary" id="btn-save">保存</button>
+      <button class="btn" id="btn-test">测试连接</button>
+      <button class="btn" id="btn-activate">设为当前</button>
+      <button class="btn danger" id="btn-del">删除</button>
+      <span class="small muted" id="prof-hint"></span>
+    </div>
+    <div class="hintbox warn" id="ai-test-out" style="display:none;margin-top:10px"></div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-head">
+    <div class="card-title">AI 分析语句模板</div>
+    <button class="btn sm" id="btn-new-tpl">新建模板</button>
+  </div>
+  <div class="card-body">
+    <!-- 与上面那张表同理：列表整行（4 列，含「变量」那格可能很长），表单在下面整行
+         —— textarea 写提示词也正好需要宽度。 -->
+    <div class="tbl-wrap" id="tpl-list"><div class="empty">加载中…</div></div>
+    <div style="margin-top:16px">
+      <div class="row" style="margin-bottom:8px">
+        <div class="field" style="flex:1;margin-bottom:0"><label class="lb">模板名</label>
+          <input type="text" id="tpl-name" placeholder="例如 亮点与消息面"></div>
+        <div class="field" style="flex:0 0 auto;align-self:flex-end">
+          <label class="chk"><input type="checkbox" id="tpl-default"> 设为默认</label></div>
+      </div>
+      <div class="field"><label class="lb">模板内容（花括号里的变量会被替换）</label>
+        <textarea id="tpl-text" rows="8" placeholder="分析{股票名称}有何亮点，近期有无利好利空消息。"></textarea></div>
+      <div class="small muted" style="margin-bottom:10px">
+        点一下就插到光标处：<span id="tpl-vars"></span></div>
+      <div class="flex wrap" style="gap:8px;align-items:center">
+        <button class="btn primary" id="btn-tpl-save">保存模板</button>
+        <button class="btn" id="btn-tpl-default">设为默认</button>
+        <button class="btn danger" id="btn-tpl-del">删除</button>
+        <span class="small muted" id="tpl-hint"></span>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+/* 模型设置页：模型配置（多条 + 切换）+ 语句模板。口径全在后端（core/llm.py / core/ai.py），
+   这一页只做表单读写 —— 不在前端再定义一遍预设、变量或默认值。 */
+let PROFILES = [];          // 全部配置（后端已脱敏：没有 api_key，只有 api_key_set/hint）
+let AI_PRESETS = [];
+let TPLS = [];
+let curProf = null;         // 正在编辑的配置（null = 新建）
+let curTpl = null;          // 正在编辑的模板（null = 新建）
+
+function presetOf(key){ return AI_PRESETS.find(p => p.key === key) || {}; }
+
+function paintPresets(){
+  $('#ai-preset').innerHTML = AI_PRESETS.map(p =>
+    `<option value="${esc(p.key)}">${esc(p.label)}</option>`).join('');
+}
+
+function paintPresetNote(){
+  const p = presetOf($('#ai-preset').value);
+  $('#ai-preset-note').innerHTML = (p.note ? esc(p.note) + '　' : '')
+    + (p.base_url ? `默认地址 <code>${esc(p.base_url)}</code>　默认模型 <code>${esc(p.model)}</code>` : '');
+}
+
+/* ---------- 模型配置：列表 ---------- */
+function paintProfiles(){
+  const box = $('#prof-list');
+  if (!PROFILES.length){ box.innerHTML = '<div class="empty">还没有配置</div>'; return; }
+  box.innerHTML = `<table class="data"><thead><tr>
+      <th>配置</th><th>模型</th><th>地址</th><th>Key</th><th>操作</th>
+    </tr></thead><tbody>
+    ${PROFILES.map(p => `<tr>
+      <td><span class="prof-name" title="${esc(p.name)}">${esc(p.name)}</span>
+        ${p.is_active ? '<span class="tag y">当前</span>' : ''}
+        ${p.ready ? '' : '<span class="tag r">未配好</span>'}</td>
+      <td class="small"><span class="prof-model" title="${esc(p.model)}">${esc(p.model || '—')}</span><span
+        class="muted prof-preset">${p.preset ? '（' + esc(presetOf(p.preset).label || p.preset) + '）' : ''}</span></td>
+      <td class="small muted mono"><span class="prof-url" title="${esc(p.base_url)}">${esc(p.base_url || '—')}</span></td>
+      <td class="small muted">${p.api_key_set ? esc(p.api_key_hint) : '—'}</td>
+      <td><button class="btn sm" data-edit="${p.id}">编辑</button>
+        ${p.is_active ? '' : `<button class="btn sm ghost" data-act="${p.id}">设为当前</button>`}</td>
+    </tr>`).join('')}</tbody></table>`;
+  $$('[data-edit]', box).forEach(b => b.onclick = () => {
+    const p = PROFILES.find(x => String(x.id) === b.dataset.edit);
+    if (p) fillForm(p);
+  });
+  $$('[data-act]', box).forEach(b => b.onclick = guardClick(b, () => activate(b.dataset.act)));
+}
+
+function paintStatus(){
+  const cur = PROFILES.find(p => p.is_active);
+  const el = $('#ai-status');
+  if (!cur){
+    el.className = 'hintbox warn';
+    el.innerHTML = '还没有可用的模型配置 —— 在下面填一条再点「保存」。';
+    return;
+  }
+  el.className = 'hintbox' + (cur.ready ? '' : ' warn');
+  el.innerHTML = cur.ready
+    ? `当前使用：<b>${esc(cur.name)}</b> · 模型 <code>${esc(cur.model)}</code>`
+      + ` · 地址 <code>${esc(cur.base_url)}</code>`
+      + (cur.api_key_set ? ' · API Key 已保存' : '')
+    : `当前配置「${esc(cur.name)}」还没配好：地址与模型名必填`
+      + (cur.key_required ? '，这个接入还要 API Key' : '')
+      + '。改完点「保存」，再点「测试连接」验证一次。';
+}
+
+/* ---------- 模型配置：表单 ---------- */
+/* `isNew=true` 时表示「还没落库的那条」：`curProf=null`（保存走新建），「设为当前/删除」禁用。 */
+function fillForm(p, isNew){
+  curProf = isNew ? null : (p || null);
+  $('#prof-name').value = (!isNew && p) ? p.name : '';
+  $('#ai-preset').value = (!isNew && p && p.preset) || 'ollama';
+  $('#ai-kind').value = (!isNew && p && p.kind) || 'ollama';
+  $('#ai-base').value = (!isNew && p && p.base_url) || '';
+  $('#ai-model').value = (!isNew && p && p.model) || '';
+  $('#ai-temp').value = (!isNew && p) ? p.temperature : 0.3;
+  $('#ai-mt').value = (!isNew && p) ? p.max_tokens : 1024;
+  $('#ai-tmo').value = (!isNew && p) ? p.timeout : 120;
+  $('#ai-system').value = (!isNew && p && p.system_prompt) ? p.system_prompt
+    : ((PROFILES.find(x => x.is_active) || {}).system_prompt || '');
+  $('#ai-key').value = '';
+  $('#ai-clear-key').checked = false;
+  $('#ai-key').placeholder = (!isNew && p && p.api_key_set)
+    ? ('已保存 ' + p.api_key_hint + '（留空 = 不改）') : '本地 Ollama 留空即可';
+  $('#prof-hint').textContent = isNew ? '新建配置'
+    : (p ? ('正在编辑 #' + p.id + (p.is_active ? '（当前使用）' : '')) : '选一条配置，或点「新建配置」');
+  $('#btn-activate').disabled = !curProf || curProf.is_active;
+  $('#btn-del').disabled = !curProf || PROFILES.length <= 1;
+  paintPresetNote();
+}
+
+/* 新建：**不**沿用一个假对象当 curProf（否则「保存」会去改那条不存在的 id），
+   系统提示沿用当前那条的 —— 空着的话保存后就没有「数据里没有的别编」那句约束了。 */
+function blankProf(){
+  const p = presetOf('ollama');
+  fillForm({ preset: 'ollama', kind: 'ollama', base_url: p.base_url, model: p.model,
+             temperature: 0.3, max_tokens: 1024, timeout: 120 }, true);
+  $('#ai-key').placeholder = '本地 Ollama 留空即可';
+  $('#prof-name').focus();
+}
+
+function formCfg(){
+  const c = {
+    name: $('#prof-name').value.trim(),
+    preset: $('#ai-preset').value,
+    kind: $('#ai-kind').value,
+    base_url: $('#ai-base').value.trim(),
+    model: $('#ai-model').value.trim(),
+    temperature: Number($('#ai-temp').value),
+    max_tokens: Number($('#ai-mt').value),
+    timeout: Number($('#ai-tmo').value),
+    system_prompt: $('#ai-system').value,
+  };
+  // Key 的三态：没动过 → 不发这个字段（后端保留这条原有的）；清了 → clear_api_key
+  const k = $('#ai-key').value.trim();
+  if ($('#ai-clear-key').checked) c.clear_api_key = true;
+  else if (k) c.api_key = k;
+  return c;
+}
+
+function showTest(html, warn){
+  const el = $('#ai-test-out');
+  el.className = 'hintbox' + (warn ? ' warn' : '');
+  el.style.display = '';
+  el.innerHTML = html;
+}
+
+/* 一次请求把整页刷新：接口回的是一整份 payload，所以状态只从后端来，不在前端自己拼。
+   `keepId` = 表单继续停在编辑哪一条（不传就停在「当前生效」那条）。 */
+function applyPayload(d, keepId){
+  AI_PRESETS = d.presets || AI_PRESETS;
+  PROFILES = d.profiles || [];
+  TPLS = d.templates || [];
+  paintPresets();
+  paintProfiles();
+  paintStatus();
+  paintTemplates();
+  fillForm(PROFILES.find(p => String(p.id) === String(keepId || d.active_id)) || null);
+}
+
+async function reload(){ applyPayload(await apiGet('/api/ai/config')); }
+
+async function activate(id){
+  try {
+    applyPayload(await apiPost('/api/ai/profiles/' + id + '/activate', {}));
+    toast('已切换当前模型配置', 'ok');
+  } catch (e) { toast(e.message, 'err', 6000); }
+}
+
+/* ---------- 模板列表 / 编辑器 ---------- */
+function paintTemplates(){
+  const box = $('#tpl-list');
+  box.innerHTML = TPLS.length ? `<table class="data"><thead><tr>
+      <th>模板名</th><th>变量</th><th>默认</th><th>操作</th></tr></thead><tbody>
+    ${TPLS.map(t => `<tr>
+      <td>${esc(t.name)}${t.builtin ? ' <span class="tag">内置</span>' : ''}</td>
+      <td class="small muted">${t.vars && t.vars.length
+        ? `<span class="tpl-vars" title="${esc(t.vars.join(' '))}">${esc(t.vars.join(' '))}</span>`
+        : '—'}</td>
+      <td class="small">${t.is_default ? '<span class="tag y">默认</span>' : ''}</td>
+      <td><button class="btn sm" data-edit="${t.id}">编辑</button></td>
+    </tr>`).join('')}</tbody></table>` : '<div class="empty">还没有模板</div>';
+  $$('[data-edit]', box).forEach(b => b.onclick = () => {
+    const t = TPLS.find(x => String(x.id) === b.dataset.edit);
+    if (!t) return;
+    curTpl = t;
+    $('#tpl-name').value = t.name;
+    $('#tpl-text').value = t.template;
+    $('#tpl-default').checked = !!t.is_default;
+    $('#tpl-hint').textContent = '正在编辑 #' + t.id + (t.builtin ? '（内置，可改文案，不可删）' : '');
+  });
+}
+
+function paintVars(vars){
+  $('#tpl-vars').innerHTML = vars.map(v =>
+    `<button type="button" class="btn sm" data-var="${esc(v.token)}"
+       title="${esc(v.desc)}">${esc(v.token)}</button>`).join(' ');
+  $$('[data-var]').forEach(b => b.onclick = () => {
+    const ta = $('#tpl-text');
+    const s = ta.selectionStart === undefined ? ta.value.length : ta.selectionStart;
+    const e = ta.selectionEnd === undefined ? s : ta.selectionEnd;
+    ta.value = ta.value.slice(0, s) + b.dataset.var + ta.value.slice(e);
+    ta.focus();
+    ta.selectionStart = ta.selectionEnd = s + b.dataset.var.length;
+  });
+}
+
+function blankTpl(){
+  curTpl = null;
+  $('#tpl-name').value = '';
+  $('#tpl-text').value = '';
+  $('#tpl-default').checked = false;
+  $('#tpl-hint').textContent = '新建模板';
+  $('#tpl-name').focus();
+}
+
+async function loadAll(){
+  const d = await apiGet('/api/ai/config');
+  applyPayload(d);
+  paintVars(d.vars || []);
+}
+
+/* ---------- 事件 ---------- */
+$('#ai-preset').addEventListener('change', () => {
+  const p = presetOf($('#ai-preset').value);
+  $('#ai-kind').value = p.key === 'custom' ? $('#ai-kind').value : (p.kind || 'openai');
+  paintPresetNote();
+});
+$('#btn-reset-preset').onclick = () => {
+  const p = presetOf($('#ai-preset').value);
+  if (p.base_url) $('#ai-base').value = p.base_url;
+  if (p.model) $('#ai-model').value = p.model;
+  if (p.key !== 'custom') $('#ai-kind').value = p.kind || 'openai';
+  toast('已按预设填好地址与模型名（记得保存）', 'ok');
+};
+$('#btn-new-prof').onclick = blankProf;
+$('#btn-save').onclick = guardClick($('#btn-save'), async () => {
+  const b = { profile: formCfg() };
+  if (curProf) b.id = curProf.id;
+  try {
+    const d = await apiPost('/api/ai/profiles', b);
+    applyPayload(d, d.saved_id || (curProf && curProf.id));
+    toast(curProf ? '已保存' : '已新建配置', 'ok');
+  } catch (e) { toast(e.message, 'err', 6000); }
+});
+$('#btn-test').onclick = guardClick($('#btn-test'), async () => {
+  const btn = $('#btn-test');
+  btn.disabled = true; btn.textContent = '测试中…';
+  showTest('<span class="muted">正在请求模型…</span>', false);
+  const b = { profile: formCfg() };
+  if (curProf) b.id = curProf.id;
+  try {
+    const r = await apiPost('/api/ai/profiles/test', b);
+    showTest(`连通：<b>${esc(r.model)}</b>（${esc(r.kind)}）· ${fmt.ms(r.elapsed_ms)}`
+             + ` · 地址 <code>${esc(r.url)}</code><br>模型回答：<code>${esc(r.text)}</code>`, false);
+  } catch (e) {
+    showTest(esc(e.message), true);
+  } finally { btn.disabled = false; btn.textContent = '测试连接'; }
+});
+$('#btn-activate').onclick = guardClick($('#btn-activate'), () => { if (curProf) activate(curProf.id); });
+$('#btn-del').onclick = guardClick($('#btn-del'), async () => {
+  if (!curProf) return;
+  if (!confirm('确定删除配置「' + curProf.name + '」？')) return;
+  try {
+    applyPayload(await apiPost('/api/ai/profiles/' + curProf.id + '/delete', {}));
+    toast('已删除', 'ok');
+  } catch (e) { toast(e.message, 'err', 6000); }
+});
+
+$('#btn-new-tpl').onclick = blankTpl;
+$('#btn-tpl-save').onclick = guardClick($('#btn-tpl-save'), async () => {
+  const b = { name: $('#tpl-name').value, template: $('#tpl-text').value,
+              is_default: $('#tpl-default').checked };
+  try {
+    const r = curTpl ? await apiPost('/api/ai/templates/' + curTpl.id, b)
+                     : await apiPost('/api/ai/templates', b);
+    TPLS = r.templates || r;
+    paintTemplates();
+    if (curTpl) curTpl = TPLS.find(t => String(t.id) === String(curTpl.id)) || curTpl;
+    toast('模板已保存', 'ok');
+  } catch (e) { toast(e.message, 'err', 6000); }
+});
+$('#btn-tpl-default').onclick = guardClick($('#btn-tpl-default'), async () => {
+  if (!curTpl) return toast('先选一条模板（点「编辑」）', 'warn');
+  try {
+    TPLS = await apiPost('/api/ai/templates/' + curTpl.id + '/default', {});
+    paintTemplates();
+    toast('已设为默认', 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+});
+$('#btn-tpl-del').onclick = guardClick($('#btn-tpl-del'), async () => {
+  if (!curTpl) return toast('先选一条模板（点「编辑」）', 'warn');
+  if (!confirm('确定删除模板「' + curTpl.name + '」？历史记录会保留（只留模板名快照）')) return;
+  try {
+    TPLS = await apiPost('/api/ai/templates/' + curTpl.id + '/delete', {});
+    paintTemplates();
+    blankTpl();
+    toast('已删除', 'ok');
+  } catch (e) { toast(e.message, 'err', 6000); }
+});
+
+document.addEventListener('DOMContentLoaded', loadAll);
+</script>
+{% endblock %}

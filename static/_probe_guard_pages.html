@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>各页加载冒烟探针</title></head>
+<body>
+<pre id="out">running</pre>
+<iframe id="fr" style="width:1440px;height:900px;border:0"></iframe>
+<script>
+/* 各页加载冒烟：把每个页面依次装进 iframe，验三件事 ——
+     ① 页面真渲染出来了（该页**独有的**标记元素出现了）
+     ② app.js 已加载（window.guardClick 是个函数）—— 这是「按钮能挂上防连点」的前提；
+        万一哪页加载顺序错了，绑定时 guardClick 还不存在 → 整页按钮全废
+     ③ 关键按钮已绑上 handler（typeof btn.onclick === 'function'）
+        —— 直接证明那页的内联脚本跑到了绑定那一行（中途抛错就绑不上）
+
+   ⚠ 别用 fr.onload / readyState 判页面就绪：iframe 里最初是 about:blank，readyState 已经
+      是 complete，会提前放行。等「该页独有的标记元素」最稳（标记都是各页唯一的 id）。
+   ⚠ 每个页面等一个「累计轮询上限」而不是只等时间：虚拟时间会快进 setTimeout。 */
+(function () {
+  var PAGES = [
+    ['/',               '#hot-refresh',  true ],
+    ['/backtest',       '#btn-run',      true ],
+    ['/screen',         '#btn-screen',   true ],
+    ['/pools',          '#btn-save',     true ],
+    ['/strategies',     '#btn-save',     true ],
+    ['/data',           '#btn-sync',     true ],
+    ['/settings',       '#btn-save',     true ],
+    ['/futures',        '#ft-refresh',   true ],
+    ['/futures/kline',  '#fk-refresh',   true ],
+    ['/monitor',        '#mon-refresh',  false]     // 这页全是本地动作，按钮走 addEventListener
+  ];
+  var checks = [], finished = false;
+  function ck(name, ok, extra) {
+    checks.push({ name: name, ok: !!ok, extra: extra === null || extra === undefined ? '' : String(extra) });
+  }
+  function out() {
+    document.getElementById('out').textContent =
+      JSON.stringify({ done: finished, checks: checks });
+  }
+  function until(fn, ms, step) {
+    return new Promise(function (res) {
+      var t0 = Date.now(), n = 0, cap = Math.ceil(ms / (step || 200)) + 60;
+      (function poll() {
+        var v = null;
+        try { v = fn(); } catch (e) { v = null; }
+        if (v) return res(v);
+        if (++n > cap || Date.now() - t0 > ms) return res(null);
+        setTimeout(poll, step || 200);
+      })();
+    });
+  }
+  var fr = document.getElementById('fr');
+  function D() { return fr.contentDocument; }
+  function W() { return fr.contentWindow; }
+
+  (async function main() {
+    for (var i = 0; i < PAGES.length; i++) {
+      var path = PAGES[i][0], mark = PAGES[i][1], wantsHandler = PAGES[i][2];
+      try { fr.src = path; } catch (e) { /* 忽略 */ }
+      // 等该页独有的标记元素出现（顺带把 app.js 也等出来）
+      var el = await until(function () {
+        /* ⚠ 别写成 `d.querySelector(mark) && W().guardClick` —— `&&` 会把结果换成**后者**
+           （函数），后面 `el.onclick` 就全成了 undefined（第一版就栽在这，9 页齐刷刷假红）。 */
+        var d = D();
+        if (!d) return null;
+        var node = d.querySelector(mark);
+        if (!node || !W() || typeof W().guardClick !== 'function') return null;
+        return node;
+      }, 40000, 200);
+      ck(path + '：页面渲染出来（找得到 ' + mark + '）', !!el, el ? '' : '超时');
+      ck(path + '：app.js 已加载（guardClick 可用）',
+         !!(W() && typeof W().guardClick === 'function'),
+         (W() && typeof W().guardClick) || '?');
+      if (el && wantsHandler) {
+        /* ⚠ 别「一发现标记元素就直接断言 onclick」：标记元素多是**静态 HTML**（首页的
+           #hot-refresh 在模板第 32 行就写死了），而绑定它在内联脚本的**最后一行**，
+           前面还串着一排 `await apiGet(...)`。DOM 一到就查，等于在跟脚本赛跑 ——
+           页面重一点（ECharts + 几张卡 + 首屏若干接口）这条就假红（2026-10-08 实测踩到：
+           同一份代码，单开一页等 5 秒是好的，这里却是 undefined）。
+           改成**轮询等它绑上**，超时才判失败。 */
+        var bound = await until(function () {
+          return typeof el.onclick === 'function' ? true : null;
+        }, 20000, 200);
+        ck(path + '：' + mark + ' 已绑上 handler（内联脚本跑到了绑定那行）',
+           !!bound, typeof el.onclick);
+      }
+    }
+    finished = true;
+    out();
+  })();
+})();
+</script>
+</body>
+</html>

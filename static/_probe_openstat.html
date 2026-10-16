@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>开盘形态概率探针</title>
+<style>
+  body{margin:0;background:#0d1117;color:#e6ebf4;font:13px/1.6 Consolas,monospace}
+  #out{white-space:pre-wrap;padding:12px;margin:0}
+  iframe{position:fixed;left:-99999px;top:0;width:1440px;height:1500px;border:0}
+</style>
+</head>
+<body>
+<pre id="out">未运行 —— 本页是自检探针，加 ?run=1 才开始（只读 DOM，不写任何数据）。</pre>
+<script>
+/* ============================================================================
+   个股诊断「开盘形态概率」的浏览器实测探针
+
+   验的是「页面渲染出来的这一块」跟后端给的那份数据是否**逐字一致**：
+
+     1) 这块（`#st-head-open`）真的**挂进了 stat 卡里**（不是被 CSS 藏了、
+        也没留在结果区外面），四格的标签与概率文本与
+        /api/stock/<code>/detail 的 openstat.items 完全一样；
+     2) 颜色：高开/低开红柱 = up（红），低开/高开绿柱 = down（绿）——
+        这是 A 股约定，与页面别处同一套（拿 class 量，不读画布像素）；
+     3) 位置：`#st-head-open` 是 `#st-head` 第 2 张卡（顶替原「最新收盘」），
+        原读数并进第 1 张「股票」卡；
+     4) 换一只票（改 URL 参数重新加载）之后这块跟着换 —— 不是留在上一只的数字。
+     5) **幅度可调 + 即时重算**（2026-10-09）：输入框的 min/max/step 来自后端下发的
+        `adjust`；前端 `calcOpen(t)` 用同一份原料 + 同一个 eps 数出来的四项，
+        必须与「探针自己独立数一遍」逐字相等；改阈值后四格标签（高开8%）、概率、
+        图上「高开/低开」标记的点数都跟着变，且**不发请求**。
+     6) 图上标记：高开=红、低开=绿，每点落在**开盘价**上，`idx` 能对回 rows。
+     7) **一字板不算跳空**（2026-10-10）：页面四格里的「n 次」要等于「按 eps 判据数一遍、
+        再把 `yz_up`/`yz_dn` 那几根剔掉」的结果；脚注要写着后端给的那句剔除说明；
+        图上标记里**不能出现**一字板那几根。
+   `?embed=1` 时**照常渲染**（2026-10-10 用户要求：K线预览弹窗里也要有这张卡）
+   —— 这里改成验「卡在、四格在、数值与接口逐字一致」，不再是「藏起来」。
+   ============================================================================ */
+const CODE = new URLSearchParams(location.search).get('code') || '300750.SZ';
+const EMBED = new URLSearchParams(location.search).get('embed') === '1';
+const out = document.getElementById('out');
+const log = (...a) => { out.textContent += a.join(' ') + '\n'; };
+
+let apiData = null;
+
+function makeIframe(src){
+  return new Promise(res => {
+    const f = document.createElement('iframe');
+    f.onload = () => setTimeout(() => res(f), 900);   // 等页面把接口跑完再读
+    f.src = src;
+    document.body.appendChild(f);
+  });
+}
+
+async function fetchDetail(){
+  const r = await fetch('/api/stock/' + encodeURIComponent(CODE) +
+                        '/detail?bars=260', {cache:'no-store'});
+  return (await r.json()).data;
+}
+
+(async () => {
+  if (!/run=1/.test(location.search)) return;
+  out.textContent = '';
+  try {
+    apiData = await fetchDetail();
+    const src = '/stock/' + encodeURIComponent(CODE) + (EMBED ? '?embed=1' : '');
+    const f = await makeIframe(src);
+    const d = f.contentDocument, w = f.contentWindow;
+
+    // ---- 1) 「开盘形态概率」卡是不是占住了原来「最新收盘」那一栏 ----
+    const card = d.querySelector('#st-head-open');
+    const head = d.querySelector('#st-head');
+    const cards = [...(head ? head.querySelectorAll(':scope > .stat') : [])];
+    log('CARD_EXISTS', !!card);
+    if (EMBED){
+      // 2026-10-10 用户要求：K线预览弹窗（?embed=1）里**也要有**开盘形态概率卡片。
+      //   所以这里验的是「卡在 + 四格渲染出来 + 与接口逐字一致」，不再是「藏起来」。
+      const vis = !!(card && w.getComputedStyle(card).display !== 'none');
+      log('EMBED_VISIBLE', vis);
+      const ecells = [...(card || d).querySelectorAll('.open-cell')];
+      const want2 = (apiData.openstat.items || []).map(x => x.text);
+      log('EMBED_CELL_N', ecells.length, 'EXPECT', want2.length);
+      const evals = ecells.map(c => c.querySelector('.open-val').textContent.trim());
+      log('EMBED_ITEMS_MATCH', JSON.stringify(evals) === JSON.stringify(want2),
+          evals.join(',') + ' | ' + want2.join(','));
+      // 预览里也要能读到完整口径（含「一字板不算跳空」那句）
+      const efoot = d.querySelector('#open-foot') || {};
+      // ⚠ 括号要包住整段拼接：`a || '' + '|' + b` 会被解析成 `a || ('' + '|' + b)`，
+      //   徽标 title 有值时就只剩它、读不到脚注。
+      const etip = ((d.querySelector('#open-badge') || {}).title || '') + '|' + (efoot.title || '');
+      log('EMBED_NOTE_IN_TIP', etip.indexOf(apiData.openstat.note || '\u0000') >= 0);
+      log('DONE');
+      return;
+    }
+    await new Promise(r => setTimeout(r, 400));
+
+    // 位置：必须是 `#st-head` 的第 2 张卡（顶替「最新收盘」），且「股票」卡里带着收盘读数
+    const idx = cards.indexOf(card);
+    const stockCard = cards[0] || null;
+    const subStock = stockCard ? stockCard.querySelector('#st-head-close') : null;
+    const visible = !!(card && w.getComputedStyle(card).display !== 'none');
+    log('SLOT_INDEX', idx, 'EXPECT', 1);
+    log('VISIBLE', visible);
+    // 「最新收盘」那张卡已经不在了（原来的读数并进「股票」卡）
+    log('CLOSE_CARD_GONE', !d.querySelector('#st-head-close')
+        || !!d.querySelector('.stat.accent #st-head-close'));
+    log('READOUT_IN_STOCK', !!subStock);
+    // 「股票」卡的读数必须带价格与涨跌幅（不写死数字，只查这两截都在）
+    const st0 = apiData.rows && apiData.rows.length ? apiData.rows[apiData.rows.length-1] : {};
+    const roTxt = subStock ? subStock.textContent : '';
+    log('READOUT_HAS_PRICE', !!roTxt && String(st0.close || '') !== ''
+        && roTxt.length > 0);
+
+    const cells = [...(card || d).querySelectorAll('.open-cell')];
+    log('CELL_N', cells.length);
+    const got = cells.map(c => ({
+      label: c.querySelector('.open-lab').textContent.trim(),
+      val: c.querySelector('.open-val').textContent.trim(),
+      sub: (c.querySelector('.open-sub') || {}).textContent ? c.querySelector('.open-sub').textContent.trim() : '',
+      cls: c.className.replace('open-cell','').trim(),
+    }));
+    log('GOT', JSON.stringify(got));
+    log('WANT', JSON.stringify((apiData.openstat.items||[]).map(x =>
+      ({label:x.label, val:x.text, cls:x.cls}))));
+
+    // 逐项比对（标签 + 概率文本 + 颜色）
+    const items = apiData.openstat.items || [];
+    let match = items.length === got.length;
+    for (let i = 0; i < items.length && i < got.length; i++){
+      if (got[i].label !== items[i].label) match = false;
+      if (got[i].val !== items[i].text) match = false;
+      if (!got[i].cls.split(/\s+/).includes(items[i].cls)) match = false;
+    }
+    log('ITEMS_MATCH', match);
+
+    // ---- 1b) 四格排成一行（2026-10-09 用户要求 4 列）且没被挤爆 ----
+    //   ⚠ 不比写死的像素宽度（视口/字号一变就假红），只验**行为**：
+    //   (a) 四格 top 基本相同（同一行，不是折成两行）；
+    //   (b) 每格内部「标签/概率/次数」三行都不横向溢出（scrollWidth ≤ clientWidth+1），
+    //       且末行右边界不出格 —— 这才是 4 列真正的风险点。
+    const geo = [];
+    const tops = cells.map(c => Math.round(c.getBoundingClientRect().top));
+    const oneRow = cells.length === 4 && (Math.max(...tops) - Math.min(...tops)) <= 2;
+    if (!oneRow) geo.push('四格不在同一行 tops=' + tops.join(','));
+    cells.forEach((c, i) => {
+      if (c.scrollWidth > c.clientWidth + 1) {
+        geo.push(i + ' 格子内容横向溢出 ' + c.scrollWidth + '>' + c.clientWidth);
+      }
+      const cr = c.getBoundingClientRect();
+      ['.open-lab', '.open-val', '.open-sub'].forEach(sel => {
+        const el2 = c.querySelector(sel);
+        if (!el2) return;
+        if (el2.scrollWidth > el2.clientWidth + 1) {
+          geo.push(i + ' ' + sel + ' 溢出 ' + el2.scrollWidth + '>' + el2.clientWidth);
+        }
+        const r2 = el2.getBoundingClientRect();
+        if (r2.right > cr.right + 0.5) geo.push(i + ' ' + sel + ' 出格');
+      });
+    });
+    log('GRID_ROWS', oneRow ? 1 : 2, 'EXPECT 1');
+    log('CELLS_FIT', geo.length === 0, geo.join('; ') || 'ok');
+
+    // 颜色：高开/低开红柱=up，低开/高开绿柱=down
+    const clsOf = k => {
+      const it = items.find(x => x.key === k) || {};
+      const g = got.find(x => x.label === it.label) || {};
+      return g.cls || '';
+    };
+    log('COLOR_UP', clsOf('high_open').includes('up') && clsOf('low_open_red').includes('up'));
+    log('COLOR_DOWN', clsOf('low_open').includes('down') && clsOf('high_open_green').includes('down'));
+
+    // ---- 2) 徽标 = 交易日数；完整口径（区间 / 脚注）要能在悬停提示里读到 ----
+    const os = apiData.openstat;
+    // ⚠ `adj` 必须在这里就定义：下面 2b 段（一字板剔除）要用它数 bars。
+    //   之前把它声明在 §6 才写，2b 提前引用 ⇒ TDZ ReferenceError 被 catch 吞掉，
+    //   害得 2b 之后所有断言读到空值。
+    const adj = os.adjust || {};
+    const daysTxt = String(os.days);
+    const badgeEl = d.querySelector('#open-badge') || {};
+    const badgeTxt = (badgeEl.textContent || '').trim();
+    const badgeTip = badgeEl.title || '';
+    log('BADGE', badgeTxt, 'EXPECT', daysTxt);
+    const footEl = d.querySelector('#open-foot') || {};
+    log('NOTE_IN_TIP', (badgeTip + '|' + (footEl.title || '')).indexOf(os.note || '\u0000') >= 0);
+
+    // ---- 2b) 一字板不算跳空（2026-10-10）----
+    //   ① 逐根标记的条数 == 后端给的 yizi.n_up / n_dn（前端没自己另判一套）；
+    //   ② 脚注写着后端给的那句剔除说明（有剔除才写）；
+    //   ③ yizi.applied 必须是 true（否则说明面板缺列 ⇒ 页面得照实说，别装作排过）。
+    const yzi = os.yizi || {};
+    const yzUp = (adj.bars || []).filter(b => b.yz_up).length;
+    const yzDn = (adj.bars || []).filter(b => b.yz_dn).length;
+    log('YZ_N_MATCH', yzUp === Number(yzi.n_up || 0) && yzDn === Number(yzi.n_dn || 0),
+        'bars=' + yzUp + '/' + yzDn + ' api=' + (yzi.n_up || 0) + '/' + (yzi.n_dn || 0));
+    const footTxt = (footEl.textContent || '');
+    log('YZ_FOOT', yzi.text ? footTxt.indexOf(yzi.text) >= 0 : true,
+        'foot=' + footTxt + ' want=' + (yzi.text || '(空)'));
+    log('YZ_APPLIED', yzi.applied === true);
+
+    // ---- 3) 次数小字在（用户明确要保留「n / N 次」）----
+    //   分母口径：条件概率那两项 = 各自形态天数；另外两项 = 全部交易日数。
+    const nOf = k => String((items.find(x => x.key === k) || {}).count || '');
+    const subOf = lab => {
+      const g = got.find(x => x.label === lab) || {};
+      return g.sub || '';
+    };
+    log('SUB_SHOWN', got.every(g => /\/\s*\d+\s*次/.test(g.sub)));
+    log('DENOM_ALL_HIGH', subOf('高开3%').includes(nOf('high_open')) && subOf('高开3%').includes(daysTxt));
+    log('DENOM_ALL_LOW', subOf('低开3%').includes(nOf('low_open')) && subOf('低开3%').includes(daysTxt));
+    log('DENOM_COND_RED', subOf('低开红柱').includes(nOf('low_open')));
+    log('DENOM_COND_GREEN', subOf('高开绿柱').includes(nOf('high_open')));
+
+    // ---- 4) AI 卡：这只票**没分析过**时整张卡不摆出来（不占位） ----
+    const aiCard = d.querySelector('#st-card-ai');
+    let aiRows = [];
+    try {
+      const rr = await fetch('/api/ai/analysis?limit=20&ts_code=' + encodeURIComponent(CODE),
+                             {cache:'no-store'});
+      aiRows = (await rr.json()).data || [];
+    } catch (e) { aiRows = []; }
+    const aiShown = !!(aiCard && w.getComputedStyle(aiCard).display !== 'none');
+    log('AI_HIST_N', aiRows.length, 'SHOWN', aiShown,
+        'EXPECT_SHOWN', aiRows.length > 0);
+
+    // ---- 5) 换另一只票再验一次（换票跟着换）----
+    //   主票默认是 300750.SZ（跳空多，标记验证更硬），这里换 600519.SH。
+    const OTHER = CODE === '600519.SH' ? '300750.SZ' : '600519.SH';
+    const f2 = await makeIframe('/stock/' + OTHER);
+    const d2 = f2.contentDocument;
+    await new Promise(r => setTimeout(r, 400));
+    const v2 = (d2.querySelector('#st-head-open .open-cell .open-val')||{}).textContent || '';
+    const r2 = await fetch('/api/stock/' + OTHER + '/detail?bars=260',{cache:'no-store'});
+    const a2 = (await r2.json()).data.openstat;
+    log('SWITCH_OK', v2.trim() === (a2.items[0]||{}).text,
+        'got=' + v2.trim(), 'want=' + (a2.items[0]||{}).text);
+
+    // ---- 6) 幅度可调 + 即时重算（2026-10-09 需求）----
+    //   改阈值 = 前端拿后端下发的原料重算，**不发请求**。
+    const dbg = w.__stDebug || {};
+    // （`adj` 已在上面 §2 前定义，这里不再重复声明）
+    const inp = d.querySelector('#st-open-pct');
+    log('THR_INPUT_EXISTS', !!inp,
+        (inp ? (inp.min + '/' + inp.max + '/' + inp.step) : '-'),
+        'EXPECT', adj.min + '/' + adj.max + '/' + (adj.step || 0.1));
+    log('THR_INPUT_VAL', inp ? String(inp.value) : '', 'EXPECT', String(os.threshold));
+    log('ADJ_RANGE_OK', inp
+        && Math.abs(Number(inp.min) - adj.min) < 1e-9
+        && Math.abs(Number(inp.max) - adj.max) < 1e-9);
+    log('ADJ_BARS_N', (adj.bars || []).length, 'EXPECT', os.days);
+
+    // 前端即时重算 vs 后端权威重算（recalc_from_bars）：逐阈值对拍
+    //   —— 后端重算用 /detail 的返回 + 前端算的数，两边判据必须一致。
+    //   这里再独立数一遍（**不 import 后端**）：按 eps 判据数 bars。
+    const eps = adj.eps;
+    const recount = (bars, thr) => {
+      let d = 0, nh = 0, nl = 0, nhg = 0, nlr = 0;
+      (bars||[]).forEach(b => {
+        d++;
+        // ⚠ 一字板不算跳空（与后端同一处口径）：一字涨停从高开剔、一字跌停从低开剔。
+        //   这里**不重判 high==low**，只认后端给的 yz_up / yz_dn 标记。
+        const hi = !b.yz_up && b.gap !== null && b.gap !== undefined && (b.gap >= thr - eps);
+        const lo = !b.yz_dn && b.gap !== null && b.gap !== undefined && (b.gap <= -thr + eps);
+        if (hi) { nh++; if (b.yin) nhg++; }
+        if (lo) { nl++; if (b.yang) nlr++; }
+      });
+      return {days:d, n_high:nh, n_low:nl, n_high_green:nhg, n_low_red:nlr};
+    };
+    const THRS = [1, 2.5, 3, 5, 8, 0.5];
+    let allOk = true, detail = [];
+    for (const t of THRS) {
+      const uid = {days: os.days};   // 用同一份 bars 数
+      const front = dbg.calcOpen ? dbg.calcOpen(t) : null;
+      const want = recount(adj.bars, t);
+      // 用后端重算接口对拍会更硬，但这里没这个接口；用独立 JS 数一遍当权威，
+      // 再比前端算的（前端 calcOpen 内部用的就是 bars + eps，应逐字相等）。
+      const same = front && ['days','n_high','n_low','n_high_green','n_low_red']
+        .every(k => Number(front[k]) === Number(want[k]));
+      if (!same) allOk = false;
+      detail.push(t + ':' + (same ? 'ok' : JSON.stringify(front) + '!=' + JSON.stringify(want)));
+    }
+    log('RECALC_MATCH', allOk, detail.join(' '));
+
+    // 阈值默认那一档，重算结果必须与后端给的 items 完全一致（首屏不漂）
+    const f0 = dbg.calcOpen ? dbg.calcOpen(os.threshold) : null;
+    log('RECALC_AT_DEFAULT', f0
+        && Number(f0.n_high) === Number(items[0].count)
+        && Number(f0.n_low) === Number(items[1].count)
+        && Number(f0.n_low_red) === Number(items[2].count)
+        && Number(f0.n_high_green) === Number(items[3].count),
+        f0 ? JSON.stringify(f0) : 'no calc');
+
+    // 改阈值（走用户入口 applyOpenThr）→ 四格与标记跟着变，且标签/脚注的百分比也换。
+    // ⚠ 用一个**必然有标记**的阈值（0.5%）：8% 这种高阈值在很多票上恒为 0 次，
+    //   那种情况下「标记条数 == 0 == 重算次数」是**空验**，证不了标记逻辑对不对。
+    if (dbg.setOpenThr) {
+      dbg.setOpenThr(0.5, true);
+      await new Promise(r => setTimeout(r, 250));
+      const c8 = [...card.querySelectorAll('.open-cell')].map(c => ({
+        lab: c.querySelector('.open-lab').textContent.trim(),
+        val: c.querySelector('.open-val').textContent.trim(),
+      }));
+      const w05 = recount(adj.bars, 0.5);
+      log('AFTER_SET_LABEL', c8[0] && c8[0].lab, 'EXPECT 高开0.5%');
+      log('AFTER_SET_VAL', c8[0] && c8[0].val,
+          'EXPECT', (w05.n_high / w05.days * 100).toFixed(1) + '%');
+      log('AFTER_SET_INPUT', String(inp.value), 'EXPECT 0.5');
+      // 图上标记：高开/低开 series 的条数 == 重算出来的次数
+      const om = dbg.openMarks ? dbg.openMarks() : null;
+      log('AFTER_SET_MARKS', !!(om && om.hi.length === w05.n_high && om.lo.length === w05.n_low),
+          om ? ('hi=' + om.hi.length + ' exp=' + w05.n_high + ' lo=' + om.lo.length + ' exp=' + w05.n_low) : 'no marks');
+      log('AFTER_SET_MARKS_NONZERO', !!(om && (om.hi.length + om.lo.length) > 0));
+      // 快捷按钮选中态：0.5 不是 1/3/5 任一 ⇒ 都不该亮
+      const onBtns = [...d.querySelectorAll('#st-open-seg button.on')].map(b => b.textContent.trim());
+      log('SEG_NONE_ON_AT_0_5', onBtns.length === 0, 'on=' + JSON.stringify(onBtns));
+      // 点「3%」快捷按钮 → 回到默认档
+      const b3 = [...d.querySelectorAll('#st-open-seg button')].find(b => b.dataset.t === '3');
+      if (b3) { b3.click(); await new Promise(r => setTimeout(r, 250)); }
+      log('SEG_3_RESTORE', String(inp.value) === '3'
+          && Number(dbg.calcOpen(3).n_high) === Number(f0.n_high), 'val=' + inp.value);
+      // 越界输入 → change 时夹回边界
+      inp.value = '999';
+      inp.dispatchEvent(new w.Event('change', {bubbles:true}));
+      await new Promise(r => setTimeout(r, 200));
+      log('THR_CLAMP_MAX', String(inp.value),
+          'EXPECT', String(adj.max));
+      // 恢复默认，免得影响后续（探针只读，不改库）
+      dbg.setOpenThr(os.threshold, true);
+    }
+
+    // ---- 7) 图上标记：高开=红、低开=绿，且落在开盘价上 ----
+    const opt = dbg.option ? dbg.option() : null;
+    if (opt) {
+      const hiS = (opt.series||[]).find(s => /^高开/.test(s.name));
+      const loS = (opt.series||[]).find(s => /^低开/.test(s.name));
+      log('MARK_SERIES_PRESENT', !!hiS || !!loS, 'hi=' + !!hiS + ' lo=' + !!loS);
+      if (hiS) log('MARK_HI_COLOR_UP', (hiS.itemStyle||{}).color === '#e5352b', (hiS.itemStyle||{}).color);
+      if (loS) log('MARK_LO_COLOR_DOWN', (loS.itemStyle||{}).color === '#12a06a', (loS.itemStyle||{}).color);
+      // 标记点落在开盘价上：取第一点，比对该 idx 那一根的开盘价
+      const rr = dbg.rows ? dbg.rows() : [];
+      let posOk = true, checked = 0;
+      [hiS, loS].forEach(s => {
+        if (!s || !(s.data||[]).length) return;
+        const [ix, y] = s.data[0];
+        if (rr[ix] && Math.abs(Number(y) - Number(rr[ix].open)) > 1e-6) posOk = false;
+        checked++;
+      });
+      log('MARK_ON_OPEN_PRICE', posOk && checked > 0, 'checked=' + checked);
+      // 标记的 idx 必须能对回 rows（有效交易日跳过停牌那几根也不能错位）
+      let idxOk = true;
+      [hiS, loS].forEach(s => (s && s.data || []).forEach(pt => {
+        if (!rr[pt[0]]) idxOk = false;
+      }));
+      log('MARK_IDX_VALID', idxOk);
+      // 一字板那几根**不许**出现在标记里（与四格同一份判据）
+      const yzIdx = new Set((adj.bars || []).filter(b => b.yz_up || b.yz_dn).map(b => b.idx));
+      let yzHit = 0;
+      [hiS, loS].forEach(s => (s && s.data || []).forEach(pt => {
+        if (yzIdx.has(pt[0])) yzHit++;
+      }));
+      log('MARK_NO_ONE_WORD', yzHit === 0,
+          'yzIdx=' + yzIdx.size + ' hit=' + yzHit);
+    }
+
+    log('DONE');
+  } catch (e) {
+    log('ERROR', e && (e.stack || e.message || e));
+    log('DONE');
+  }
+})();
+</script>
+</body>
+</html>

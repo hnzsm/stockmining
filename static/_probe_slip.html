@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>滑点口径探针</title>
+<style>
+  body{margin:0;background:#0d1117;color:#e6ebf4;font:13px/1.6 Consolas,monospace}
+  #out{white-space:pre-wrap;padding:12px;margin:0}
+  iframe{position:fixed;left:-99999px;top:0;width:1440px;height:1100px;border:0}
+</style>
+</head>
+<body>
+<pre id="out">未运行 —— 本页是自检探针，加 ?run=1 才开始（它会建两条临时买卖策略、改一条、最后都删掉）。</pre>
+<script>
+/* ============================================================================
+   滑点口径探针：买卖策略编辑页 ⇄ 回测页 的那条「跟随策略」连线
+   ----------------------------------------------------------------------------
+   为什么需要它：这条连线**坏了也看不出来** ——
+     · 回测页那个滑点框在策略自带滑点时应该置灰并显示策略的值，否则用户改了框里
+       的数字、跑出来却没变（值被策略压过），是个纯隐形的坑；
+     · 界面填的是**百分数**（0.2），库里存的是**小数**（0.002），换算错一位就是
+       10 倍差异，页面上完全看不出来；
+     · 上下限来自 /api/config，页面写死就等着哪天范围改了忘同步。
+   这些「读 DOM 才验得出来」的东西，静态读模板是读不出来的。
+
+   做法（沿用本项目探针的既有套路）：
+     · 建两条临时买卖策略：A 自带滑点 0.002、B 不设滑点（**不依赖库里已有策略**，
+       用户随便改自己的策略也不影响本探针）；
+     · /strategies 塞进同源 iframe（src 必须用 JS 设，否则 load 监听挂不上）：
+       选中 A → 输入框应显示 0.2（百分数）、上下限应等于 /api/config 给的 0~3；
+       改成 0.25 点保存 → 库里应存 0.0025；
+     · /backtest 塞进另一个 iframe：选中 A → 滑点框应**置灰**且显示 0.25、标签写
+       「跟随买卖策略」；选中 B → 应可编辑且回落到默认值 0.1（%）。
+   结果 JSON 写进 <pre id="out">，由 tools/verify_slippage.py 解析。
+   ============================================================================ */
+(function () {
+  var params = new URLSearchParams(location.search);
+  var out = document.getElementById('out');
+  if (params.get('run') !== '1') return;      // 门禁：防用户误打开（它会写库）
+
+  var CHECKS = [];
+  function ok(name, cond, extra) {
+    CHECKS.push({ name: name, ok: !!cond, extra: extra == null ? '' : String(extra) });
+    out.textContent = JSON.stringify({ done: false, checks: CHECKS }, null, 1);
+  }
+  function done(err) {
+    out.textContent = JSON.stringify({ done: true, error: err || '', checks: CHECKS }, null, 1);
+  }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function waitFor(fn, limitMs, stepMs) {
+    return new Promise(function (resolve, reject) {
+      var t0 = Date.now();
+      (function tick() {
+        var v;
+        try { v = fn(); } catch (e) { v = null; }
+        if (v) return resolve(v);
+        if (Date.now() - t0 > limitMs) return reject(new Error('等待超时'));
+        setTimeout(tick, stepMs || 200);
+      })();
+    });
+  }
+  function loadPage(url) {
+    return new Promise(function (resolve) {
+      var f = document.createElement('iframe');
+      f.width = 1440; f.height = 1100;
+      f.addEventListener('load', function () { resolve(f); });   // 先挂监听再赋 src
+      f.src = url;
+      document.body.appendChild(f);
+    });
+  }
+  async function api(method, path, body) {
+    var res = await fetch(path, {
+      method: method,
+      headers: body ? { 'Content-Type': 'application/json' } : {},
+      body: body ? JSON.stringify(body) : undefined
+    });
+    return await res.json();
+  }
+
+  var NAME_A = '__probe_slip_on__', NAME_B = '__probe_slip_off__';
+  var A = null, B = null;
+
+  async function cleanup() {
+    var list = ((await api('GET', '/api/strategies')).data) || [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].name === NAME_A || list[i].name === NAME_B) {
+        await api('DELETE', '/api/strategies/' + list[i].id);
+      }
+    }
+  }
+
+  (async function () {
+    try {
+      await cleanup();          // 上一次跑挂了留下的，先清掉
+
+      // ---------- 1. 临时策略 ----------
+      var ra = await api('POST', '/api/strategies', {
+        name: NAME_A, note: '滑点探针 · 用完即删',
+        config: { buy_trigger: ['open > ref(close, 1)'], sell_signal: ['close < ma5'],
+                  exec: { slippage: 0.002 } }
+      });
+      A = (ra.data || {}).id;
+      var rb = await api('POST', '/api/strategies', {
+        name: NAME_B, note: '滑点探针 · 用完即删',
+        config: { buy_trigger: ['open > ref(close, 1)'], sell_signal: ['close < ma5'] }
+      });
+      B = (rb.data || {}).id;
+      ok('两条临时买卖策略已建（A 带滑点 / B 不带）', !!A && !!B, 'A=' + A + ' B=' + B);
+
+      // ---------- 2. /strategies：界面按百分数、范围由后端给 ----------
+      var f1 = await loadPage('/strategies');
+      var W = f1.contentWindow, D = f1.contentDocument;
+      var slipEl = await waitFor(function () {
+        var e = D.querySelector('#ed-slip');
+        return (e && D.querySelector('.strat-item')) ? e : null;
+      }, 25000);
+      ok('买卖策略编辑器有滑点输入框（#ed-slip）', !!slipEl);
+      ok('滑点上下限来自 /api/config（页面不写死）',
+         String(slipEl.getAttribute('min')) === '0' && String(slipEl.getAttribute('max')) === '3',
+         'min=' + slipEl.getAttribute('min') + ' max=' + slipEl.getAttribute('max'));
+      ok('单位换算只有一处 window.SLIP',
+         !!(W.SLIP && W.SLIP.fromCfg && W.SLIP.toCfg), typeof W.SLIP);
+      ok('SLIP：小数 → 界面 %（0.002 → 0.2）', W.SLIP.fromCfg(0.002) === 0.2,
+         String(W.SLIP.fromCfg(0.002)));
+      ok('SLIP：界面 % → 小数（0.25 → 0.0025）', W.SLIP.toCfg('0.25') === 0.0025,
+         String(W.SLIP.toCfg('0.25')));
+      ok('SLIP：留空 → null（= 跟随回测参数）', W.SLIP.toCfg('') === null,
+         String(W.SLIP.toCfg('')));
+
+      var itemA = await waitFor(function () { return D.querySelector('.strat-item[data-id="' + A + '"]'); }, 10000);
+      itemA.click();
+      await waitFor(function () { return D.querySelector('#ed-slip').value !== ''; }, 8000);
+      ok('选中带滑点的策略 → 输入框按 % 显示（0.002 → 0.2）',
+         D.querySelector('#ed-slip').value === '0.2', D.querySelector('#ed-slip').value);
+      ok('列表项写明滑点（一眼看出策略自带多少）',
+         itemA.textContent.indexOf('滑点 0.2%') >= 0, itemA.textContent.trim().replace(/\s+/g, ' '));
+
+      // 界面上改成 0.25% → 保存 → 库里应是 0.0025
+      D.querySelector('#ed-slip').value = '0.25';
+      D.querySelector('#btn-save').click();
+      var saved = null;
+      for (var i = 0; i < 30; i++) {
+        await sleep(400);
+        var list = ((await api('GET', '/api/strategies')).data) || [];
+        for (var j = 0; j < list.length; j++) {
+          if (list[j].id === A &&
+              ((list[j].config || {}).exec || {}).slippage === 0.0025) { saved = list[j]; }
+        }
+        if (saved) break;
+      }
+      ok('界面上填 0.25 → 库里存 0.0025（换算落到了存储口径）', !!saved,
+         saved ? JSON.stringify((saved.config.exec || {})) : '30 次轮询没等到');
+
+      // ---------- 3. /backtest：滑点框跟随策略 ----------
+      var f2 = await loadPage('/backtest');
+      var W2 = f2.contentWindow, D2 = f2.contentDocument;
+      var sel = await waitFor(function () {
+        var e = D2.querySelector('#bt-strategy');
+        return (e && e.options.length > 1) ? e : null;
+      }, 25000);
+      await sleep(600);                       // 等页面自己先 sync 一次
+      var input = D2.querySelector('#bt-slip');
+
+      sel.value = String(A);
+      sel.dispatchEvent(new W2.Event('change', { bubbles: true }));
+      await sleep(400);
+      ok('回测页：策略自带滑点 → 输入框置灰（免得改了不生效）',
+         input.disabled === true, 'disabled=' + input.disabled + ' value=' + input.value);
+      ok('回测页：置灰时显示的就是策略的值（0.0025 → 0.25）', input.value === '0.25', input.value);
+      ok('回测页：标签写明「跟随买卖策略」',
+         (D2.querySelector('#bt-slip-hint') || {}).textContent === '跟随买卖策略',
+         (D2.querySelector('#bt-slip-hint') || {}).textContent);
+
+      sel.value = String(B);
+      sel.dispatchEvent(new W2.Event('change', { bubbles: true }));
+      await sleep(400);
+      ok('回测页：策略没设滑点 → 输入框可编辑', input.disabled === false,
+         'disabled=' + input.disabled);
+      ok('回测页：策略没设时回落到默认值 0.1%',
+         input.value === '0.1', 'value=' + input.value + '（默认 0.001 = 0.1%）');
+      ok('回测页：标签不再说「跟随买卖策略」',
+         (D2.querySelector('#bt-slip-hint') || {}).textContent !== '跟随买卖策略',
+         (D2.querySelector('#bt-slip-hint') || {}).textContent);
+
+      // ---------- 4. 清理 ----------
+      await api('DELETE', '/api/strategies/' + A);
+      await api('DELETE', '/api/strategies/' + B);
+      var left = ((await api('GET', '/api/strategies')).data) || [];
+      var remain = left.filter(function (x) { return x.name === NAME_A || x.name === NAME_B; });
+      ok('临时策略已删干净', remain.length === 0, '剩 ' + remain.length + ' 条');
+      done('');
+    } catch (e) {
+      try { await cleanup(); } catch (e2) { /* 清理失败不掩盖原始错误 */ }
+      ok('探针执行未中断', false, String((e && e.message) || e));
+      done(String((e && e.message) || e));
+    }
+  })();
+})();
+</script>
+</body>
+</html>

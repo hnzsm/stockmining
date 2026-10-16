@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>probe hot</title>
+<style>html,body{margin:0;background:#111;color:#ddd;font:12px/1.6 monospace}
+#fr{width:1560px;height:2400px;border:0;position:absolute;left:-9999px;top:0}
+#out{white-space:pre-wrap;padding:8px}</style>
+</head><body>
+<pre id="out">waiting</pre>
+<iframe id="fr"></iframe>
+<script>
+/* 总览页「热股榜」探针：验证**每一行都点得开 K线预览**。
+   2026-10-11 改：这一行原来是链到个股诊断页的 `<a href="/stock/<代码>" target="_blank">`，
+   现在整行自己就是预览入口（弹窗里仍留「在诊断页打开」）—— 所以这里既验「不再跳转」，
+   又验「真点下去确实弹出预览、iframe 里的 src 就是那只票、且带 sel_only=1」。
+   ⚠ 探针纪律（见 CONVENTIONS C17）：iframe.src 必须用 JS 赋值；
+     contentDocument 每次现取；别对帧内元素调 scrollIntoView。 */
+const out = document.getElementById('out');
+const fr  = document.getElementById('fr');
+const L = [];
+const say = (ok, name, extra) => L.push((ok ? 'OK   ' : 'FAIL ') + name + (extra ? '  ' + extra : ''));
+const note = s => L.push('NOTE ' + s);
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function waitFor(fn, ms, step) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    let v = null;
+    try { v = fn(); } catch (e) { v = null; }
+    if (v) return v;
+    await sleep(step || 300);
+  }
+  return null;
+}
+
+fr.src = 'http://127.0.0.1:8777/';
+
+(async () => {
+  try {
+    const grid = await waitFor(() => {
+      const d = fr.contentDocument;
+      const g = d && d.getElementById('hot-grid');
+      return (g && g.querySelectorAll('.card').length >= 1
+              && g.querySelector('.hot-row:not(.empty)')) ? g : null;
+    }, 30000, 400);
+    if (!grid) { say(false, '总览页 热股榜渲染出来（#hot-grid 里有行）'); return finish(); }
+    say(true, '总览页 热股榜渲染出来（#hot-grid 里有行）');
+
+    const cards = grid.querySelectorAll('.card');
+    say(cards.length === 3, '恰好 3 张卡', 'cards=' + cards.length);
+
+    const rows = [...grid.querySelectorAll('.hot-row')];
+    say(rows.length > 0, '有可展示的热股行', 'rows=' + rows.length);
+    if (!rows.length) return finish();
+
+    // 1) 整行可点 = 带 data-k（ts_code）的 div；不再有任何指向诊断页的链接
+    const clickable = rows.filter(r => r.dataset.k);
+    say(clickable.length === rows.length, '每一行都可点（带 data-k，不是纯展示行）',
+        'clickable=' + clickable.length + ' rows=' + rows.length);
+    const aRows = [...grid.querySelectorAll('a.hot-row')];
+    say(aRows.length === 0, '不再有整行跳转的链接（点击走 K线预览弹窗，不是开新标签）',
+        'a.hot-row=' + aRows.length);
+    const badRole = clickable.filter(r => r.getAttribute('role') !== 'button');
+    say(badRole.length === 0, '可点的行声明了 role=button（可访问性）', 'bad=' + badRole.length);
+    const badTab = clickable.filter(r => r.getAttribute('tabindex') !== '0');
+    say(badTab.length === 0, '可点的行能 Tab 到（tabindex=0，原来是 <a> 天然可聚焦）',
+        'bad=' + badTab.length);
+
+    // 2) data-k 的形态与内容
+    const RE = /^\d{6}\.(SH|SZ|BJ)$/;
+    const badCode = clickable.filter(r => !RE.test(r.dataset.k)).map(r => r.dataset.k);
+    say(badCode.length === 0, 'data-k 一律是 6 位代码.市场后缀（与库内口径一致）',
+        badCode.slice(0, 3).join(' | '));
+
+    // data-k 里的代码必须 == 行内显示的那 6 位代码（点错票比不点更糟）
+    const mism = clickable.filter(r => {
+      const cd = r.querySelector('.cd');
+      return !cd || r.dataset.k.slice(0, 6) !== cd.textContent.trim();
+    });
+    say(mism.length === 0, 'data-k 的代码 == 行内显示的代码（不会张冠李戴）',
+        mism.slice(0, 3).map(r => r.dataset.k).join(' | '));
+
+    // 同一个源内部不许有重复（跨源重复是正常的：同一天同一只票可能上三个榜）
+    const dupIn = [];
+    cards.forEach((c, i) => {
+      const hs = [...c.querySelectorAll('.hot-row[data-k]')].map(r => r.dataset.k);
+      if (new Set(hs).size !== hs.length) dupIn.push('card' + i);
+    });
+    say(dupIn.length === 0, '每张卡内部没有重复的票', dupIn.join(','));
+
+    // 标题行 / 副标题仍由接口给（页面不写死源名）
+    const titles = [...cards].map(c => (c.querySelector('.card-title') || {}).textContent || '');
+    say(titles.every(t => t.trim().length > 0), '每张卡标题非空（来自 /api/hot 的 title）',
+        titles.map(t => t.trim().split(/\s+/)[0]).join(' / '));
+
+    // 可点行的样式：手型光标（原来是 <a> 天然手型，换成 div 后必须自己给）
+    const st = fr.contentWindow.getComputedStyle(clickable[0]);
+    say(st.cursor === 'pointer', '可点行是手型光标', st.cursor);
+
+    // 3) 真点第一行 → 弹出 K线预览，iframe 里就是这只票
+    const first = clickable[0];
+    const code0 = first.dataset.k;
+    first.click();
+    const frame = await waitFor(() => {
+      const d = fr.contentDocument;
+      return (d && d.querySelector('iframe.kl-frame')) || null;
+    }, 20000, 400);
+    if (!frame) {
+      say(false, '点热股榜的行会弹出 K线预览（找到弹窗里的 iframe）', 'code=' + code0);
+      return finish();
+    }
+    say(true, '点热股榜的行会弹出 K线预览（不是跳转诊断页）', 'code=' + code0);
+    const src = decodeURIComponent(frame.getAttribute('src') || '');
+    say(src.indexOf('/stock/' + code0) >= 0, '预览打开的就是点的那只票', code0 + ' → ' + src);
+    say(/[?&]sel_only=1/.test(src), '预览带 sel_only=1（这张卡没绑策略，不摆「收益」卡）', src);
+    say(/[?&]embed=1/.test(src), '预览是 embed 模式（弹窗内嵌，不是新开整页）', src);
+    say(!/[?&]trade_date=/.test(src), '没有乱锚某个历史日（热股榜与哪天无关，跟最新交易日）', src);
+    const title = ((fr.contentDocument.querySelector('.modal-head h3') || {}).textContent) || '';
+    say(/K线预览/.test(title), '弹窗标题写明是 K线预览', title);
+
+    // 诊断页入口没丢：弹窗里那个「在诊断页打开」要带同一份参数
+    const full = fr.contentDocument.querySelector('[data-open-full]');
+    say(!!full && /[?&]sel_only=1/.test(full.getAttribute('href') || ''),
+        '弹窗里保留「在诊断页打开」，且带同一份参数',
+        full ? full.getAttribute('href') : '（没找到链接）');
+
+    // 4) 同一张卡的 10 行一起传了 list → 有「下一个」翻页
+    const next = fr.contentDocument.querySelector('[data-next]');
+    say(!!next, '同一张卡里能翻「下一个」（整张榜一起传进弹窗）');
+    const sib = clickable.filter(r => r.parentNode === first.parentNode);
+    if (next && !next.disabled && sib.length > 1) {
+      next.click();
+      await sleep(1200);
+      const src2 = decodeURIComponent(
+        (fr.contentDocument.querySelector('iframe.kl-frame') || {}).getAttribute
+          ? fr.contentDocument.querySelector('iframe.kl-frame').getAttribute('src') : '');
+      say(src2.indexOf('/stock/' + sib[1].dataset.k) >= 0,
+          '「下一个」翻到的是同一张卡的第二只票（行序 = 屏幕顺序）',
+          sib[1].dataset.k + ' → ' + src2);
+    } else {
+      note('这张卡只有一行，翻页跳过');
+    }
+
+    // 5) 键盘可达：Tab 到某行按回车也开预览（换成 div 后这条得自己实现）
+    const second = sib[1] || null;
+    if (second && fr.contentWindow.KeyboardEvent) {
+      const ev = new fr.contentWindow.KeyboardEvent('keydown', {
+        key: 'Enter', bubbles: true, cancelable: true });
+      second.dispatchEvent(ev);
+      await sleep(1200);
+      const src3 = decodeURIComponent(
+        (fr.contentDocument.querySelector('iframe.kl-frame') || {}).getAttribute
+          ? fr.contentDocument.querySelector('iframe.kl-frame').getAttribute('src') : '');
+      say(src3.indexOf('/stock/' + second.dataset.k) >= 0,
+          '按回车也能开预览（键盘可达，不只剩鼠标）',
+          second.dataset.k + ' → ' + src3);
+    } else {
+      note('这张卡没有第二行，回车验证跳过');
+    }
+  } catch (e) {
+    say(false, '探针自己炸了', e && e.message);
+  }
+  finish();
+
+  function finish() { out.textContent = L.join('\n'); }
+})();
+</script>
+</body></html>

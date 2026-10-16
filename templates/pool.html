@@ -1,0 +1,605 @@
+{% extends "base.html" %}
+{% block title %}选股策略管理 · 短线选股{% endblock %}
+{% block pagetitle %}选股策略管理{% endblock %}
+{% block pagedesc %}保存各种「条件股票池」· 回测与选股的股票池下拉框直接引用这里的内容{% endblock %}
+
+{% block content %}
+<div class="hintbox" style="margin-bottom:14px">
+  <b>选股策略</b>回答的是「哪些股票有资格进入候选范围」：基础池 + 入池条件 + 静态过滤项。
+  它和「<a href="/strategies">买卖策略</a>」是两回事：买卖策略管<b>什么时候买、什么时候卖</b>，
+  选股策略只管<b>在哪些股票里挑</b>。改一条选股策略，所有引用它的回测/选股口径会一起变。<br>
+  <span class="small muted">条件里可以直接写周线字段（<code>w_</code> 前缀，如 <code>w_close &gt; w_boll_mid</code>）——
+  「日线选股 + 周线过滤」在这里一条条件就能表达。</span><br>
+  <span class="small muted"><b>周期</b>：选 <b>日K</b> 就是老行为（条件在日线上逐日求值）；
+  选 <b>周K</b> 则这条策略<b>整条链按周线跑</b>（条件里的 <code>close</code> 就是<b>周收盘</b>、
+  <code>ma5</code> 就是 <b>5 周均线</b>），引用它的选股 / 回测 / 提醒一并按周线算。
+  周K 策略的名字后面带「（周K）」，日K 不标。</span>
+</div>
+
+<div class="grid" style="grid-template-columns:300px minmax(0,1fr);align-items:start">
+  <div class="card" style="margin-bottom:0">
+    <div class="card-head">
+      <div class="card-title">选股策略</div>
+      <button class="btn sm primary" id="btn-new">新建</button>
+    </div>
+    <div class="card-body tight">
+      <div id="pool-list"><div class="empty">加载中…</div></div>
+      <div class="hr"></div>
+      <button class="btn sm" id="btn-builtins" style="width:100%">补齐预设与内置样例</button>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:0">
+    <div class="card-head">
+      <div class="card-title" id="ed-title">策略编辑</div>
+      <div class="flex">
+        <span class="pill" id="ed-status">未保存</span>
+        <button class="btn sm" id="btn-validate">校验</button>
+        <button class="btn sm" id="btn-save-as">另存为</button>
+        <button class="btn sm primary" id="btn-save">保存</button>
+      </div>
+    </div>
+    <div class="card-body">
+      <div id="ed-errs"></div>
+
+      <div class="row">
+        <div class="field" style="flex:2"><label class="lb">策略名称</label>
+          <input type="text" id="ed-name" placeholder="例如：小市值活跃股"></div>
+        <div class="field" style="flex:1;min-width:120px"><label class="lb">周期</label>
+          <select id="ed-freq"></select></div>
+        <div class="field" style="flex:1;min-width:170px"><label class="lb">基础池</label>
+          <select id="ed-base"></select></div>
+      </div>
+      <div class="small muted" id="ed-freq-hint" style="margin:-6px 0 10px"></div>
+      <div class="field"><label class="lb">说明 <span class="hint">写清楚筛的是什么，便于回溯</span></label>
+        <textarea id="ed-note" style="min-height:44px"></textarea></div>
+
+      <div class="field">
+        <label class="lb">入池条件 <span class="hint">每行一条，<b>全部</b>成立才算入池；
+          在信号日 T 的 K 线上求值，<code>ref()</code> 可向前看历史；输入字段名会自动提示（含 <code>w_</code> 周线字段）；
+          <code>#</code> 起注释（行尾或整行），<b>不算条件</b></span></label>
+        <textarea id="ed-conds" class="mono" rows="4" spellcheck="false"
+          placeholder="total_mv &lt; 500000  # 小市值（单位万元）&#10;turnover_rate &gt; 5&#10;# 下面这条是周线确认&#10;w_close &gt; w_boll_mid"></textarea>
+        <div class="small muted" style="margin-top:4px">
+          例：<code>total_mv &lt; 500000</code> 小市值（单位万元，50 亿）·
+          <code>turnover_rate &gt; 5</code> 换手率 ·
+          <code>close &gt;= boll_upper</code> 站上布林上轨 ·
+          <code>ref(pct_chg, 1) &lt;= -5</code> 昨日跌超 5% ·
+          <code>w_close &gt; w_boll_mid</code> 周线在布林中轨之上 ·
+          <code>total_mv &gt; 300000&nbsp;&nbsp;# 市值大于 30 亿</code>（<code>#</code> 后是注释）
+        </div>
+      </div>
+
+      <div class="hr"></div>
+      <div class="field">
+        <label class="lb">静态过滤项
+          <span class="hint">与入池条件同时生效；这是「选股逻辑」的一部分，所以放在选股策略上</span></label>
+        <div class="flex wrap" style="gap:12px;margin:6px 0 10px">
+          <label class="chk"><input type="checkbox" id="ed-st"> 剔除 ST</label>
+          <label class="chk"><input type="checkbox" id="ed-kcb"> 剔除科创板</label>
+          <label class="chk"><input type="checkbox" id="ed-cyb"> 剔除创业板</label>
+          <label class="chk"><input type="checkbox" id="ed-bj"> 剔除北交所</label>
+        </div>
+        <div class="row">
+          <div class="field"><label class="lb small">最小日成交额（千元）<span class="hint">逐日生效，0 = 不限</span></label>
+            <input type="number" id="ed-minamt" step="1000" placeholder="0"></div>
+          <div class="field"><label class="lb small">最小上市天数<span class="hint">次新股规避</span></label>
+            <input type="number" id="ed-mindays" step="10" placeholder="60"></div>
+        </div>
+      </div>
+
+      <div class="hr"></div>
+      <div class="pool-actions">
+        <span class="lb" style="margin-right:2px">试跑</span>
+        <input type="date" id="ed-date">
+        <span class="small muted" title="结果表最多列多少只命中股（改大要重跑，全市场试跑约需数分钟）">样例</span>
+        <input type="number" id="ed-sample" value="50" min="10" max="2000" step="10" style="width:80px">
+        <span class="small muted" title="结果表按它降序（数值越大越靠前），如 turnover_rate；留空则按代码升序。它同时是表里「评分」列的值 —— 排序和评分本来就是同一个式子。只影响本次试跑，不写进策略。">排序表达式</span>
+        <input type="text" id="ed-sort" class="mono" style="width:150px" spellcheck="false"
+               placeholder="如 turnover_rate">
+        <button class="btn sm" id="btn-test">看当日命中</button>
+        <span class="small muted" id="test-hint"></span>
+      </div>
+      <div id="test-result"></div>
+
+      <div class="hr"></div>
+      <div class="flex between">
+        <button class="btn sm danger" id="btn-del">删除该策略</button>
+        <span class="small muted" id="ed-meta"></span>
+      </div>
+
+      <div class="hr"></div>
+      <div class="flex between" style="cursor:pointer" id="toggle-help">
+        <span class="card-title" style="font-size:12.5px">可用字段参考</span>
+        <span class="btn ghost sm" id="help-arrow">展开 ▾</span>
+      </div>
+      <div id="help-panel" style="display:none;margin-top:10px">
+        <div class="fieldhelp" id="help-fields"></div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const POOL_PREFIX = 'pool:';
+let pools = [], currentId = null, universes = [], dirty = false;
+/* 静态过滤项默认值：从 /api/config 的 filt_defaults 取（唯一来源 universe.DEFAULT_FILT），
+   页面里不抄一份默认 —— 否则改后端默认，前端「新建」出来的还是老一套。 */
+let FILT_DEF = { exclude_st: true, exclude_kcb: true, exclude_cyb: false,
+                 exclude_bj: true, min_amount: 0, min_list_days: 60 };
+let cfgDefaults = null;
+
+/* 周期（`pool_strategy.timeframe`）：选项与展示名的唯一来源是后端 `universe.FREQS`
+   （页面不写死「日K / 周K」）。周K = **整条链按周线跑**，判定只有一处
+   `strategy.selection_cfg()`；名字后缀「（周K）」由后端 `universe.name_tag()` 出。 */
+const FREQS = {{ freqs|tojson }};
+const FREQ_ORDER = {{ freq_order|tojson }};
+const DEF_FREQ = {{ default_freq|tojson }};
+/* 周期下拉下方的口径说明 —— 两档各写清代价，别让人以为「周K 只是把线换成周线」。 */
+const FREQ_HINT = {
+  daily: '条件在<b>日线</b>上逐日求值（<code>close</code> = 当日收盘）。引用它的选股 / 回测 / 提醒按日线算。',
+  weekly: '⚠ <b>整条链按周线跑</b>：条件里的 <code>close</code> 就是<b>周收盘</b>、'
+        + '<code>ma5</code> 就是 <b>5 周均线</b>，每根 K 都是<b>已收盘的完整周</b>'
+        + '（约一年 50 根）。引用它的选股 / 回测 / 提醒<b>一并按周线算</b>；'
+        + '周中跑不出结果，要等这周走完。条件里<b>不用</b>再写 <code>w_</code> 前缀 —— 那根本身就是周。'
+};
+function syncFreqHint() {
+  $('#ed-freq-hint').innerHTML = FREQ_HINT[$('#ed-freq').value || DEF_FREQ] || '';
+}
+
+function conds() {
+  return String($('#ed-conds').value || '').split('\n').map(x => x.trim()).filter(Boolean);
+}
+/* 真正要执行的入池条件条数 —— `#` 注释不算（口径 = 后端 expr.strip_comment）。
+   ⚠ 存库/回显走上面的 `conds()`（**保留注释原文**，那是用户写的批注），
+     这个只用来判「有没有条件」，别拿它去提交。 */
+function activeConds() {
+  return conds().filter(x => window.condText.active(x));
+}
+/** 读静态过滤项（4 个勾 + 2 个数字）。 */
+function readFilt() {
+  return {
+    exclude_st: $('#ed-st').checked,
+    exclude_kcb: $('#ed-kcb').checked,
+    exclude_cyb: $('#ed-cyb').checked,
+    exclude_bj: $('#ed-bj').checked,
+    min_amount: Number($('#ed-minamt').value || 0) || 0,
+    min_list_days: Number($('#ed-mindays').value || 0) || 0
+  };
+}
+/** 写静态过滤项；缺的键用默认值补（老记录没有 filt 列时就是这个情况）。 */
+function writeFilt(f) {
+  const d = FILT_DEF || {};
+  const v = Object.assign({}, d, f || {});
+  $('#ed-st').checked = v.exclude_st !== false;
+  $('#ed-kcb').checked = !!v.exclude_kcb;
+  $('#ed-cyb').checked = !!v.exclude_cyb;
+  $('#ed-bj').checked = v.exclude_bj !== false;
+  $('#ed-minamt').value = v.min_amount || '';
+  $('#ed-mindays').value = v.min_list_days === 0 ? 0 : (v.min_list_days ?? d.min_list_days ?? '');
+}
+/** 过滤项的一句话摘要（进列表项的 hover 提示）。 */
+function filtText(f) {
+  const v = Object.assign({}, FILT_DEF, f || {});
+  const on = [];
+  if (v.exclude_st) on.push('剔ST');
+  if (v.exclude_kcb) on.push('剔科创');
+  if (v.exclude_cyb) on.push('剔创业');
+  if (v.exclude_bj) on.push('剔北交');
+  if (v.min_amount) on.push('额≥' + v.min_amount + '千元');
+  if (v.min_list_days) on.push('上市≥' + v.min_list_days + '天');
+  return on.join(' · ');
+}
+/** 列表项的 hover 摘要（基础池 / 条件数 / 过滤），不进列表正文。 */
+function poolSummary(p) {
+  const a = (p.base_label || p.base) + ' · ' + p.cond_count + ' 条条件'
+    + ' · ' + (FREQS[p.timeframe] || FREQS.daily);
+  return a + ' · ' + (filtText(p.filt) || '无静态过滤');
+}
+function markDirty() {
+  dirty = true;
+  $('#ed-status').textContent = '未保存';
+  $('#ed-status').className = 'pill';
+  // 试跑跑的是「表单里当前的条件」，改动后那份结果就对不上了 —— 不删掉（信息还在），
+  // 但必须标一句，否则会照着过期列表点进 K线。
+  const tr = $('#test-result');
+  if (tr.innerHTML && !$('#test-stale')) {
+    tr.insertAdjacentHTML('afterbegin',
+      '<div class="small" id="test-stale" style="margin-bottom:6px;color:var(--warn)">' +
+      '条件已改动 —— 下面是改动前试跑的结果，重新「看当日命中」才会更新。</div>');
+  }
+}
+function markSaved(builtin) {
+  dirty = false;
+  $('#ed-status').textContent = builtin ? '内置策略' : '已保存';
+  $('#ed-status').className = 'pill' + (builtin ? '' : ' ok');
+}
+
+/* ---------- 表单 <-> 数据 ---------- */
+function readForm() {
+  return {
+    name: $('#ed-name').value.trim(),
+    note: $('#ed-note').value.trim(),
+    base: $('#ed-base').value || 'all',
+    // 周期：跟着下拉走（默认日K）。存进 `pool_strategy.timeframe`，引用它的一方按它算
+    timeframe: $('#ed-freq').value || DEF_FREQ,
+    conds: conds(),
+    filt: readFilt()
+  };
+}
+function writeForm(p) {
+  $('#ed-title').textContent = '策略编辑 · ' + (p.name || '新建');
+  $('#ed-name').value = p.name || '';
+  $('#ed-note').value = p.note || '';
+  $('#ed-base').value = p.base || 'all';
+  $('#ed-freq').value = p.timeframe || DEF_FREQ;
+  syncFreqHint();
+  $('#ed-conds').value = (p.conds || []).join('\n');
+  writeFilt(p.filt);
+  $('#btn-del').disabled = !!p.builtin;
+  $('#btn-del').textContent = p.builtin ? '内置策略不可删除' : '删除该策略';
+  $('#ed-meta').textContent = p.builtin
+    ? '内置策略：可直接用，或「另存为」后修改'
+    : (p.updated_at ? '更新于 ' + String(p.updated_at).slice(0, 19) : '');
+  $('#test-result').innerHTML = '';
+  markSaved(!!p.builtin);
+}
+
+/* ---------- 列表 ---------- */
+/** 清空右侧表单 →「新建」态。列表删除当前那条之后也用它（否则删完了编辑区还留着
+    一份已不存在的策略，点保存会当成改一条没 id 的记录）。 */
+function newForm() {
+  currentId = null;
+  writeForm({ name: '', base: 'all', conds: [],
+              timeframe: DEF_FREQ, filt: Object.assign({}, FILT_DEF) });
+  $('#ed-title').textContent = '策略编辑 · 新建';
+  $('#btn-del').disabled = true;
+  $('#btn-del').textContent = '删除该策略';
+  clearErrs();
+}
+
+function renderList() {
+  // 列表只留名称：基础池/条件数/过滤摘要挪进 hover 提示（选中后在右侧编辑区本来就看得到）
+  // 名称后面挂「删」（内置不给，与买卖策略列表同一套：`.strat-acts` + `data-del`）
+  $('#pool-list').innerHTML = pools.length ? pools.map(p => `
+    <div class="strat-item" style="cursor:pointer" data-id="${p.id}" title="${esc(poolSummary(p))}">
+      <div style="min-width:0">
+        <div class="nm">${esc(p.name_label || p.name)}${p.builtin ? ' <span class="tag">内置</span>' : ''}</div>
+      </div>
+      ${p.builtin ? '' : '<div class="strat-acts"><button class="btn sm danger" data-del="' + p.id
+        + '" title="删除这条选股策略（已完成的回测记录不受影响）">删</button></div>'}
+    </div>`).join('') : '<div class="empty">暂无选股策略</div>';
+  $$('#pool-list .strat-item').forEach(el => el.onclick = () => {
+    const p = pools.find(x => String(x.id) === el.dataset.id);
+    if (p) { currentId = p.id; writeForm(p); clearErrs(); }
+  });
+  // 「删」在列表项里 → 必须 stopPropagation，否则删之前还会先把它选中
+  $$('#pool-list [data-del]').forEach(b => b.onclick = guardClick(b, async (e) => {
+    e.stopPropagation();
+    const p = pools.find(x => String(x.id) === b.dataset.del);
+    if (!p) return;
+    if (!confirm('确定删除选股策略「' + p.name + '」？\n已完成的回测记录不受影响，但再按原条件跑时该策略已不存在。')) return;
+    try {
+      await apiDel('/api/pools/' + b.dataset.del);
+    } catch (err) {
+      toast(err.message || String(err), 'err', 5000);
+      return;
+    }
+    if (String(currentId) === b.dataset.del) newForm();
+    toast('已删除', 'ok');
+    await load();
+  }));
+}
+
+function clearErrs() { $('#ed-errs').innerHTML = ''; }
+function showErrs(list) {
+  $('#ed-errs').innerHTML = list && list.length ? `<div class="hintbox warn" style="margin-bottom:12px">
+    <b>校验未通过：</b><ul style="margin:6px 0 0 18px">${list.map(e => `<li>${esc(e)}</li>`).join('')}</ul></div>` : '';
+}
+
+async function load() {
+  /* 加载中 / 取失败都摆在这张卡里（原来失败是裸抛 → 静默停在「加载中…」）。 */
+  const box = $('#pool-list');
+  boxState(box, 'loading', '加载中…');
+  try { pools = await apiGet('/api/pools'); }
+  catch (e) { boxState(box, 'error', '选股策略列表没取到', e.message); return; }
+  renderList();
+  if (currentId) {
+    const p = pools.find(x => x.id === currentId);
+    if (p) { writeForm(p); return; }
+  }
+  if (pools.length) { currentId = pools[0].id; writeForm(pools[0]); }
+}
+
+/* ---------- 试跑 ---------- */
+/** 命中列表里每只票的 K线入口：新标签打开「个股诊断」整页（基本面 / 筹码 / 收益 / 明细）。 */
+function klineUrl(tsCode) {
+  return '/stock/' + encodeURIComponent(tsCode);
+}
+
+/* 试跑「当时」的条件快照 —— 结果列表是**那份**条件算出来的，弹窗预览必须挂同一份，
+   否则改了表单再去点旧列表，图上的命中点跟列表里的「入池」不是一回事（同一只票
+   会看着像没命中）。和列表本身的处理一致：改动后旧结果只标过期、不被新条件污染。 */
+let testSpec = null, testDate = '', testSamples = [];
+
+/* ---------- 试跑结果表：排序 ----------
+   两层排序，与「今日选股」同一条规矩：
+     · 服务端顺序 = 「排序表达式」降序（没填 → 代码升序）；
+     · 点表头 → **只在这批里**换个看法（重跑一次全市场要几分钟，为看一眼顺序不值当）。
+   交互复用买卖策略页「交易明细」那套 CSS（`.sortable` / `.sarrow` /
+   `.sort-asc|.sort-desc`）：点同列切升降、换列时文本列默认升序、数值列默认降序。
+   ⚠ 缺值（—）永远沉底，不随升降序翻上来 —— 否则一点升序，一屏「—」全冒到最前面。
+   ⚠ 「#」列可点 = **恢复服务端原顺序**（点过别的列之后总得有条回路）。 */
+const TEST_TEXT_COLS = { ts_code: 1, name: 1, industry: 1 };  // 按文本比，其余按数值比
+let testSort = { key: '', dir: -1 };                          // key='' = 服务端原顺序
+let testResult = null;
+
+/** 屏幕上真正要显示的那批（顺序 = 当前排序）。不改 samples，只重排引用。 */
+function testSortedItems() {
+  const its = (testResult && testResult.samples) || [];
+  if (!testSort.key) return its.slice();
+  const key = testSort.key, text = !!TEST_TEXT_COLS[key], dir = testSort.dir > 0 ? 1 : -1;
+  return its.map((it, i) => ({ it, i })).sort((a, b) => {
+    const va = a.it[key], vb = b.it[key];
+    const na = va === null || va === undefined || (typeof va === 'number' && isNaN(va));
+    const nb = vb === null || vb === undefined || (typeof vb === 'number' && isNaN(vb));
+    if (na || nb) return (na && nb) ? a.i - b.i : (na ? 1 : -1);   // 缺值沉底（不受方向影响）
+    const c = text ? String(va).localeCompare(String(vb), 'zh')
+                   : (Number(va) < Number(vb) ? -1 : (Number(va) > Number(vb) ? 1 : 0));
+    return c ? c * dir : a.i - b.i;                                // 同值保持原相对顺序
+  }).map(p => p.it);
+}
+
+/** 可排序表头。`key` 传 '' → 普通表头；传 '__orig' → 「#」= 回服务端原序（可点、不冒充排序）。 */
+function testTh(label, key, cls, title) {
+  if (!key) return `<th class="${cls || ''}">${esc(label)}</th>`;
+  const tip = title !== undefined ? title : '点击按「' + label + '」排序';
+  // 「#」是回原序的入口，不是一列可比大小的值 —— 不给 ▲/▼，免得看着像「按行号排」
+  if (key === '__orig') {
+    return `<th class="${(cls ? cls + ' ' : '') + 'sortable'}" data-sort="__orig"`
+      + ` title="${esc(tip)}">${esc(label)}</th>`;
+  }
+  const dc = (testSort.key === key) ? (testSort.dir > 0 ? ' sort-asc' : ' sort-desc') : '';
+  return `<th class="${(cls ? cls + ' ' : '') + 'sortable' + dc}" data-sort="${key}"`
+    + ` title="${esc(tip)}">${esc(label)}<span class="sarrow"></span></th>`;
+}
+
+function renderTest(d) {
+  testResult = d;
+  testSort = { key: '', dir: -1 };   // 新一次试跑 → 回到服务端（排序表达式）那套顺序
+  const hit = d.samples || [];
+  const hidden = Math.max(0, (d.hit_count || 0) - hit.length);
+  // 「按什么排的」写在结果卡上，别让人对着顺序猜；式子算不出值时后端会给 sort_note
+  const sortText = d.sort_expr ? '按 ' + d.sort_expr + ' 降序' : '按代码升序（未填排序表达式）';
+  const warn = d.sort_note
+    ? `<div class="hintbox warn" style="margin-top:6px">${esc(d.sort_note)}</div>` : '';
+  $('#test-result').innerHTML =
+    `<div class="pool-stat" style="margin-top:8px">
+      <span>基准日 <b>${esc(d.trade_date)}</b></span>
+      <span>基础池 <b>${esc(d.base_size)}</b> 只</span>
+      <span>当日入池 <b class="${d.hit_count ? 'up' : 'down'}">${esc(d.hit_count)}</b> 只</span>
+      <span>${d.preselected ? '<span class="tag b">可预筛</span>' : '<span class="tag y">含指标，无法预筛</span>'}</span>
+      <span class="muted">${esc(sortText)}</span>
+      <span class="muted">${esc(d.elapsed)}s</span>
+    </div>` + warn +
+    `<div id="test-table"></div>` +
+    `<div class="small muted">点表头排序（再点一下反向，「#」列回到上面这套顺序）；
+       点「K线」在本页弹窗预览（含下挂指标，不跳转）；
+       点代码 / 名称在新标签打开个股诊断页${hidden
+       ? ` · 另有 <b>${hidden}</b> 只未列出，把「样例」调大后重跑可看更多` : ' · 已列出全部命中'}</div>`;
+  paintTest();
+}
+
+/** 只重画结果表 —— 点表头不重新试跑（那要几分钟），也不动结果卡与说明。 */
+function paintTest() {
+  const d = testResult, box = $('#test-table');
+  if (!d || !box) return;
+  const view = testSortedItems();
+  testSamples = view;                // 弹窗「下一个」按**屏幕当前顺序**翻
+  if (!view.length) {
+    box.innerHTML = '<div class="empty">该日没有股票满足条件，把阈值放宽些试试</div>';
+    return;
+  }
+  const sortTip = d.sort_expr ? '排序表达式：' + d.sort_expr : '未填排序表达式 —— 按代码升序';
+  // 额外列：**入池条件/排序表达式真正引用到的字段**（后端按 `indicators.col_spec` 给出
+  // 表头/小数位/格式/涨跌色）—— 这里照单渲染，不写死任何字段名。与「今日选股」结果表
+  // 共用同一套渲染（`app.js` 的 extraCols/colText/colCls），两边别各写一份。
+  const cols = extraCols(d);
+  const extraHead = cols.map(c => testTh(c.label, c.key, 'num', c.key)).join('');
+  const extraCell = (x) => cols.map(c =>
+    `<td class="num ${colCls(c, x[c.key])}">${colText(c, x[c.key])}</td>`).join('');
+  const head = testTh('#', '__orig', '',
+                      '点击恢复服务端顺序（' + (d.sort_expr ? '按 ' + d.sort_expr + ' 降序' : '按代码升序') + '）')
+    + testTh('代码', 'ts_code') + testTh('名称', 'name') + testTh('行业', 'industry')
+    + testTh('收盘', 'close', 'num') + testTh('涨跌幅', 'pct_chg', 'num')
+    + testTh('总市值(亿)', 'total_mv', 'num') + testTh('换手%', 'turnover_rate', 'num')
+    + extraHead
+    + testTh('评分', 'score', 'num', sortTip + ' · 点击按「评分」排序')
+    + '<th></th>';
+  box.innerHTML = `<div class="tbl-wrap" style="max-height:420px;border:1px solid var(--line);border-radius:var(--radius-s)">
+      <table class="data sm"><thead><tr>${head}</tr></thead><tbody>
+      ${view.map((x, i) => `<tr>
+      <td class="mono small">${i+1}</td>
+      <td class="mono small"><a href="${klineUrl(x.ts_code)}" target="_blank"
+          title="打开 ${esc(x.ts_code)} 的个股诊断页（基本面 / 筹码 / 收益 / 信号明细）">${esc(x.ts_code)}</a></td>
+      <td><a href="${klineUrl(x.ts_code)}" target="_blank">${esc(x.name || '')}</a></td>
+      <td class="small muted">${esc(x.industry || '')}</td>
+      <td class="num">${x.close == null ? '—' : fmt.price(x.close)}</td>
+      <td class="num ${fmt.cls(x.pct_chg)}">${x.pct_chg == null ? '—' : fmt.pct(x.pct_chg)}</td>
+      <td class="num">${x.total_mv == null ? '—' : fmt.mv(x.total_mv)}</td>
+      <td class="num">${x.turnover_rate == null ? '—' : Number(x.turnover_rate).toFixed(2)}</td>
+      ${extraCell(x)}
+      <td class="num">${x.score == null ? '—' : Number(x.score).toFixed(3)}</td>
+      <td><button class="btn sm" data-kline="${esc(x.ts_code)}" data-idx="${i}"
+          title="弹窗预览 K线（含下挂指标，不跳转）">K线</button></td>
+      </tr>`).join('')}</tbody></table>
+    </div>`;
+  // 点表头 → 换排序（点同列切方向；换列文本升序、数值降序；「#」回服务端原序）
+  $$('th[data-sort]', box).forEach(th => th.onclick = () => {
+    const k = th.dataset.sort;
+    if (k === '__orig') testSort = { key: '', dir: -1 };
+    else if (testSort.key === k) testSort.dir = -testSort.dir;
+    else testSort = { key: k, dir: TEST_TEXT_COLS[k] ? 1 : -1 };
+    paintTest();
+  });
+  // 「K线」按钮 → 弹窗预览（事件在渲染后一次性挂上，别在行模板里写 onclick）
+  $$('[data-kline]', box).forEach(b => b.onclick = guardClick(b, () => {
+    const i = Number(b.dataset.idx);
+    const s = testSamples[i] || {};
+    openKline(b.dataset.kline, s.name || '', testSamples, i);
+  }));
+}
+
+function previewParams() {
+  const where = (testSpec && testSpec.where) || [];
+  // 周期跟着策略走：周K 策略的诊断页也要按周线视图看（否则图上是日K、命中点却按周K 算）
+  const fq = (testSpec && testSpec.timeframe) || DEF_FREQ;
+  const p = { bars: 260, freq: fq,
+              // 选股策略 → 当 entry 条件（与诊断页带 pool_id 是同一条通路：
+              // 命中点 = 当日是否满足入池条件）
+              config: JSON.stringify({ entry: where, timeframe: fq }),
+              // ⚠ 试跑**没有绑定买卖策略**：不加这个的话，诊断页会拿默认买卖参数
+              //   跑一遍单票回测，弹窗里冒出一张「策略收益」卡 —— 跟这批票选得对不对
+              //   毫无关系，却长得像这次试跑的结论。sel_only 只画选股命中、不算收益。
+              sel_only: '1' };
+  if (testDate) p.trade_date = testDate;
+  return p;
+}
+
+/** 「K线」按钮 → 弹窗预览。`list`/`index` 是这次试跑的命中列表与行号：
+    弹窗右上角的「下一个」按它翻，跟表里的顺序一致（这一批票的查询日、选股条件
+    全都一样，直接沿用同一份 previewParams 就行）。 */
+function openKline(tsCode, name, list, index) {
+  if (!window.klinePreview) return;
+  window.klinePreview({
+    tsCode: tsCode, name: name, params: previewParams(),
+    list: list, index: index,
+  });
+}
+
+async function test() {
+  const f = readForm();
+  if (!activeConds().length) return toast('先写一条入池条件（只写 # 注释不算）', 'warn');
+  const date = $('#ed-date').value;
+  const sample = Math.max(1, Math.min(2000, Number($('#ed-sample').value) || 50));
+  $('#ed-sample').value = sample;
+  const body = {
+    universe: { base: f.base, where: f.conds,
+                filt: f.filt, timeframe: f.timeframe },
+    trade_date: date, sample: sample
+  };
+  // 排序表达式：留空 = 不传（后端按代码升序），别把空串发过去让它去校验
+  const sortExpr = $('#ed-sort').value.trim();
+  if (sortExpr) body.sort_expr = sortExpr;
+  $('#test-hint').textContent = '试跑中…';
+  $('#test-result').innerHTML = '';
+  try {
+    const d = await apiPost('/api/universe/test', body);
+    $('#test-hint').textContent = '';
+    // 记下「这份结果是用什么条件、哪一天跑出来的」—— 列表与弹窗预览都按它走
+    testSpec = { base: f.base, where: f.conds,
+                 filt: f.filt, timeframe: f.timeframe };
+    testDate = d.trade_date || date || '';
+    renderTest(d);
+  } catch (e) {
+    $('#test-hint').textContent = '';
+    $('#test-result').innerHTML = '<div class="empty">' + esc(e.message || String(e)) + '</div>';
+  }
+}
+
+/* ---------- 按钮 ---------- */
+$('#btn-new').onclick = newForm;
+$('#btn-validate').onclick = guardClick($('#btn-validate'), async () => {
+  const f = readForm();
+  try {
+    const r = await apiPost('/api/pools/validate', f);
+    showErrs(r.errors);
+    toast(r.valid ? '校验通过' : '校验未通过，共 ' + r.errors.length + ' 个问题', r.valid ? 'ok' : 'warn');
+  } catch (e) { showErrs([e.message]); }
+});
+$('#btn-save').onclick = guardClick($('#btn-save'), async () => {
+  const f = readForm();
+  if (!f.name) return toast('请填写策略名称', 'warn');
+  try {
+    const r = await apiPost('/api/pools', { id: currentId, ...f });
+    currentId = r.id;
+    toast('已保存：' + r.name, 'ok');
+    clearErrs();
+    await load();
+  } catch (e) { showErrs([e.message]); toast(e.message, 'err', 6000); }
+});
+$('#btn-save-as').onclick = guardClick($('#btn-save-as'), async () => {
+  const f = readForm();
+  const name = prompt('新策略名称', f.name ? f.name + ' 副本' : '新选股策略');
+  if (!name) return;
+  try {
+    const r = await apiPost('/api/pools', { name, note: f.note, base: f.base,
+      timeframe: f.timeframe, conds: f.conds, filt: f.filt });
+    currentId = r.id;
+    toast('已另存为：' + name, 'ok');
+    await load();
+  } catch (e) { showErrs([e.message]); }
+});
+$('#btn-del').onclick = guardClick($('#btn-del'), async () => {
+  if (!currentId) return;
+  const p = pools.find(x => x.id === currentId);
+  if (!p || p.builtin) return toast('内置策略不可删除', 'warn');
+  if (!confirm('确定删除选股策略「' + p.name + '」？\n已完成的回测记录不受影响，但再按原条件跑时该策略已不存在。')) return;
+  try {
+    await apiDel('/api/pools/' + currentId);
+    currentId = null;
+    toast('已删除', 'ok');
+    await load();
+  } catch (e) { toast(e.message, 'err', 5000); }
+});
+$('#btn-builtins').onclick = guardClick($('#btn-builtins'), async () => {
+  const r = await apiPost('/api/pools/builtins', {});
+  toast('预设与内置样例已补齐（新增 ' + (r.installed || 0) + ' 条）', 'ok');
+  await load();
+});
+$('#btn-test').onclick = guardClick($('#btn-test'), test);
+
+$('#toggle-help').onclick = () => {
+  const p = $('#help-panel');
+  const open = p.style.display !== 'none';
+  p.style.display = open ? 'none' : '';
+  $('#help-arrow').textContent = open ? '展开 ▾' : '收起 ▴';
+};
+
+['#ed-name', '#ed-note', '#ed-conds'].forEach(s => $(s).addEventListener('input', markDirty));
+['#ed-st', '#ed-kcb', '#ed-cyb', '#ed-bj', '#ed-minamt', '#ed-mindays'].forEach(s =>
+  $(s).addEventListener('input', markDirty));
+['#ed-st', '#ed-kcb', '#ed-cyb', '#ed-bj'].forEach(s =>
+  $(s).addEventListener('change', markDirty));
+$('#ed-base').addEventListener('change', markDirty);
+$('#ed-freq').addEventListener('change', () => { syncFreqHint(); markDirty(); });
+
+document.addEventListener('DOMContentLoaded', async () => {
+  const [u, f, cfg] = await Promise.all([
+    apiGet('/api/universes'), apiGet('/api/universe/fields'), apiGet('/api/config')
+  ]);
+  universes = u || [];
+  if (cfg && cfg.filt_defaults) FILT_DEF = cfg.filt_defaults;
+  cfgDefaults = cfg;
+  fillSelect($('#ed-base'), universes, 'code', 'name');
+  // 周期下拉：选项/展示名同源（后端 `universe.FREQS`），默认停日K（= 老行为）
+  fillSelect($('#ed-freq'), FREQ_ORDER.map(x => ({ code: x, name: FREQS[x] })),
+             'code', 'name', DEF_FREQ);
+  syncFreqHint();
+  // 字段行 + 每行的「示例」链接都由 app.js 的 fieldHelpRow 出（买卖策略页共用同一份，
+  // 别在这里另写一遍列名/点法）。点「示例」→ 弹窗看该字段的真实取值。
+  $('#help-fields').innerHTML = (f || []).map(x => window.fieldHelpRow(x.name, x.desc)).join('');
+  window.bindFieldHelp($('#help-fields'));
+  $('#ed-date').value = cfg.latest_trade_date || cfg.today;
+  // 选股策略的条件里可以写 w_ 周线字段；补全里输入 w_ 开头就会列出它们（见 ac.js 的 pool()）
+  if (window.ExprAC) window.ExprAC.attach($('#ed-conds'), { weekly: false });
+  // 排序表达式也是表达式（字段名一样要能补全）
+  if (window.ExprAC) window.ExprAC.attach($('#ed-sort'), { weekly: false });
+  await load();
+  const q = new URLSearchParams(location.search).get('id');
+  if (q) { const p = pools.find(x => String(x.id) === q); if (p) { currentId = p.id; writeForm(p); } }
+});
+</script>
+{% endblock %}

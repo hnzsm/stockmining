@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>探针 · K线预览入口的 URL 口径</title>
+<style>html,body{margin:0;background:#0f1116;color:#cfd6e4;font:13px/1.6 monospace}
+pre{padding:12px;white-space:pre-wrap}</style></head>
+<body>
+<div id="frames"></div>
+<pre id="out">running…</pre>
+<script>
+/* 一次性的实测探针：真点每个 K线按钮，读出弹窗里那个同源 iframe 的 src。
+   目的只有一个 —— 确认「没绑定买卖策略的入口」都带上了 sel_only=1（C8）。
+   跑法：无头 Chrome --dump-dom 本文件，读 <pre id="out"> 里的 JSON。 */
+const R = [];
+function ok(name, cond, extra) { R.push({ name: name, ok: !!cond, extra: String(extra == null ? '' : extra) }); }
+// 门禁 ?run=1：不给参数就只画一行提示，免得随手打开这个文件也在服务端跑一遍
+if (!/[?&]run=1/.test(location.search)) {
+  document.getElementById('out').textContent = '加 ?run=1 才跑（tools/verify_watch.py 的【5】会带）。';
+} else {
+function frame(url) {
+  return new Promise(function (res) {
+    const f = document.createElement('iframe');
+    f.style.cssText = 'width:1400px;height:900px;border:0;position:absolute;left:-9999px;top:0';
+    f.src = url;
+    f.onload = function () { res(f); };
+    document.getElementById('frames').appendChild(f);
+  });
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function waitFor(f, sel, tries) {
+  for (let i = 0; i < (tries || 60); i++) {
+    const el = f.contentDocument && f.contentDocument.querySelector(sel);
+    if (el) return el;
+    await sleep(400);
+  }
+  return null;
+}
+
+(async function () {
+  try {
+    const $ = window.jQuery;
+    // ---------- 非交易时段也要能稳：先确认服务在 ----------
+    // 1) 我的关注页：自选股表的「K线」
+    const wf = await frame('/watch');
+    // 页面默认选第一个分组；探针的数据在「ZZ·K线探针组」里，先切过去
+    const grp = await waitFor(wf, '#grp-list .grp', 60);
+    if (grp) {
+      const all = wf.contentDocument.querySelectorAll('#grp-list .grp');
+      for (const g of all) {
+        if (/探针/.test(g.textContent)) { g.click(); break; }
+      }
+      await sleep(1200);
+    }
+    const kbtn = await waitFor(wf, '#stk-list [data-k]', 60);
+    ok('关注页渲染出自选股（有 K线 按钮可点）', !!kbtn);
+    if (kbtn) {
+      const want = wf.contentDocument.querySelector('#stk-list [data-k]').dataset.k;
+      kbtn.click();
+      const fr = await waitFor(wf, 'iframe.kl-frame', 40);
+      const src = fr ? fr.getAttribute('src') : '';
+      ok('关注页自选股的 K线预览带 sel_only=1', /[?&]sel_only=1/.test(src), src);
+      ok('关注页自选股的 K线预览带 trade_date（与表格同一天）',
+         /[?&]trade_date=\d{4}-\d{2}-\d{2}/.test(src), src);
+      ok('预览确实是「一只票」的（代码对得上）',
+         decodeURIComponent(src).indexOf(want) > 0, want + ' → ' + src);
+      // 弹窗里的「在诊断页打开」也要带同一份参数
+      const full = wf.contentDocument.querySelector('[data-open-full]');
+      ok('弹窗里「在诊断页打开」的链接带同一份参数（sel_only + trade_date）',
+         full && /[?&]sel_only=1/.test(full.getAttribute('href'))
+              && /[?&]trade_date=/.test(full.getAttribute('href')),
+         full ? full.getAttribute('href') : '（没找到链接）');
+      // 弹窗里切周期：分段按钮在 iframe 内部，切完外面只该动「在诊断页打开」那个链接。
+      // 验证的是 app.js 里那段跨 iframe 的约定（postMessage 只更新链接，**不重建 iframe** ——
+      // 重建会把用户刚切的周期又冲回 URL 上那份）。
+      // ⚠ iframe 元素出现 ≠ 里面的文档加载完（那一刻 contentDocument 还是空的 about:blank），
+      //   所以得等它**自己的**按钮出现，别一拿到 iframe 就查 —— 会稳定假红。
+      let segW = null;
+      for (let i = 0; i < 75 && !segW; i++) {
+        await sleep(400);
+        const d = fr && fr.contentDocument;
+        segW = d && d.querySelector('#st-freq-seg [data-f="weekly"]');
+      }
+      ok('弹窗内的诊断页有「日K / 周K」分段按钮', !!segW);
+      if (segW) {
+        segW.click();
+        let got = false;
+        for (let i = 0; i < 80; i++) {          // 切周期要重新取数（周K 是另一份面板）
+          await sleep(400);
+          try { if (fr.contentWindow.__stDebug.view().freq === 'weekly') { got = true; break; } } catch (e) {}
+        }
+        ok('弹窗里点「周K」真的切过去了（iframe 内视图 = 周K）', got);
+        const href1 = (wf.contentDocument.querySelector('[data-open-full]') || {}).getAttribute
+          ? wf.contentDocument.querySelector('[data-open-full]').getAttribute('href') : '';
+        ok('切完「在诊断页打开」的链接跟着带 freq=weekly（两个视图不会对不上）',
+           /[?&]freq=weekly/.test(href1), href1);
+        // 翻「下一个」：周期要留着 —— 切周K 是想按周线看这一批，不该翻一只就弹回日线
+        const nx = wf.contentDocument.querySelector('[data-next]');
+        if (nx && !nx.disabled) {
+          nx.click();
+          await sleep(1200);
+          const src2 = (wf.contentDocument.querySelector('iframe.kl-frame') || {}).getAttribute
+            ? wf.contentDocument.querySelector('iframe.kl-frame').getAttribute('src') : '';
+          ok('翻「下一个」时保留了周K（不弹回日线）', /[?&]freq=weekly/.test(src2), src2);
+        } else {
+          ok('列表里只有一只票，翻页项跳过', true, 'SKIP');
+        }
+      }
+    }
+
+    // 2) 总览页：触发提醒卡的「K线」 + 东财新概念卡的代表股
+    const ix = await frame('/');
+    const fb = await waitFor(ix, '#wf-list [data-k]', 60);
+    if (fb) {
+      const d = fb.dataset.d;
+      // 2026-10-11：入口从「单独的 K线 按钮」换成**票名本身**。读 DOM 认一下，
+      // 免得以后有人把按钮加回来、名字那边悄悄没了绑定（两处都能点也不该是这形状）。
+      ok('总览「触发提醒」的入口是**票名**本身（不是单摆的按钮）',
+         fb.tagName !== 'BUTTON' && /\bwf-k\b/.test(fb.className),
+         fb.tagName + '.' + fb.className);
+      ok('总览「触发提醒」卡里已经没有「K线」按钮了',
+         !ix.contentDocument.querySelector('#wf-list table.data button'),
+         (ix.contentDocument.querySelector('#wf-list table.data button') || {}).textContent || '无');
+      fb.click();
+      const fr = await waitFor(ix, 'iframe.kl-frame', 40);
+      const src = fr ? fr.getAttribute('src') : '';
+      ok('总览「触发提醒」的 K线带 sel_only=1', /[?&]sel_only=1/.test(src), src);
+      ok('总览「触发提醒」的 K线锚在**触发那天**（看当日命中）',
+         d && decodeURIComponent(src).indexOf('trade_date=' + d) > 0, d + ' → ' + src);
+    } else {
+      ok('总览「触发提醒」暂时没有命中行（跳过该项）', true, 'SKIP-无命中');
+    }
+
+    const nc = await waitFor(ix, '#nc-list .nc-k', 60);
+    ok('总览新概念卡渲染出代表股', !!nc);
+    if (nc) {
+      const code = nc.dataset.c;
+      nc.click();
+      const fr = await waitFor(ix, 'iframe.kl-frame', 40);
+      const src = fr ? fr.getAttribute('src') : '';
+      ok('新概念代表股的 K线预览带 sel_only=1', /[?&]sel_only=1/.test(src), src);
+      ok('新概念代表股点的是那只票', decodeURIComponent(src).indexOf(code) > 0, code + ' → ' + src);
+      ok('新概念代表股**没有**乱锚一个 trade_date（本页与哪天无关）',
+         !/[?&]trade_date=/.test(src), src);
+    }
+    // 2b) 「最新动态」tab：变更流水表里「股票」那列也要能点开 K线预览，
+    //     而且要**锚在那条变更日**（与触发提醒列表同一口径：看当日形态），不是全锚到今天。
+    await sleep(300);
+    const evBtn = ix.contentDocument.querySelector('#nc-tabs [data-t="ev"]');
+    ok('总览新概念卡有「最新动态」tab（可切过去）', !!evBtn);
+    if (evBtn) {
+      evBtn.click();
+      await sleep(900);
+      const ek = await waitFor(ix, '#nc-list .nc-k[data-d]', 40);
+      ok('「最新动态」的股票名可点（带 data-d 锚点）', !!ek);
+      if (ek) {
+        const ec = ek.dataset.c, ed = ek.dataset.d;
+        ek.click();
+        const fr2 = await waitFor(ix, 'iframe.kl-frame', 40);
+        const src2 = fr2 ? fr2.getAttribute('src') : '';
+        ok('「最新动态」的股票 K线预览带 sel_only=1', /[?&]sel_only=1/.test(src2), src2);
+        ok('「最新动态」的股票 K线**锚在变更那天**（不是都锚到今天）',
+           !!ed && decodeURIComponent(src2).indexOf('trade_date=' + ed) > 0, ed + ' → ' + src2);
+        ok('「最新动态」的股票点的是那只票', !!ec && decodeURIComponent(src2).indexOf(ec) > 0,
+           ec + ' → ' + src2);
+      } else {
+        ok('「最新动态」暂时没有可点的变更行（跳过该项）', true, 'SKIP-无动态');
+      }
+    }
+    // 3) 弹窗选票：被点的那只票的 iframe 真加载出来（不是空 src）
+    ok('预览 iframe 是 embed 模式（内嵌诊断页，不是新开整页）',
+       /[?&]embed=1|\?/.test((ix.contentDocument.querySelector('iframe.kl-frame') || {}).src || ''),
+       (ix.contentDocument.querySelector('iframe.kl-frame') || {}).src || '');
+  } catch (e) {
+    ok('探针自身没抛异常', false, e && (e.message || e));
+  }
+  document.getElementById('out').textContent =
+    JSON.stringify({ done: true, checks: R }, null, 1);
+})();
+}
+</script>
+</body></html>

@@ -1,0 +1,500 @@
+{% extends "base.html" %}
+{% block title %}总览 · 短线选股{% endblock %}
+{% block pagetitle %}总览{% endblock %}
+{% block pagedesc %}行情数据、策略与回测总览 · 数据源 tushare · 本地 MySQL 存储{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-head">
+    <div class="card-title">涨跌停家数 <span class="tag" id="lim-range-label">近 3 月</span></div>
+    <div class="flex" id="lim-range">
+      <button class="btn sm" data-m="1">近1月</button>
+      <button class="btn sm on" data-m="3">近3月</button>
+      <button class="btn sm" data-m="6">近6月</button>
+      <button class="btn sm" data-m="12">近1年</button>
+    </div>
+  </div>
+  <div class="card-body">
+    <div class="chart" id="chart-limit" style="height:340px"></div>
+    <div class="small muted" id="lim-note" style="margin-top:6px">加载中…</div>
+    <div class="small muted" style="margin-top:2px">
+      默认只看<b>涨停总计（红）</b>与<b>跌停总计（绿）</b>，点击上方图例可展开主板 / 创业板 / 科创板 / ST 分板块曲线。
+      口径与策略里的 <code>limit_up / limit_down</code> 字段一致：主板 10% · 创业板/科创板 20% · 北交所 30% · ST 5%。
+      <b>ST 是标记不是板块</b>，与其他板块重叠计数，所以「总计」≠ 各板块之和（北交所只计入总计）。
+    </div>
+  </div>
+</div>
+
+<div class="flex" style="margin:18px 0 12px">
+  <div class="card-title" style="margin:0">热股榜 <span class="tag">每源前 10</span></div>
+  <div class="spacer"></div>
+  <span class="small muted" id="hot-asof">加载中…</span>
+  <button class="btn sm" id="hot-refresh" title="跳过缓存，立刻重新取三个源">刷新</button>
+</div>
+<div class="grid g3" id="hot-grid">
+  <div class="card"><div class="card-body"><div class="empty">加载中…</div></div></div>
+</div>
+<p class="small muted" style="margin:0 2px 18px">
+  三个源都是<b>站外公开接口</b>（不消耗 tushare 额度，见 README「一之二」）。
+  其中「人气榜」那个只给代码与名次，<b>名称 / 涨跌幅由本地库补齐</b>，是
+  <b>最近交易日收盘</b>口径；另两个用它们自己的口径。右上角标着本次取数时间。
+  光标停在某一行可看该行的热度值与上榜理由；<b>点某一行</b>会在新标签打开这只票的
+  <b>个股诊断页</b>（K线 / 信号 / 基本面 / 筹码 / 收益，走本地库、与列表页同一个入口）。
+  某个源取数失败只影响它那一张卡。
+</p>
+
+<div class="flex" style="margin:18px 0 12px">
+  <div class="card-title" style="margin:0">我的关注 · 触发提醒 <span class="tag b" id="wf-badge">—</span></div>
+  <div class="spacer"></div>
+  <span class="small muted" id="wf-asof"></span>
+  <a class="btn sm" href="/watch">管理自选与提醒</a>
+  <button class="btn sm" id="wf-check" title="按每条规则自己的周期重判一遍（日K 判最新交易日那根 / 周K 判最近一个已收盘的完整周）">立即检测</button>
+</div>
+<div class="card">
+  <div class="card-body tight">
+    <div id="wf-list"><div class="empty">加载中…</div></div>
+    <div class="hr"></div>
+    <div class="small muted">
+      提醒规则在<a href="/watch">我的关注</a>里按自选股设置（触及布林中线 / 上穿 MA10 / 上下穿某价位…）。
+      <b>上穿、下穿按收盘价判</b>（前一根在下方、这一根到上方才算），<b>触及是盘中口径</b>；
+      均线与布林为<b>前复权</b>，与选股 / 回测 / 个股诊断页<b>同一个来源</b>。
+      检测按<b>每条规则的周期</b>判：<b>日K</b> 看最新交易日那根、<b>周K</b> 看最近一个
+      <b>已收盘的完整周</b>（周K 要等这周走完才出结果）。同一条规则同一天只记一条。
+      <b>点票名</b>即开 K线预览（锚在<b>触发那天</b>，图上能看到之后怎么走）；
+      「股票标记」列是这只票在自选股里写的文本标记（与「备注」列不是一回事：那是这条提醒的备注）。
+    </div>
+  </div>
+</div>
+
+<div class="flex" style="margin:18px 0 12px">
+  <div class="card-title" style="margin:0">东财新概念 <span class="tag" id="nc-badge">—</span></div>
+  <div class="flex" id="nc-tabs">
+    <button class="btn sm on" data-t="new">新概念</button>
+    <button class="btn sm" data-t="ev">最新动态</button>
+  </div>
+  <div class="spacer"></div>
+  <span class="small muted" id="nc-asof"></span>
+  <button class="btn sm" id="nc-refresh" title="立刻再抓一次东财（本页每次刷新也会自动抓）">刷新</button>
+</div>
+<div class="card">
+  <div class="card-body">
+    <div id="nc-list" style="max-height:430px;overflow:auto"><div class="empty">加载中…</div></div>
+    <div class="small muted" id="nc-note" style="margin-top:9px"></div>
+    <div class="small muted" style="margin-top:3px">
+      源：东财「新概念速览」（<code>emdata.eastmoney.com/appdc/gnsl</code>）背后的两条公开报表，
+      <b>站外接口、不耗 tushare 额度</b>。<b>本页每次刷新都会实时抓一遍</b>（不读本地缓存），
+      抓不到的这一次会退回上次那份快照并在这里标出来。<b>新概念</b>是板块视角
+      （这个概念什么时候建的、讲什么、代表股是谁）；
+      <b>最新动态</b>是成分变更流水（哪天把哪只票加进了哪个概念、理由是什么）——
+      与个股诊断页那份 F10 题材库（票 → 概念）<b>不是同一个口径</b>，别混着读。
+    </div>
+  </div>
+</div>
+
+<div class="grid g2">
+  <div class="card">
+    <div class="card-head">
+      <div class="card-title">快速开始 <span class="tag">3 步跑通</span></div>
+    </div>
+    <div class="card-body">
+      <div class="hintbox" style="margin-bottom:14px">
+        本工作台的流程是：<b>同步行情 → 定义策略 → 选股 / 回测</b>。首次使用请先完成数据同步。
+      </div>
+      <div style="display:flex;flex-direction:column;gap:11px">
+        <div class="flex">
+          <span class="tag b">1</span>
+          <div style="flex:1">
+            <div><b>同步行情数据</b></div>
+            <div class="small muted">从 tushare 拉取全市场日线 + 复权因子 + 每日指标，并本地合成周线</div>
+          </div>
+          <a class="btn sm" href="/data">去同步</a>
+        </div>
+        <div class="flex">
+          <span class="tag b">2</span>
+          <div style="flex:1">
+            <div><b>选择或自定义策略</b></div>
+            <div class="small muted">内置 7 个示例策略，也可用表达式自定义任意选股条件</div>
+          </div>
+          <a class="btn sm" href="/strategies">去配置</a>
+        </div>
+        <div class="flex">
+          <span class="tag b">3</span>
+          <div style="flex:1">
+            <div><b>回溯收益 / 今日选股</b></div>
+            <div class="small muted">组合回测输出收益、回撤、胜率等指标，或直接筛出今日候选股</div>
+          </div>
+          <a class="btn sm" href="/backtest">去回测</a>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><div class="card-title">最近回测</div><a class="btn sm" href="/backtest">全部</a></div>
+    <div class="card-body tight"><div id="run-list"><div class="empty">加载中…</div></div></div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-head"><div class="card-title">数据同步日志</div><a class="btn sm" href="/data">数据管理</a></div>
+  <div class="card-body tight"><div id="sync-list"><div class="empty">加载中…</div></div></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+/* ---------------- 我的关注 · 触发提醒（总览卡片） ----------------
+   口径与「我的关注」页同一份（core/watch.py）：这里只铺格子，涨跌色/文本都是后端算好的。 */
+function wfRow(x){
+  /* ⚠ 两个「备注」别混（2026-10-11）：
+       · 「股票标记」列 = `stock_note` = **这只票**在自选股里写的文本标记（题材那类长文本）；
+       · 「备注」列 = `note` = **这条提醒规则**的备注。
+     票名旁边那列放「股票标记」（它讲的是这只票），提醒那三列排在后面（它们讲的是这条提醒）。 */
+  return `<tr>
+    <td class="mono small" style="width:96px">${esc(x.trade_date)}</td>
+    <td class="mono small" style="width:102px">${esc(x.ts_code)}</td>
+    <td style="width:88px"><span class="wf-k" data-k="${esc(x.ts_code)}" data-d="${esc(x.trade_date)}" data-f="${esc(x.freq || 'daily')}" data-n="${esc(x.name || '')}" title="点开 K线预览（锚在触发那天）">${esc(x.name || '—')}</span></td>
+    <td class="small muted" style="width:150px" title="${esc(x.stock_note || '')}">${esc((x.stock_note || '').slice(0, 18))}</td>
+    <td style="width:120px"><span class="wchip on">${esc(x.freq_label && x.freq_label !== '日K' ? x.freq_label + '·' : '')}${esc(x.op_label)}${esc(x.line_label)}</span></td>
+    <td class="small">${esc(x.message)}</td>
+    <td class="small muted" style="width:104px">${esc(x.note || '')}</td>
+  </tr>`;
+}
+async function loadWatchCard(){
+  let d;
+  try { d = await apiGet('/api/watch/feed?days=7'); }
+  catch (e) { $('#wf-list').innerHTML = '<div class="empty">读取失败：' + esc(e.message) + '</div>'; return; }
+  const items = d.items || [];
+  $('#wf-badge').textContent = items.length ? items.length + ' 条' : '无';
+  $('#wf-asof').textContent = '判到 ' + (d.today || '—') + '（本库最新交易日）· 最近 7 个交易日';
+  $('#wf-list').innerHTML = items.length
+    ? `<table class="data"><thead><tr><th>交易日</th><th>代码</th><th>名称</th>
+        <th title="这只票在「我的关注」里写的文本标记（题材 / 成本那类）—— 与「备注」不是一回事，那是这条提醒的备注">股票标记</th>
+        <th>规则</th><th>说明</th><th>备注</th></tr></thead><tbody>
+        ${items.slice(0, 20).map(wfRow).join('')}</tbody></table>`
+    : '<div class="empty"><span class="big">★</span>还没有触发 —— 去「我的关注」加自选股、设提醒规则，再点「立即检测」</div>';
+  // 点**票名**开预览（2026-10-11：原来单摆一个「K线」按钮，点了才知道能看；名字本身就是入口）。
+  // ⚠ 锚点用**该条触发那一天**（这就是「看当日命中」），且这个入口没有绑定买卖策略
+  //   → 必须带 `sel_only=1`，否则会拿默认买卖参数跑一遍单票回测、摆出第 4 张「收益」卡。
+  $$('#wf-list [data-k]').forEach(b => b.onclick = () =>
+    klinePreview({ tsCode: b.dataset.k, name: b.dataset.n || '',
+                   // ⚠ 周K 的命中要按**周线**开图：这条规则判的是周线那一根，拿日线图去看
+                   //   等于看不到那根 K（与关注页同一套口径）。
+                   params: { sel_only: '1', trade_date: b.dataset.d,
+                             freq: b.dataset.f === 'weekly' ? 'weekly' : '' } }));
+}
+
+/* ---------------- 东财新概念（总览卡片） ----------------
+   两个 tab 是**两个口径**：新概念 = 板块视角；最新动态 = 成分变更流水。文案里已分开写。 */
+let NC = null, NCTAB = 'new';
+async function loadNewConcept(){
+  try { NC = await apiGet('/api/newconcept?days=5'); }
+  catch (e) { $('#nc-list').innerHTML = '<div class="empty">读取失败：' + esc(e.message) + '</div>'; return; }
+  renderNewConcept();
+}
+/* 本卡片里所有「股票名」→ 点开 K线预览，绑一次管两个 tab。
+   ⚠ 这张卡**没有绑定任何选股 / 买卖策略** → 一律带 `sel_only=1`
+   （不算策略收益、不摆第 4 张「收益」卡、图上只留「选股命中」那档，而且现在没条件=不铺点）。
+   `data-d`（变更流水那列 = 变更日）有就锚在**那一天**（与触发提醒列表同一口径，看当日形态）；
+   代表股那栏没有 `data-d` ⇒ 按本库最新交易日开图（`klinePreview` 会把空串参数丢掉）。 */
+function bindNCKline(){
+  $$('#nc-list .nc-k').forEach(el => el.onclick = () =>
+    klinePreview({ tsCode: el.dataset.c, name: el.dataset.n || '',
+                   params: { sel_only: '1', trade_date: el.dataset.d || '' } }));
+}
+function renderNewConcept(){
+  const d = NC || {};
+  $('#nc-badge').textContent = (d.new_total || 0) + ' 个概念';
+  // 卡片**每次刷新都会真去东财抓一遍**（后端 overview 里就抓了，不再用本地缓存）；
+  // 抓失败时会退回上一次的快照 —— 这里如实标出来，别让人以为是刚拿到的新数。
+  $('#nc-asof').textContent = d.fetched_at
+    ? ((d.live === false ? '抓取失败 · 快照 ' : '实时抓取于 ') + String(d.fetched_at).slice(5, 16))
+    : '还没抓过';
+  $$('#nc-tabs .btn').forEach(b => b.classList.toggle('on', b.dataset.t === NCTAB));
+
+  if (NCTAB === 'ev') {
+    const ev = d.events || [];
+    $('#nc-list').innerHTML = ev.length ? `<table class="data"><thead><tr>
+        <th>日期</th><th>时间</th><th>方向</th><th>概念</th><th>股票</th>
+        <th class="num">当日涨跌</th><th>入选理由（东财原文）</th></tr></thead><tbody>
+      ${ev.map(e => `<tr>
+        <td class="mono small">${esc(e.change_date)}</td>
+        <td class="mono small">${esc(e.change_time)}</td>
+        <td><span class="tag ${e.direction === '新增' ? 'b' : ''}">${esc(e.direction)}</span></td>
+        <td>${esc(e.board_name)} <span class="mono small muted">${esc(e.board_code)}</span></td>
+        <td>${e.ts_code
+          ? `<span class="nc-k" data-c="${esc(e.ts_code)}" data-d="${esc(e.change_date)}" data-n="${esc(e.name || '')}" title="点开 K线预览（锚在变更那天；弹窗里可再去诊断页）">${esc(e.name || e.ts_code)}</span> <span class="mono small muted">${esc(e.ts_code)}</span>`
+          : esc(e.name || '—')}</td>
+        <td class="num ${esc(e.pct_cls || '')}">${esc(e.pct_text)}</td>
+        <td class="small muted" title="${esc(e.reason)}">${esc((e.reason || '').slice(0, 90))}</td>
+      </tr>`).join('')}</tbody></table>`
+      : '<div class="empty">最近几个交易日没有成分变更记录</div>';
+    $('#nc-note').textContent = ev.length
+      ? `最近变更日 ${(d.event_days || []).join('、')} —— 每条 = 某只票被加进/剔出某个概念；理由取自东财。`
+      : '';
+    bindNCKline();          // 「股票」那列的票名可点开 K线预览（锚在该条变更日）
+    return;
+  }
+
+  const ns = d.new || [];
+  $('#nc-list').innerHTML = ns.length ? ns.map(it => `
+    <div class="nc-item">
+      <div class="nc-h"><b>${esc(it.board_name)}</b>
+        <span class="tag">${it.age_days === null ? esc(it.start_text || '') : it.age_days + ' 天前'}</span>
+        <span class="mono small muted">${esc(it.board_code)}</span>
+        <span class="small muted">${esc(it.start_date || '')}</span></div>
+      <div class="nc-s">${(it.stocks || []).map(s =>
+        `<span class="nc-k" data-c="${esc(s.ts_code)}" title="点开 K线预览（弹窗里可再去诊断页）">${esc(s.name)}
+          <i class="${esc(s.pct_cls || '')}">${esc(s.pct_text)}</i></span>`).join('')}</div>
+      <div class="nc-p" title="${esc(it.profile)}">${esc(it.profile || '（东财没给这个概念写简介）')}</div>
+    </div>`).join('')
+    : '<div class="empty">没抓到新概念数据 —— 点右上角「刷新」重试（本页每次刷新都会自动重抓一遍）</div>';
+  $('#nc-note').textContent = d.note || '';
+  // 代表股只是「东财说这个概念里有这只票」，本页没有绑定任何选股 / 买卖策略
+  // → 带 `sel_only=1`（不算策略收益、不给买卖点），锚点就取本库最新交易日（那栏没有 data-d）。
+  bindNCKline();
+}
+
+(async function(){
+  loadWatchCard();
+  loadNewConcept();
+
+  $('#wf-check').onclick = guardClick($('#wf-check'), async () => {
+    try {
+      const r = await apiPost('/api/watch/check', { lookback: 1, days: 7 });
+      const sp = (r.result.weekly_alerts || 0)
+        ? `（日K ${r.result.daily_fired || 0} 条 / 周K ${r.result.weekly_fired || 0} 条）` : '';
+      toast(`检测 ${r.result.codes} 只 / ${r.result.alerts} 条规则，命中 ${r.result.fired} 条${sp}`,
+            'ok', 5000);
+    } catch (e) { toast('检测失败：' + e.message, 'err', 6000); }
+    await loadWatchCard();
+  });
+
+  $$('#nc-tabs .btn').forEach(b => b.onclick = () => { NCTAB = b.dataset.t; renderNewConcept(); });
+
+  /* 「刷新」= 立刻再抓一次东财。取消缓存后**页面每次加载本来就会抓**，
+     这个按钮只是给「想马上再看一眼」用的（比如刚收盘、刚看到消息）。
+     Shift 已经没意义了（不再有「今天已抓过就跳过」），但保留按键判断不伤。 */
+  $('#nc-refresh').onclick = guardClick($('#nc-refresh'), async ev => {
+    try {
+      const r = await apiPost('/api/newconcept/sync', { force: !!ev.shiftKey });
+      NC = r.overview;
+      toast(`已抓 ${r.coverage.new} 个新概念 / ${r.coverage.events} 条动态`, 'ok', 5000);
+    } catch (e) { toast('抓取失败：' + e.message, 'err', 7000); }
+    renderNewConcept();
+  });
+
+  // 回测记录。⚠ 这一段跑在 DOMContentLoaded 的 async 里、从上往下 await ——
+  // 不接错的话，这一个接口抖一下，后面「同步日志 / 涨跌停 / 热股榜」全都静默不执行，
+  // 页面看着像「加载到一半停了」，而且一条报错都没有。所以每块各自 try + 各自留痕。
+  try {
+  const runs = await apiGet('/api/backtest/runs?limit=8');
+  $('#run-list').innerHTML = runs.length ? `<table class="data"><thead><tr>
+      <th>策略</th><th>区间</th><th class="num">收益</th><th class="num">回撤</th>
+      <th class="num">胜率</th><th class="num">交易</th><th></th></tr></thead><tbody>
+      ${runs.map(r=>`<tr>
+        <td>${esc(r.strategy_name)} <span class="muted small">${esc(r.universe||'')}</span></td>
+        <td class="mono small">${esc(r.start_date)} ~ ${esc(r.end_date)}</td>
+        <td class="num ${fmt.cls(r.total_return)}">${fmt.pct(r.total_return)}</td>
+        <td class="num down">${fmt.pct(r.max_drawdown)}</td>
+        <td class="num">${fmt.pct(r.win_rate,1)}</td>
+        <td class="num">${fmt.int(r.trade_count)}</td>
+        <td><a class="btn sm" href="/backtest?run_id=${r.id}">查看</a></td></tr>`).join('')}
+      </tbody></table>` : '<div class="empty"><span class="big">↗</span>还没有回测记录，去「策略回测」跑一次</div>';
+  } catch (e) { boxState($('#run-list'), 'error', '回测记录没取到', e.message); }
+
+  // 同步日志
+  try {
+  const logs = await apiGet('/api/sync/logs');
+  $('#sync-list').innerHTML = logs.length ? `<table class="data"><thead><tr>
+      <th>任务</th><th>区间</th><th class="num">行数</th><th>状态</th><th>开始时间</th><th>说明</th>
+      </tr></thead><tbody>${logs.slice(0,8).map(l=>`<tr>
+        <td>${esc(l.task)}</td>
+        <td class="mono small">${esc(l.date_from||'—')} ~ ${esc(l.date_to||'—')}</td>
+        <td class="num">${fmt.int(l.rows_cnt)}</td>
+        <td><span class="tag ${esc(l.status_cls||'')}" title="${esc(l.status||'')}">${esc(l.status_label||l.status||'')}</span></td>
+        <td class="mono small">${esc(l.started_at||'')}</td>
+        <td class="small muted">${esc((l.message||'').slice(0,60))}</td></tr>`).join('')}</tbody></table>`
+      : '<div class="empty"><span class="big">⛁</span>还没有同步记录，去「数据管理」同步行情</div>';
+  } catch (e) { boxState($('#sync-list'), 'error', '同步日志没取到', e.message); }
+
+  // ---------------- 涨跌停家数（单图合并，默认近 3 月） ----------------
+  // 板块口径由后端给出（与 indicators._limit_pct 同一套规则），颜色在这里定：
+  // 涨停用红色系、跌停用绿色系（A 股习惯）；「总计」最粗并**默认只有它俩可见**，
+  // 其余板块默认隐藏，点图例才展开 —— 所以 series/legend 名字必须带「涨停·/跌停·」前缀，
+  // 否则两条「总计」线重名会互相覆盖。
+  // 深色主题下板块色的「次要感」靠**压暗 + 降饱和**取得（浅色主题时是加白变淡）——
+  // 总计那两条仍是 --up/--down 原色，永远是图上最扎眼的。
+  const LIM_STYLE = {
+    '涨停·总计':   { color: '#e5352b', width: 2.6 },
+    '跌停·总计':   { color: '#12a06a', width: 2.6 },
+    '涨停·主板':   { color: '#b8625a', width: 1.4 },
+    '跌停·主板':   { color: '#3f8f6e', width: 1.4 },
+    '涨停·创业板': { color: '#c98a1f', width: 1.4 },
+    '跌停·创业板': { color: '#2b7d78', width: 1.4 },
+    '涨停·科创板': { color: '#9a56bd', width: 1.4 },
+    '跌停·科创板': { color: '#5f6fbd', width: 1.4 },
+    '涨停·ST':     { color: '#a83a60', width: 1.4 },
+    '跌停·ST':     { color: '#786f8d', width: 1.4 },
+  };
+  // 图例顺序：总计在前，其后涨停/跌停各自成组，便于对照
+  const LIM_NAMES = ['涨停·总计', '跌停·总计', '涨停·主板', '跌停·主板',
+                     '涨停·创业板', '跌停·创业板', '涨停·科创板', '跌停·科创板',
+                     '涨停·ST', '跌停·ST'];
+  const LIM_DEFAULT_ON = ['涨停·总计', '跌停·总计'];
+
+  function monthsBefore(iso, m){
+    // 必须按**本地日期**拼字符串：toISOString() 是 UTC，会把本地午夜回退 8 小时，
+    // 结果少一天（2026-06-14 → 2026-06-13）。
+    const d = new Date(String(iso).slice(0,10) + 'T00:00:00');
+    d.setMonth(d.getMonth() - m);
+    const p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  }
+
+  function limOption(dates, up, down){
+    const selected = {};
+    LIM_NAMES.forEach(n => { selected[n] = LIM_DEFAULT_ON.indexOf(n) >= 0; });
+    return {
+      tooltip: Object.assign({}, tooltipBase, { valueFormatter: v => v + ' 家' }),
+      legend: { top: 0, itemWidth: 12, itemHeight: 7, itemGap: 12,
+                textStyle: { fontSize: 11, color: '#9aa6ba' },
+                data: LIM_NAMES, selected: selected },
+      grid: { left: 46, right: 16, top: 34, bottom: 46 },
+      xAxis: Object.assign({ type: 'category', data: dates, boundaryGap: false,
+        axisLabel: { color: '#8b95a9', fontSize: 10, rotate: 40, hideOverlap: true } }, baseAxis),
+      yAxis: Object.assign({ type: 'value', name: '家数', minInterval: 1,
+        nameTextStyle: { fontSize: 11, color: '#8b95a9' } }, baseAxis),
+      series: LIM_NAMES.map(n => {
+        const parts = n.split('·');
+        const src = parts[0] === '涨停' ? up : down;
+        return {
+          name: n, type: 'line', data: (src || {})[parts[1]] || [],
+          smooth: true, symbol: 'none',
+          lineStyle: { width: LIM_STYLE[n].width, color: LIM_STYLE[n].color },
+          itemStyle: { color: LIM_STYLE[n].color }, emphasis: { focus: 'series' },
+        };
+      }),
+    };
+  }
+
+  async function loadLimitStats(months){
+    const cfg = window.__cfg || await apiGet('/api/config');
+    const end = cfg.latest_trade_date || cfg.today;
+    const start = monthsBefore(end, months);
+    const d = await apiGet('/api/market/limit_stats?start=' + start + '&end=' + end);
+    mkChart('#chart-limit', limOption(d.dates, d.up, d.down));
+    const l = d.latest;
+    $('#lim-note').textContent = l
+      ? `最新交易日 ${l.trade_date}：涨停 ${l.up['总计']} 家（主板 ${l.up['主板']} · 创业板 ${l.up['创业板']} · 科创板 ${l.up['科创板']} · ST ${l.up['ST']}）｜跌停 ${l.down['总计']} 家（主板 ${l.down['主板']} · 创业板 ${l.down['创业板']} · 科创板 ${l.down['科创板']} · ST ${l.down['ST']}）`
+      : '区间内没有交易数据，先去「数据管理」同步行情';
+    $('#lim-range-label').textContent = `近 ${months} 月 · ${start} ~ ${end}`;
+  }
+
+  $$('#lim-range .btn').forEach(btn => {
+    btn.onclick = async () => {
+      $$('#lim-range .btn').forEach(b => b.classList.remove('on'));
+      btn.classList.add('on');
+      btn.disabled = true;
+      const prev = $('#lim-note').textContent;
+      $('#lim-note').textContent = '统计中…（区间越长越慢）';
+      try { await loadLimitStats(Number(btn.dataset.m)); }
+      catch (e) { toast('涨跌停统计加载失败：' + e.message, 'err', 6000); $('#lim-note').textContent = prev; }
+      finally { btn.disabled = false; }
+    };
+  });
+  try { await loadLimitStats(3); }
+  catch (e) { $('#lim-note').textContent = '涨跌停统计加载失败：' + e.message; }
+
+  // ---------------- 热股榜（3 个站外源，每源前 10） ----------------
+  // 卡片标题、顺序、副标题都由接口给（唯一来源是后端 core/hot.py 的 SOURCES），
+  // 这里只按 key 渲染 —— 页面不写死源的名字，以后加/换源不用动前端。
+  /* 整行点击 = **弹 K 线预览**（2026-10-11 改；原来整行是 `/stock/<代码>` 的新标签链接）。
+     · 这张卡没有绑定任何选股 / 买卖策略 → 一律带 `sel_only=1`
+       （不算策略收益、不摆第 4 张「收益」卡）。
+     · 诊断页入口没丢：预览弹窗右上角自带「在诊断页打开」。
+     · 同一张卡的 10 行一起塞进 `list` → 弹窗里能「下一个」一只只往下看
+       （与关注页自选股列表同一套翻页口径）。 */
+  function hotOpen(el){
+    const row = el.closest('.hot-row[data-k]');
+    if (!row) return;
+    const list = $$('.hot-row[data-k]', row.parentNode)
+      .map(x => ({ ts_code: x.dataset.k, name: x.dataset.n || '' }));
+    const idx = list.findIndex(x => x.ts_code === row.dataset.k);
+    klinePreview({ tsCode: row.dataset.k, name: row.dataset.n || '',
+                   list: list, index: idx, params: { sel_only: '1' } });
+  }
+  /* ⚠ 用**事件委托**挂在 #hot-grid 上，不给每行单独绑：`loadHot` 每次都会重写
+     `#hot-grid` 的 innerHTML（点右上角「刷新」也一样），逐行绑的监听会连同旧 DOM
+     一起丢掉 —— 表现是「第一次能点，刷新一次就点不动了」，而且不报错。 */
+  function bindHotKline(){
+    const grid = $('#hot-grid');
+    grid.addEventListener('click', e => {
+      if (e.target.closest && e.target.closest('.hot-row[data-k]')) hotOpen(e.target);
+    });
+    grid.addEventListener('keydown', e => {          // 键盘可达（原来是 <a>，天然能 Tab）
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      if (!(e.target.closest && e.target.closest('.hot-row[data-k]'))) return;
+      e.preventDefault();
+      hotOpen(e.target);
+    });
+  }
+
+  function hotCard(s){
+    const head = `<div class="card-head"><div class="card-title">${esc(s.title)}`
+               + ` <span class="tag">${esc(s.subtitle)}</span></div></div>`;
+    let body;
+    if (s.error){
+      // 站外接口，挂了是常态 —— 只让这一张卡报错，别影响另外两张
+      body = `<div class="empty">取数失败<div class="small" style="margin-top:6px">${esc(s.error)}</div></div>`;
+    } else if (!s.items.length){
+      body = '<div class="empty">这个源没返回条目</div>';
+    } else {
+      body = s.items.map(it => {
+        // ⚠ `tag` 是热度榜源给的 popularity_tag，值是「2天2板」这类**连板数**，也可能是
+        // 「持续上榜」「N连板」等别的说法 —— 直接原样显示，别在标题里给它套「连板」前缀。
+        const tip = [it.name || it.ts_code, it.ts_code,
+                     '涨跌幅 ' + fmt.pct(it.pct_chg),
+                     it.hot != null ? '热度 ' + fmt.int(it.hot) : '',
+                     it.tag || '', it.note || ''].filter(Boolean).join(' · ');
+        const inner = `<span class="hot-rk">${it.rank}</span>`
+          + `<span class="hot-nm">${esc(it.name || '—')}`
+          + (it.tag ? `<span class="tag y">${esc(it.tag)}</span>` : '')
+          + `<span class="cd">${esc(String(it.ts_code).slice(0, 6))}</span></span>`
+          + `<span class="hot-pc ${fmt.cls(it.pct_chg)}">${fmt.pct(it.pct_chg)}</span>`;
+        // 整行可点 → 弹 K 线预览。没有 ts_code（理论上不会有）就退化成**不可点**的行：
+        // 不给 `data-k`，绑定那边就找不到它，也不会弹出一个空代码的图。
+        return it.ts_code
+          ? `<div class="hot-row" role="button" tabindex="0" data-k="${esc(it.ts_code)}"`
+            + ` data-n="${esc(it.name || '')}"`
+            + ` title="${esc(tip + ' · 点击看 K线预览')}">${inner}</div>`
+          : `<div class="hot-row" title="${esc(tip)}">${inner}</div>`;
+      }).join('');
+    }
+    return `<div class="card">${head}<div class="card-body tight"><div class="hot-list">${body}</div></div></div>`;
+  }
+
+  async function loadHot(force){
+    const btn = $('#hot-refresh');
+    btn.disabled = true;
+    $('#hot-asof').textContent = force ? '重新取数中…' : '加载中…';
+    try {
+      const d = await apiGet('/api/hot' + (force ? '?force=1' : ''));
+      $('#hot-grid').innerHTML = d.sources.map(hotCard).join('');
+      const bad = d.sources.filter(s => s.error).length;
+      $('#hot-asof').textContent = `更新于 ${d.as_of}${d.cached ? '（缓存）' : ''}`
+        + (bad ? `　·　${bad} 个源取数失败` : '');
+    } catch (e) {
+      $('#hot-grid').innerHTML = '<div class="card"><div class="card-body">'
+        + `<div class="empty">热股榜加载失败：${esc(e.message)}</div></div></div>`;
+      $('#hot-asof').textContent = '取数失败，点「刷新」重试';
+    } finally { btn.disabled = false; }
+  }
+
+  // 挂一次就够（事件委托在 #hot-grid 本身，重画列表不影响）；必须在第一次 loadHot 之前挂。
+  bindHotKline();
+  $('#hot-refresh').onclick = guardClick($('#hot-refresh'), () => loadHot(true));
+  await loadHot(false);
+})();
+</script>
+{% endblock %}

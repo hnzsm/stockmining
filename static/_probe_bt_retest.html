@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="dark">
+<title>回测记录重测探针</title>
+</head>
+<body style="background:#0d1117;color:#e6ebf4;font:12px/1.5 Consolas,monospace">
+<pre id="out">（未运行：需要 ?run=1）</pre>
+<iframe id="fr" style="width:1500px;height:2200px;border:0"></iframe>
+<script>
+/* 回测记录「重测」探针。
+   在**同源** iframe 里真开 /backtest，真点一次行内的「重测」，但**把提交拦下来**：
+   iframe 里 `window.apiPost` 是挂在 window 上的属性（static/js/app.js），同源可以直接替换，
+   于是「真点了按钮 + 真走了 handler + 真调了提交接口」，只是那一枪打在探针自己的记录里 ——
+   探针不跑真回测（真跑由 Python 侧另外验，见 tools/verify_bt_retest.py 的第【4】段）。
+
+   断言（只看 DOM、接口与拦到的请求）：
+     ① 每行都有「重测」，顺序是「查看 / 重测 / 删」，按钮挂在对的行上；
+     ② 表格有没有被挤到横向滚动（操作列从 2 个按钮变 3 个）；
+     ③ **把表单改乱再点重测** ⇒ 发出去的 start / init_cash 仍等于**记录里**的值
+        （这条是「重测取记录、不取表单」最直接的证据）；
+     ④ body 的四项（策略 / 区间 / 选股条件快照 / 参数）与源记录逐项一致，名字带「 · 重测」；
+     ⑤ 策略不存在、快照里引用的池已被删这两种情况：前者拒绝、后者去掉 pool_id 照跑。
+
+   硬规矩（踩过的）：iframe.src 必须 JS 赋值；contentDocument 每次现取；不读 iframe 里的内部变量
+   （唯一例外是显式调用 retestBody 造 body —— 那是 DOM 里看不到的东西）。 */
+const qs = new URLSearchParams(location.search);
+const out = document.getElementById('out');
+const say = (k, v) => { out.textContent += k + '=' + v + '\n'; };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const api = (p, o) => fetch(p, o).then(r => r.json());
+const num = v => (v === null || v === undefined || v === '' || isNaN(v)) ? NaN : Number(v);
+async function until(fn, budget, gap) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < budget) {
+    let v = null;
+    try { v = await fn(); } catch (e) { v = null; }
+    if (v) return v;
+    await sleep(gap || 150);
+  }
+  return null;
+}
+
+(async () => {
+  if (qs.get('run') !== '1') return;
+  out.textContent = '';
+  const srcId = Number(qs.get('src') || '110');
+  const checks = [];
+  const ck = (name, ok, extra) => { checks.push({name: name, ok: !!ok, extra: extra || ''}); };
+  const fr = document.getElementById('fr');
+  fr.src = '/backtest';                        // ← JS 赋值，不是写在 HTML 里
+  const doc = () => fr.contentDocument;        // ← 每次现取
+  const rows = () => Array.from(doc().querySelectorAll('#runs-list tbody tr'));
+  const retests = () => Array.from(doc().querySelectorAll('#runs-list [data-retest]'));
+
+  try {
+    ck('记录表渲染出来了', await until(() => rows().length > 0, 60000), '');
+    await sleep(400);
+
+    // ---- ① 按钮本身 ----
+    const r0 = rows(), b0 = retests();
+    ck('每行一个「重测」按钮', b0.length === r0.length && r0.length > 0, b0.length + '/' + r0.length);
+    const lastCell = r0[r0.length - 1].lastElementChild;
+    ck('操作列是「查看 / 重测 / 删」三个（顺序不变）',
+       /查看\s*重测\s*删/.test(lastCell.textContent.replace(/\s+/g, ' ')),
+       lastCell.textContent.replace(/\s+/g, ' ').trim());
+    ck('按钮挂在对的行上（data-retest = 该行 #id）',
+       r0.every(tr => {
+         const b = tr.querySelector('[data-retest]');
+         return b && b.dataset.retest === tr.firstElementChild.textContent.trim();
+       }));
+    ck('「重测」有说明性的 title（不写清会被当成「对比」）',
+       !!b0[0] && (b0[0].title || '').indexOf('原样') >= 0, b0[0] ? b0[0].title : '');
+
+    // ---- ② 表格宽度（操作列 2 个按钮变 3 个，别把最右边的「删」顶出去）----
+    const tbl = doc().querySelector('#runs-list table');
+    const wrap = doc().querySelector('#runs-list');
+    const over = Math.max(0, tbl.scrollWidth - wrap.clientWidth);
+    ck('14 列的表没被挤到横向滚动（最右边的按钮不用拖才点得到）', over <= 0,
+       'scrollW=' + tbl.scrollWidth + ' wrapW=' + wrap.clientWidth + ' 溢出=' + over);
+
+    // ---- ③ 把表单改乱，再点重测：发出去的必须还是**记录里**的值 ----
+    const sd = (await api('/api/backtest/runs/' + srcId)).data;
+    ck('源记录详情拿得到（有快照与参数）', !!sd && !!sd.universe_spec && !!sd.params, '#' + srcId);
+    const d = doc();
+    d.querySelector('#bt-start').value = '2020-01-01';
+    d.querySelector('#bt-cash').value = '1';
+    d.querySelector('#bt-maxpos').value = '1';
+    d.querySelector('#bt-pospct').value = '1';
+    await sleep(520);        // 让草稿防抖写入先发生（不改结论，只是让现场更接近真实使用）
+
+    const calls = [];
+    const errs = [];
+    fr.contentWindow.addEventListener('error', e => errs.push('err:' + e.message));
+    fr.contentWindow.addEventListener('unhandledrejection',
+      e => errs.push('rej:' + ((e.reason && e.reason.message) || e.reason)));
+    /* ⚠ 假的返回要是**解包后**的 data（static/js/app.js 的 apiGet/apiPost 已经把 {ok,data}
+       里的 data 掏出来给调用方了）。写成 {data:{run_id}} 会让 r.run_id 变 undefined ⇒
+       watchRun 去拉 `/api/backtest/runs/undefined` 404 掉，进度条静默不显示（踩过）。 */
+    fr.contentWindow.apiPost = (u, b) => {
+      calls.push({url: u, body: b});
+      return Promise.resolve({run_id: srcId, job_id: 'probe'});
+    };
+    /* ⚠ 提交被拦下后 submitBacktest 会 watchRun(srcId) —— 它会去拉 `/api/backtest/runs/<id>`。
+       无头 Chrome 的虚拟时间会快进 setTimeout，但**不会**快进真实网络往返，靠「等一会儿再看
+       DOM」会误判成「进度条没接上」（第一版就是这么误报的）。所以这里把 iframe 的 apiGet 也
+       只对「记录详情」这一条路径换成即时返回的真记录：paintJob 立刻跑，断言看的是
+       「submitBacktest 到底有没有走 watchRun」这个事实，而不是网络快慢。 */
+    const realGet = fr.contentWindow.apiGet;
+    const fakeRun = Object.assign({}, sd, {status: 'done', progress: 1, writing: false,
+                                           progress_msg: '完成（探针：提交被拦下，没真跑）',
+                                           logs: ['（探针）提交被拦下，没有真跑']});
+    fr.contentWindow.apiGet = u => /^\/api\/backtest\/runs\/\d+$/.test(String(u))
+      ? Promise.resolve(fakeRun) : realGet(u);
+    const btn = d.querySelector('#runs-list [data-retest="' + srcId + '"]');
+    ck('找得到源记录的「重测」按钮', !!btn, '#' + srcId);
+    if (!btn) throw new Error('没有源记录按钮，后面没法点');
+    btn.click();
+
+    const got = await until(() => calls.length > 0, 15000, 120);
+    ck('点下去真发出了提交请求', !!got, calls.length ? (calls.length + ' 次') : '（15s 内没有）');
+    const call = calls[0] || {url: '', body: {}};
+    const b = call.body || {};
+    ck('打到的是 POST /api/backtest/start（唯一提交入口）',
+       String(call.url).indexOf('/api/backtest/start') >= 0, call.url);
+
+    // ---- ④ body 逐项等于源记录 ----
+    ck('区间取记录的、不是表单里被改乱的（表单写 2020-01-01）',
+       String(b.start).slice(0, 10) === String(sd.start_date).slice(0, 10) &&
+       String(b.end).slice(0, 10) === String(sd.end_date).slice(0, 10),
+       b.start + ' ~ ' + b.end + '（记录 ' + String(sd.start_date).slice(0, 10) + '）');
+    ck('资金 / 持仓取记录的、不是表单里被改乱的（表单写 1）',
+       num(b.params && b.params.init_cash) === num(sd.params.init_cash) &&
+       num(b.params && b.params.max_positions) === num(sd.params.max_positions) &&
+       num(b.params && b.params.position_pct) === num(sd.params.position_pct),
+       'cash=' + (b.params && b.params.init_cash) + ' maxpos=' + (b.params && b.params.max_positions));
+    ck('买卖策略 = 记录里的 strategy_id',
+       Number(b.strategy_id) === Number(sd.strategy_id), b.strategy_id + ' vs ' + sd.strategy_id);
+    ck('费率 / 滑点 = 记录里的值',
+       num(b.params.commission) === num(sd.params.commission) &&
+       num(b.params.stamp_tax) === num(sd.params.stamp_tax) &&
+       num(b.params.slippage) === num(sd.params.slippage),
+       '佣金=' + b.params.commission + ' 印花=' + b.params.stamp_tax + ' 滑点=' + b.params.slippage);
+
+    const su = sd.universe_spec || {}, bu = b.universe || {};
+    if (su.kind === 'cond') {
+      ck('选股条件用**当时那份快照**（base / where 一致，不跟池子的现状走）',
+         bu.base === su.base && JSON.stringify(bu.where) === JSON.stringify(su.where),
+         'where ' + (bu.where || []).length + ' 条 · base ' + bu.base);
+      ck('引用还在的池 → 快照里保留 pool_id（记录看得出引用了谁）',
+         !su.pool_id || Number(bu.pool_id) === Number(su.pool_id),
+         'pool_id=' + bu.pool_id + '（记录 ' + su.pool_id + '）');
+    } else {
+      ck('静态池 → universe 直接是池代码', bu === su.base, JSON.stringify(bu));
+    }
+    ck('名字带「 · 重测」后缀', / · 重测$/.test(b.name || ''), b.name || '');
+    /* 进度条：submitBacktest 最后一步是 watchRun（下一次轮询才把 #bt-job 打开）——
+       所以这里要**等**它，不能点完立刻看（第一版就是这么误报的）。 */
+    const watching = await until(() => (doc().querySelector('#bt-job') || {}).style.display !== 'none',
+                                 10000, 150);
+    ck('提交后页面把进度条接上了（submitBacktest 走了 watchRun）', !!watching,
+       (doc().querySelector('#bt-msg') || {}).textContent.trim().slice(0, 40));
+    ck('点这一下没在 iframe 里留下未捕获异常', errs.length === 0, errs.slice(0, 2).join(' | '));
+
+    // ---- ⑤ 两种「不该硬跑」的情况 ----
+    const w = fr.contentWindow;
+    let missed = null;
+    try { missed = w.retestBody({strategy_id: 999999, universe_spec: su, params: sd.params,
+                                 start_date: sd.start_date, end_date: sd.end_date, name: 'x'}); }
+    catch (e) { missed = 'throw'; }
+    ck('买卖策略已不存在 → 拒绝（返回 null，不硬跑一个不存在的策略）', missed === null,
+       'retestBody=' + JSON.stringify(missed));
+
+    const ghost = {base: 'all', where: ['close > 0'], pool_id: 999999,
+                   filt: {}, kind: 'cond', label: 'x'};
+    const gb = w.retestBody({strategy_id: sd.strategy_id, universe_spec: ghost, params: sd.params,
+                             start_date: sd.start_date, end_date: sd.end_date, name: 'y'});
+    ck('快照引用的池已被删 → 去掉 pool_id、按快照条件照跑（不是报错也不是退回全市场）',
+       !!gb && gb.universe && gb.universe.pool_id === undefined &&
+       (gb.universe.where || []).length === 1 && gb.universe.base === 'all',
+       gb ? JSON.stringify(gb.universe) : 'null');
+  } catch (e) {
+    ck('探针异常', false, (e && e.message) || String(e));
+  } finally {
+    say('JSON', JSON.stringify({done: true, checks: checks}));
+  }
+})();
+</script>
+</body>
+</html>

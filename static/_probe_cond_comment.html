@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>条件注释探针（# 不算条件）</title>
+<style>
+  body{margin:0;background:#0d1117;color:#e6ebf4;font:13px/1.6 Consolas,monospace}
+  #out{white-space:pre-wrap;padding:12px;margin:0}
+  iframe{position:fixed;left:-99999px;top:0;width:1440px;height:1100px;border:0}
+</style>
+</head>
+<body>
+<pre id="out">未运行 —— 本页是自检探针，加 ?run=1 才开始（只读 DOM、只在页面上点一次「看当日命中」的**空条件**分支，不发任何试跑请求）。</pre>
+<script>
+/* ============================================================================
+   条件注释探针：`#` 之后（含 #）都算注释，**注释不是条件**。
+
+   为什么需要浏览器实测：这条口径前端也有一份（`window.condText`，见 app.js），
+   它只在「到底有没有真条件」这类判断上用（试跑前的空条件提示）。静态读代码看不出
+   「只写注释时按钮到底拦不拦、拦的文案对不对」，也看不出注释原文会不会被顺手删掉。
+
+   做法：
+     · 把 /pools 塞进**同源 iframe**（src 必须用 JS 设，否则 load 监听挂不上）；
+     · 等 app.js 的 `condText` 就位，逐条对口径：strip / active / count；
+     · 把 `#ed-conds` 全填成注释 → `activeConds()` 必须是 0 → 点「看当日命中」
+       必须只弹提示、不发请求（#test-result 保持空、#test-hint 不变成「试跑中…」）；
+     · 再填成 `total_mv < 500000  # 小市值` → `activeConds()` 是 1，而 `conds()`
+       仍返回**带注释的原文**（提交时不能把用户写的批注吃掉）。
+   结果 JSON 写进 <pre id="out">，由 tools/verify_cond_comment.py 解析。
+   ============================================================================ */
+(function () {
+  var params = new URLSearchParams(location.search);
+  var out = document.getElementById('out');
+  if (params.get('run') !== '1') return;      // 门禁：防用户误打开
+
+  var CHECKS = [];
+  function ok(name, cond, extra) {
+    CHECKS.push({ name: name, ok: !!cond, extra: extra == null ? '' : String(extra) });
+    out.textContent = JSON.stringify({ done: false, checks: CHECKS }, null, 1);
+  }
+
+  function waitFor(fn, limitMs, stepMs) {
+    return new Promise(function (resolve, reject) {
+      var t0 = Date.now();
+      (function tick() {
+        var v;
+        try { v = fn(); } catch (e) { v = null; }
+        if (v) return resolve(v);
+        if (Date.now() - t0 > limitMs) return reject(new Error('等待超时'));
+        setTimeout(tick, stepMs || 150);
+      })();
+    });
+  }
+
+  function loadPage(url) {
+    return new Promise(function (resolve) {
+      var f = document.createElement('iframe');
+      f.width = 1440; f.height = 1100;
+      f.addEventListener('load', function () { resolve(f); });
+      f.src = url;                        // 必须先挂 load 监听再赋 src
+      document.body.appendChild(f);
+    });
+  }
+
+  function setConds(D, W, val) {
+    var ta = D.querySelector('#ed-conds');
+    ta.value = val;
+    ta.dispatchEvent(new W.Event('input', { bubbles: true }));
+    return ta;
+  }
+
+  (async function () {
+    try {
+      var f = await loadPage('/pools');
+      var W = f.contentWindow, D = f.contentDocument;
+
+      // app.js 的 condText 就绪（接口清单是异步的，这里只等这个同步小工具）
+      await waitFor(function () { return (W.condText && W.activeConds) ? 1 : null; }, 20000);
+      var CT = W.condText;
+
+      ok('页面真的有 condText 这个口径（app.js 加载了）', !!(CT && CT.strip && CT.active && CT.count));
+      ok('行内注释被剥掉（口径同后端 strip_comment）',
+         CT.strip('total_mv > 300000  # 市值大于30亿') === 'total_mv > 300000',
+         JSON.stringify(CT.strip('total_mv > 300000  # 市值大于30亿')));
+      ok('行首 # ⇒ 整行是注释（active=false）', CT.active('# 以下是小市值筛选') === false);
+      ok('全角 ＃ 也认（中文输入法全角标点打出来的是它）',
+         CT.strip('total_mv > 300000　＃ 市值大于30亿') === 'total_mv > 300000'
+         && CT.active('＃ 只有注释') === false,
+         JSON.stringify(CT.strip('total_mv > 300000　＃ 市值大于30亿')));
+      ok('注释只吃到行尾、不连坐下一行',
+         CT.count('# 说明：下面这条是周线确认\nw_close > w_boll_mid\n') === 1,
+         'count=' + CT.count('# 说明：下面这条是周线确认\nw_close > w_boll_mid\n'));
+      ok('空行不算条件', CT.count('close > 0\n\n\nopen > 0') === 2);
+
+      // ---- 只写注释：前端必须拦住，且不发试跑请求
+      setConds(D, W, '# 只是注释，还没写条件\n# 第二行注释');
+      ok('只写注释时 activeConds() 是 0', W.activeConds().length === 0,
+         'activeConds=' + W.activeConds().length);
+      ok('conds()（提交用）仍保留注释原文（不悄悄删用户的批注）',
+         W.conds().length === 2 && W.conds()[0].indexOf('#') === 0,
+         JSON.stringify(W.conds()));
+
+      D.querySelector('#btn-test').click();
+      var toasted = await waitFor(function () {
+        var t = D.querySelector('#toast-wrap .toast');
+        return (t && t.textContent.indexOf('先写一条入池条件') >= 0) ? t : null;
+      }, 5000).catch(function () { return null; });
+      ok('空条件时点「看当日命中」只弹提示、不发请求', !!toasted,
+         toasted ? toasted.textContent : '没等到提示');
+      ok('被拦下时结果区没被写成「试跑中…」',
+         (D.querySelector('#test-hint').textContent || '').indexOf('试跑中') < 0,
+         'hint=' + (D.querySelector('#test-hint').textContent || '(空)'));
+
+      // ---- 行内注释：算一条真条件
+      setConds(D, W, 'total_mv < 500000  # 小市值\n# 下面这条是换手\n');
+      ok('带行内注释的条件算 1 条真条件', W.activeConds().length === 1,
+         'activeConds=' + JSON.stringify(W.activeConds()));
+      ok('提交时原样带上注释（后端负责剥，前端只管存原文）',
+         W.conds().length === 2 && W.conds()[0].indexOf('# 小市值') > 0,
+         JSON.stringify(W.conds()));
+
+      ok('探针执行完成', true);
+    } catch (e) {
+      ok('探针执行完成', false, (e && e.message) || String(e));
+    }
+    out.textContent = JSON.stringify({ done: true, checks: CHECKS }, null, 1);
+  })();
+})();
+</script>
+</body>
+</html>

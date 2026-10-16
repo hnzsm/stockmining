@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="dark">
+<title>回测交易明细分页探针</title>
+</head>
+<body style="background:#0d1117;color:#e6ebf4;font:12px/1.5 Consolas,monospace">
+<pre id="out">（未运行：需要 ?run=1）</pre>
+<iframe id="fr" style="width:1400px;height:1800px;border:0"></iframe>
+<script>
+/* 回测页「交易明细分页」探针。
+   在**同源** iframe 里真开 /backtest?run_id=N，只从 DOM 读事实：
+   行数 / 分页条文案 / 首末行的买入日 / 表头排序状态；并真点「下一页」「末页」「买入日」。
+
+   硬规矩（踩过的）：iframe.src 必须 JS 赋值；contentDocument 每次现取（别存变量）；
+   不用 scrollIntoView（无头里会挂起）；断言只看 DOM，不碰 iframe 里的内部变量。 */
+const out = document.getElementById('out');
+const say = (k, v) => { out.textContent += k + '=' + v + '\n'; };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const qs = new URLSearchParams(location.search);
+
+async function until(fn, budget, gap) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < budget) {
+    try { if (fn()) return true; } catch (e) { /* iframe 还没就绪 */ }
+    await sleep(gap || 120);
+  }
+  return false;
+}
+
+(async () => {
+  if (qs.get('run') !== '1') return;
+  out.textContent = '';
+  const runId = qs.get('run_id') || '39';
+  const fr = document.getElementById('fr');
+  fr.src = '/backtest?run_id=' + runId;             // ← JS 赋值，不是写在 HTML 里
+  const doc = () => fr.contentDocument;             // ← 每次现取
+  const rows = () => Array.from(doc().querySelectorAll('#trades-list tbody tr'));
+  const txt = sel => { const e = doc().querySelector(sel); return e ? e.textContent.trim() : ''; };
+  const buyDates = () => rows().map(tr => tr.children[2].textContent.trim());
+  const pager = () => {
+    const e = doc().querySelector('#trades-list .pager');
+    return e ? e.textContent.replace(/\s+/g, ' ').trim() : '';
+  };
+  const curPage = () => (txt('#trades-list .pager-cur') || '').trim();
+  const clickBtn = label => {
+    const b = Array.from(doc().querySelectorAll('#trades-list [data-page]'))
+      .find(x => x.textContent.indexOf(label) >= 0);
+    if (!b) return false;
+    b.click();
+    return true;
+  };
+
+  if (!await until(() => rows().length > 0, 45000)) {
+    say('ERR', '交易明细未渲染（45s）'); return;
+  }
+  await sleep(300);
+
+  // ---- ① 默认：第一页 ----
+  say('rows', rows().length);
+  say('pages', curPage());
+  say('pager', pager());
+  say('tag', txt('#trade-tag'));
+  const d1 = buyDates();
+  say('first_buy', d1[0]);
+  say('last_buy', d1[d1.length - 1]);
+  say('desc_default', d1.every((v, i) => i === 0 || d1[i - 1] >= v));
+  say('sort_cls', (doc().querySelector('th[data-sort="buy_date"]') || {}).className || '');
+
+  // ---- ② 点「下一页」：首行必须变、页码 +1 ----
+  const before = d1[0];
+  say('clicked_next', clickBtn('下一页'));
+  await until(() => buyDates()[0] !== before, 6000, 100);
+  say('page_after_next', curPage());
+  say('first_buy_page2', buyDates()[0]);
+  say('rows_page2', rows().length);
+
+  // ---- ③ 点「末页」：行数 = 尾页余数，且页码到最后一页 ----
+  const pagesTotal = Number((curPage().split('/')[1] || '1').trim());
+  say('clicked_last', clickBtn('末页'));
+  await until(() => curPage() === pagesTotal + ' / ' + pagesTotal, 6000, 100);
+  say('page_at_last', curPage());
+  say('rows_last_page', rows().length);
+  say('first_buy_last_page', buyDates()[0]);
+
+  // ---- ④ 点表头「买入日」：切升序（首行应变成最早那笔）+ 回第一页 ----
+  const th = doc().querySelector('th[data-sort="buy_date"]');
+  if (th) th.click();
+  await until(() => curPage() === '1 / ' + pagesTotal, 6000, 100);
+  await sleep(200);
+  say('page_after_resort', curPage());
+  say('first_buy_asc', buyDates()[0]);
+  say('sort_cls_asc', (doc().querySelector('th[data-sort="buy_date"]') || {}).className || '');
+
+  // ---- ⑤ 筛选「仅盈利」：分页应回第一页，且笔数变少 ----
+  const sel = doc().querySelector('#trade-filter');
+  if (sel) {
+    sel.value = 'win';
+    sel.dispatchEvent(new Event('change'));
+    await until(() => (txt('#trade-tag') || '').indexOf('笔') > 0
+                      && curPage().split('/')[1].trim() !== String(pagesTotal), 8000, 150);
+    say('page_after_filter', curPage());
+    say('tag_filtered', txt('#trade-tag'));
+  }
+  say('DONE', '1');
+})();
+</script>
+</body>
+</html>

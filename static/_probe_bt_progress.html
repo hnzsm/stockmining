@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>回测页探针：进度条接回 + 记录列表进度/配置列</title>
+<style>
+  html,body{margin:0;background:#0d1117;color:#e6ebf4;font:13px/1.6 system-ui,sans-serif}
+  iframe{display:block;width:1500px;height:1200px;border:0}
+  pre{margin:0;padding:10px;white-space:pre-wrap}
+</style></head>
+<body>
+<pre id="out">waiting</pre>
+<iframe id="fr" title="probe"></iframe>
+<script>
+/* 回测页探针（只读事实 + 合成事件验悬浮，不做任何像素断言）
+   用法：/static/_probe_bt_progress.html?run=1        —— 已开跑时验证「刷新后进度条还在」
+        /static/_probe_bt_progress.html?run=1&cfg=1  —— 只验「回测配置」列的截断与悬浮
+   产出：<pre id="out"> 里逐行 key=value，由 probe_bt_progress.py 抠出来打印。
+   另含「股票池」列的选股条件悬浮（pool_tip_* / pool_pop_*）—— 断言的是**契约**
+   （tip 非空、含「基础池：」、浮层文本就是 tip），不是某条池子的具体条件（那是会变的数据）。 */
+const Q = new URLSearchParams(location.search);
+const out = [];
+const log = (k, v) => out.push(k + '=' + v);
+const fr = document.getElementById('fr');
+const doc = () => fr.contentDocument;          // ⚠ 每次都现取，iframe 导航后会换 document
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function rows() { return Array.from(doc().querySelectorAll('#runs-list tbody tr')); }
+
+async function waitFor(fn, tries, step) {
+  for (let i = 0; i < tries; i++) { try { if (fn()) return true; } catch (e) {} await sleep(step); }
+  return false;
+}
+
+(async function main() {
+  if (Q.get('run') !== '1') { document.getElementById('out').textContent = 'need ?run=1'; return; }
+  // ⚠ src 必须 JS 赋值：直接写属性在部分无头版本里不会触发同源脚本可读
+  fr.src = '/backtest';
+  const ok = await waitFor(() => rows().length > 0, 80, 500);
+  log('iframe_url', doc().location.pathname);
+  log('runs_rendered', ok);
+  if (!ok) { document.getElementById('out').textContent = out.join('\n'); return; }
+
+  const ths = Array.from(doc().querySelectorAll('#runs-list thead th')).map(t => t.textContent.trim());
+  log('table_cols', ths.join('|'));
+  log('has_cfg_col', ths.indexOf('回测配置') >= 0);
+
+  /* ---- ① 进度条：页面是「刷新后重新打开」的，进度条该自己接回来 ---- */
+  const panel = doc().querySelector('#bt-job');
+  const visible = panel && getComputedStyle(panel).display !== 'none';
+  log('job_panel_visible', visible);
+  log('job_pct', visible ? doc().querySelector('#bt-pct').textContent : '');
+  log('job_msg', visible ? doc().querySelector('#bt-msg').textContent : '');
+  log('job_bar_width', visible ? doc().querySelector('#bt-bar').style.width : '');
+  log('job_log_lines', visible ? doc().querySelector('#bt-log').textContent.split('\n').length : 0);
+
+  /* ---- ② 记录列表里 running 那一行的进度百分比 ---- */
+  const runRow = rows().find(tr => /running/.test(tr.textContent));
+  log('running_row_found', !!runRow);
+  if (runRow) {
+    // 列序：# 策略 股票池 区间 总收益 年化 基准 超额 最大回撤 胜率 交易 回测配置 状态 操作
+    // 所以从右往左数：操作是最后一个、状态倒数第二、回测配置倒数第三（别写死正数下标）
+    const tds = runRow.querySelectorAll('td');
+    log('running_row_status_text', tds[tds.length - 2].textContent.replace(/\s+/g, ' ').trim());
+    log('running_row_cfg_chars', (tds[tds.length - 3].textContent || '').trim().length);
+  }
+
+  /* ---- ③ 表格有没有被卡片右沿裁掉（.card 是 overflow:hidden，超宽=按钮点不到）---- */
+  const tbl = doc().querySelector('#runs-list table');
+  const wrap = doc().querySelector('#runs-list');
+  const card = wrap.closest('.card');
+  log('table_w', tbl.scrollWidth + '/视口 ' + wrap.clientWidth);
+  log('table_clipped', tbl.scrollWidth > wrap.clientWidth);
+  /* 真·余量：表格是 width:auto，会**缩到容器宽**（所以 scrollWidth==clientWidth 只说明
+     「没溢出」，看不出还剩多少）。全部单元格都是 nowrap ⇒ 把表设成 max-content 量到的
+     就是它「最窄能到多少」，差值才是还能塞下多少东西（跑起来的状态格要多 27px）。 */
+  const keepW = tbl.style.width;
+  tbl.style.width = 'max-content';
+  const need = tbl.scrollWidth;
+  tbl.style.width = keepW;
+  log('table_min_w', need);
+  log('table_slack_px', wrap.clientWidth - need);
+  // 每列多宽 —— 要「瘦表」时按它砍，别猜
+  log('col_w', Array.from(tbl.querySelectorAll('thead th'))
+    .map((h, i) => i + ':' + h.textContent.trim() + '=' + Math.round(h.getBoundingClientRect().width)).join(' '));
+  const act = doc().querySelector('#runs-list [data-view]');
+  if (act) {
+    const r = act.getBoundingClientRect(), cr = card.getBoundingClientRect();
+    log('action_col_visible',
+        (r.left >= cr.left && r.right <= cr.right)
+        + ' (按钮右沿 ' + Math.round(r.right) + ' vs 卡片右沿 ' + Math.round(cr.right) + ')');
+  }
+
+  /* ---- ④ 「回测配置」列：截断 + 悬浮看全（合成事件，别指望真鼠标） ---- */
+  const cell = doc().querySelector('#runs-list .json-cell');
+  log('cfg_cell_found', !!cell);
+  if (cell) {
+    log('cfg_cell_text_chars', cell.textContent.length);
+    log('cfg_full_chars', (cell.dataset.cfg || '').length);
+    // 真截断 = 内容宽度溢出容器（CSS ellipsis 在生效）
+    log('cfg_cell_overflow',
+        (cell.scrollWidth > cell.clientWidth) + ' (' + cell.scrollWidth + '>' + cell.clientWidth + ')');
+    const fire = (el, type) => el.dispatchEvent(new MouseEvent(type, { bubbles: true }));
+    fire(cell, 'mouseover');
+    await sleep(60);
+    const pop = doc().querySelector('.json-pop');
+    const pv = pop && getComputedStyle(pop).display !== 'none';
+    log('popover_visible', pv);
+    log('popover_lines', pv ? pop.textContent.split('\n').length : 0);
+    log('popover_has_init_cash', pv ? pop.textContent.indexOf('init_cash') >= 0 : false);
+    log('popover_has_max_positions', pv ? pop.textContent.indexOf('max_positions') >= 0 : false);
+    log('popover_position_fixed', pv ? getComputedStyle(pop).position : '');
+    // ⚠ 浮层的 rect 是**iframe 视口**内的坐标 → 必须拿 iframe 的 innerHeight 比，
+    //   拿外层窗口的 innerHeight 比是两套坐标系混用（会得出恒 false 的假红）
+    const vw = doc().defaultView, rr = pv ? pop.getBoundingClientRect() : null;
+    log('popover_inside_viewport',
+        rr ? (rr.top >= 0 && rr.bottom <= vw.innerHeight && rr.left >= 0 && rr.right <= vw.innerWidth)
+        + ' rect=' + [rr.top, rr.bottom, rr.left, rr.right].map(Math.round).join(',')
+        + ' vp=' + vw.innerWidth + 'x' + vw.innerHeight : false);
+    log('popover_text_clipped', pv ? pop.scrollWidth > pop.clientWidth : '');
+    log('popover_text_clipped_note',
+        pv ? 'scrollW ' + pop.scrollWidth + ' vs clientW ' + pop.clientWidth : '');
+    fire(cell, 'mouseout');
+    await sleep(60);
+    log('popover_hidden_after_mouseout',
+        pop ? getComputedStyle(pop).display === 'none' : 'no-pop');
+  }
+
+  /* ---- ⑤ 「股票池」列：悬浮看**当时**的选股条件（2026-09-20）----
+     断的是契约：池格带 data-tip、文本里有「基础池：」、浮层显示的就是它原文、且不出视口。
+     ⚠ 不断言具体条件表达式 —— 那是用户随时会改的数据，不是契约。 */
+  const pcell = doc().querySelector('#runs-list .pool-name');
+  log('pool_cell_found', !!pcell);
+  if (pcell) {
+    const tip = pcell.dataset.tip || '';
+    log('pool_cell_classes', pcell.className);
+    log('pool_cell_text', pcell.textContent.trim());
+    log('pool_tip_chars', tip.length);
+    log('pool_tip_has_base', tip.indexOf('基础池：') >= 0);
+    log('pool_tip_has_cond', tip.indexOf('入池条件') >= 0);
+    log('pool_tip_is_derived', tip.indexOf('反查') >= 0);
+    const fire2 = (el, type) => el.dispatchEvent(new MouseEvent(type, { bubbles: true }));
+    fire2(pcell, 'mouseover');
+    await sleep(60);
+    const pop2 = doc().querySelector('.json-pop');
+    const pv2 = pop2 && getComputedStyle(pop2).display !== 'none';
+    log('pool_pop_visible', pv2);
+    log('pool_pop_matches_tip', pv2 ? pop2.textContent === tip : false);
+    log('pool_pop_lines', pv2 ? pop2.textContent.split('\n').length : 0);
+    const vw2 = doc().defaultView, rr2 = pv2 ? pop2.getBoundingClientRect() : null;
+    log('pool_pop_inside_viewport',
+        rr2 ? (rr2.top >= 0 && rr2.bottom <= vw2.innerHeight && rr2.left >= 0 && rr2.right <= vw2.innerWidth)
+        + ' rect=' + [rr2.top, rr2.bottom, rr2.left, rr2.right].map(Math.round).join(',')
+        + ' vp=' + vw2.innerWidth + 'x' + vw2.innerHeight : false);
+    // 池名被 CSS 截断（列宽有上界）—— 这才是"必须悬浮"的原因
+    log('pool_cell_overflow',
+        (pcell.scrollWidth > pcell.clientWidth) + ' (' + pcell.scrollWidth + '>' + pcell.clientWidth + ')');
+    fire2(pcell, 'mouseout');
+    await sleep(60);
+    log('pool_pop_hidden_after_mouseout',
+        pop2 ? getComputedStyle(pop2).display === 'none' : 'no-pop');
+  }
+
+  document.getElementById('out').textContent = out.join('\n');
+})().catch(e => { document.getElementById('out').textContent = out.join('\n') + '\nERR=' + e.message; });</script>
+</body></html>

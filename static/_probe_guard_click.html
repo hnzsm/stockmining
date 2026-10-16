@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>guardClick 探针</title></head>
+<body>
+<pre id="out">running</pre>
+<iframe id="fr" src="/backtest" style="width:1440px;height:1000px;border:0"></iframe>
+<script>
+/* 「按钮防连点」探针。
+   在同源 iframe 里真开 /backtest，借它自己的 window.guardClick 做两件事：
+     ① 单元验证三道保护（在飞忽略 / 600ms 窗口 / 置灰反馈 / finally 解锁）
+     ② 真点「开始回测」「重测」各两次 —— 但把 apiPost 换掉，只**数**发出去几个请求，
+        不产生任何回测记录（前后对比记录条数来证明）。
+   ⚠ 虚拟时间会快进 setTimeout 但**不快进真实网络往返** → 轮询等待除了看时间还要加迭代上限，
+      否则第一段会在网络没回来时空转。
+   ⚠ 假 apiPost 必须返回**解包后**的 data（页面里的 apiPost 已经解过一层），
+      多包一层会让 watchRun 拿到 undefined。 */
+(function () {
+  var checks = [], finished = false;
+  function ck(name, ok, extra) {
+    checks.push({ name: name, ok: !!ok, extra: extra === null || extra === undefined ? '' : String(extra) });
+  }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function until(fn, ms, step) {
+    return new Promise(function (res) {
+      var t0 = Date.now(), n = 0, cap = Math.ceil(ms / (step || 100)) + 30;
+      (function poll() {
+        var v = null;
+        try { v = fn(); } catch (e) { v = null; }
+        if (v) return res(v);
+        if (++n > cap || Date.now() - t0 > ms) return res(null);
+        setTimeout(poll, step || 100);
+      })();
+    });
+  }
+  function out() {
+    document.getElementById('out').textContent =
+      JSON.stringify({ done: finished, checks: checks });
+  }
+  function click(el) {
+    /* ⚠ 用 dispatchEvent 而不是 el.click()：`click()` 在 disabled 元素上**不派发**事件，
+       那样测到的只是「灰了」，测不到「灰之前那层在飞锁」。dispatchEvent 会照发。 */
+    el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+  }
+
+  var fr = document.getElementById('fr');
+  function W() { return fr.contentWindow; }
+  function D() { return fr.contentDocument; }
+  function got(p) { return fetch(p).then(function (r) { return r.json(); }).then(function (j) { return j.data; }); }
+
+  /* ---------------- ① 单元：三道保护 ---------------- */
+  async function unitTests() {
+    var realNow = W().Date.now;
+    var VC = 100000;                              // 自己掌控的时钟，免得靠真实等待
+    W().Date.now = function () { return VC; };
+
+    var btn = document.createElement('button');
+    document.body.appendChild(btn);
+    var calls = 0, resolvers = [];
+    btn.onclick = W().guardClick(btn, function () {
+      calls++;
+      return new Promise(function (r) { resolvers.push(r); });   // 手动决定「请求何时返回」
+    });
+
+    click(btn);
+    var greyed = btn.disabled === true;
+    click(btn);                                   // 同一时刻再点
+    VC += 50; click(btn);                         // 50ms 后再点（第一次还没返回）
+    ck('① 请求在飞：连点 3 次只跑 1 次', calls === 1, 'calls=' + calls);
+    ck('③ 锁住期间按钮置灰（不只靠后台拦）', greyed, 'disabled=' + greyed);
+
+    resolvers.shift()();                          // 第一次「请求」返回
+    await sleep(0);
+    var back = btn.disabled === false;
+    VC += 50; click(btn);                         // 返回后 50ms 再点 → 该被 600ms 窗口挡住
+    ck('解锁后按钮恢复可用', back, 'disabled=' + btn.disabled);
+    ck('② 距上次点击 <600ms 的重复点击被忽略', calls === 1, 'calls=' + calls);
+
+    VC += 900; click(btn);                        // 越过锁定窗口
+    ck('超过锁定窗口后可以再点（不是永久锁死）', calls === 2, 'calls=' + calls);
+    resolvers.shift()();
+    await sleep(0);
+
+    var btn2 = document.createElement('button');
+    document.body.appendChild(btn2);
+    var errs = 0;
+    btn2.onclick = W().guardClick(btn2, function () { errs++; throw new Error('boom'); });
+    VC += 5000; click(btn2);
+    await sleep(0);
+    ck('handler 抛错后按钮没被永久锁死（finally 解锁）', btn2.disabled === false,
+       'disabled=' + btn2.disabled);
+    VC += 5000; click(btn2);
+    ck('抛错解锁后确实还能再点', errs === 2, 'errs=' + errs);
+
+    W().Date.now = realNow;                       // 别把页面的时钟一直改着
+    btn.remove(); btn2.remove();
+  }
+
+  /* ---------------- ② 页面：真点两次「开始回测 / 重测」 ---------------- */
+  async function pageTests() {
+    var ready = await until(function () {
+      return W().guardClick && D() && D().querySelector('#bt-strategy') &&
+             D().querySelector('#bt-strategy').options.length > 0 &&
+             D().querySelector('#runs-list [data-retest]');
+    }, 40000, 200);
+    ck('页面初始化完成（guardClick 可用 · 策略与记录列表就绪）', !!ready, ready ? '' : '超时');
+    if (!ready) return;
+
+    // 拿一条**已完成**的记录当「提交后要轮询的那条」，watchRun 才能很快收敛
+    var ids = Array.prototype.slice.call(
+      D().querySelectorAll('#runs-list [data-view]'), 0, 6).map(function (b) { return Number(b.dataset.view); });
+    var runId = null;
+    for (var i = 0; i < ids.length; i++) {
+      var j = await got('/api/backtest/runs/' + ids[i]);
+      if (j && j.status === 'done') { runId = ids[i]; break; }
+    }
+    ck('拿得到一条已完成记录来承接轮询', !!runId, 'run_id=' + runId);
+    if (!runId) return;
+
+    var before = await got('/api/backtest/runs?limit=200');
+    var nBefore = (before || []).length;
+
+    var posts = [];
+    W().apiPost = function (u, b) {                 // 拦下提交：只数不清
+      posts.push({ url: String(u), body: b });
+      return Promise.resolve({ run_id: Number(runId) });
+    };
+
+    // 买卖策略得选上，否则 formBody() 直接返回 null，压根走不到提交
+    var sel = D().querySelector('#bt-strategy');
+    if (!sel.value) sel.value = sel.options[0].value;
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+
+    // ---- 开始回测：连点两次 ----
+    var run = D().querySelector('#btn-run');
+    click(run);
+    var grey1 = run.disabled === true;
+    click(run);
+    ck('「开始回测」连点两次只提交 1 次', posts.length === 1 && posts[0].url === '/api/backtest/start',
+       'posts=' + posts.length + ' ' + JSON.stringify(posts[0] && posts[0].url));
+    ck('「开始回测」提交期间置灰', grey1, 'disabled=' + grey1);
+    await until(function () { return run.disabled === false; }, 10000, 100);
+    ck('提交返回后「开始回测」恢复可用', run.disabled === false, 'disabled=' + run.disabled);
+    ck('提交体是回测启动请求且带策略', !!(posts[0] && posts[0].body && posts[0].body.strategy_id),
+       'body=' + JSON.stringify(posts[0] && posts[0].body).slice(0, 90));
+
+    // 等 watchRun 收敛（它会 loadRuns 重画列表）—— 免得跟下面「重测」抢同一批按钮
+    await until(function () { return W().eval('runTimer') === null; }, 30000, 200);
+    await sleep(400);
+
+    // ---- 重测：连点两次 ----
+    posts.length = 0;
+    var rt = D().querySelector('[data-retest]');
+    ck('记录行上有「重测」按钮', !!rt, rt ? ('id=' + rt.dataset.retest) : '没找到');
+    if (!rt) return;
+    click(rt);
+    var grey2 = rt.disabled === true;
+    click(rt);
+    ck('「重测」提交期间置灰（它前面还有一次 GET，也算在飞）', grey2, 'disabled=' + grey2);
+    await until(function () { return posts.length >= 1; }, 12000, 100);
+    /* ⚠ 这一条必须等「真发出去了」之后再数：retestRun 前面还有一次 GET，同步地数会数到 0
+       （第一版就是这么假红的）。再留一点时间，让「本该发出的第二个」有机会也发出来。 */
+    await sleep(300);
+    ck('「重测」连点两次只提交 1 次', posts.length === 1 && posts[0].url === '/api/backtest/start',
+       'posts=' + posts.length);
+    ck('重测发出去的是「原记录 + · 重测」那一份',
+       !!(posts[0] && / · 重测$/.test((posts[0].body || {}).name || '')),
+       (posts[0] && posts[0].body && posts[0].body.name) || '（没发出去）');
+
+    var after = await got('/api/backtest/runs?limit=200');
+    ck('探针没往库里写记录（提交被拦住了）', (after || []).length === nBefore,
+       nBefore + ' -> ' + (after || []).length);
+  }
+
+  (async function main() {
+    try {
+      /* ⚠ 不要用 fr.onload / readyState 判「页面加载完」：iframe 刚插进 DOM 时它里面是
+         about:blank，readyState 已经是 complete，onload 也可能已经 fire 过了 —— 那样会
+         在 /backtest 还没加载时就往下跑，拿到的是 about:blank 的 window（没有 guardClick）。
+         直接等「目标能力出现」最稳。 */
+      var up = await until(function () { return W() && W().guardClick; }, 40000, 150);
+      ck('同源 iframe 里 app.js 已加载（guardClick 可用）', !!up, up ? '' : '超时');
+      if (!up) throw new Error('guardClick 没等到');
+      await unitTests();
+      await pageTests();
+    } catch (e) {
+      ck('探针整体跑完（没中途抛异常）', false, (e && e.message) || String(e));
+    }
+    finished = true;
+    out();
+  })();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>选股策略「列表项删除按钮」探针</title>
+<style>
+  body{margin:0;background:#0d1117;color:#e6ebf4;font:13px/1.6 Consolas,monospace}
+  #out{white-space:pre-wrap;padding:12px;margin:0}
+  iframe{position:fixed;left:-99999px;top:0;width:1440px;height:1100px;border:0}
+</style>
+</head>
+<body>
+<pre id="out">未运行 —— 本页是自检探针，加 ?run=1 才开始（它会临时建两条「ZZ·删除自检」选股策略，用完自己删掉，不动你的其它策略）。</pre>
+<script>
+/* ============================================================================
+   选股策略「列表项删除按钮」探针
+   ----------------------------------------------------------------------------
+   目的：列表里每条策略名称后面那个「删」按钮，光读模板读不出它到底能不能用 ——
+   handler 挂在列表项上会不会顺手把这条选中、confirm 点了取消会不会照样删、
+   删的是不是当前那条之后编辑区会不会留着一份已经不存在的策略，全得真点一次。
+
+   做法（沿用本项目探针的既有套路）：
+     · 把 /pools 塞进**同源 iframe**（src 必须用 JS 设，否则 load 监听挂不上）；
+     · 先验「按钮该有的都有、不该有的没有」：非内置一项一个 [data-del]，
+       内置一项都没有，且按钮排在名称后面（.strat-acts 是 .nm 的后续兄弟）；
+     · 建一条临时策略 A，刷新列表，点上它的「删」但**取消** confirm：
+       必须什么都没发生（这条最要紧 —— 误删是删不回来的），且编辑区
+       仍停在之前选中的那条（证明 stopPropagation 生效，没顺手选中它）；
+     · 再确定一次：真删掉 → 接口里没了、列表里没了、编辑区回到「新建」态
+       （删的正是当前编辑的那条时，不许留着一份没 id 的旧表单）；
+     · 建第二条临时策略 B，先选中另一条别的策略，再删 B：编辑区不许被清空
+       （删的不是当前那条，现场就得留着）；
+     · 收尾把自己建的临时策略删干净（一条不留）。
+   结果 JSON 写进 <pre id="out">，由 tools/verify_pool_del.py 解析。
+   ============================================================================ */
+(function () {
+  var params = new URLSearchParams(location.search);
+  var out = document.getElementById('out');
+  if (params.get('run') !== '1') return;      // 门禁：防用户误打开（它会真建真删）
+
+  var CHECKS = [];
+  function ok(name, cond, extra) {
+    CHECKS.push({ name: name, ok: !!cond, extra: extra == null ? '' : String(extra) });
+    out.textContent = JSON.stringify({ done: false, checks: CHECKS }, null, 1);
+  }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  function waitFor(fn, limitMs, stepMs) {
+    return new Promise(function (resolve, reject) {
+      var t0 = Date.now();
+      (function tick() {
+        var v;
+        try { v = fn(); } catch (e) { v = null; }
+        if (v) return resolve(v);
+        if (Date.now() - t0 > limitMs) return reject(new Error('等待超时'));
+        setTimeout(tick, stepMs || 200);
+      })();
+    });
+  }
+
+  function loadPools() {
+    return new Promise(function (resolve) {
+      var f = document.createElement('iframe');
+      f.width = 1440; f.height = 1100;
+      f.addEventListener('load', function () { resolve(f); });
+      f.src = '/pools';                    // 必须先挂 load 监听再赋 src
+      document.body.appendChild(f);
+    });
+  }
+
+  var NAME_A = 'ZZ·删除自检A', NAME_B = 'ZZ·删除自检B';
+  var created = [];        // 自己建的临时策略 id，收尾一律删掉
+
+  async function api(method, path, bodyObj) {
+    var opt = { method: method, headers: { 'Content-Type': 'application/json' } };
+    if (bodyObj !== undefined) opt.body = JSON.stringify(bodyObj);
+    var r = await fetch(path, opt);
+    var j = await r.json().catch(function () { return {}; });
+    return { status: r.status, json: j };
+  }
+  async function allPools() { return ((await api('GET', '/api/pools')).json.data) || []; }
+  /* ⚠ 别去读 iframe 里的 `W.pools`：那是 `let` 声明的顶层变量，**不挂到 window 上**
+     （`W.pools` 恒 undefined，脚本里看着像能取到，实测是空的），builtin 标记会全部
+     查不到 —— 内置「首板」会被当成缺按钮的非内置项，一条断言假红带倒后面一串。
+     内置/普通这套标记**只能**从接口拿（本轮就是这么踩的）。 */
+  async function plainPools() {
+    var l = await allPools();
+    return l.filter(function (p) { return !p.builtin; });
+  }
+  /* ⚠ waitFor 的谓词必须是**同步**的：传 async 函数进去返回的 Promise 永远 truthy，
+     第一次 tick 就 resolve，等于没等 —— 删除这种要等接口落库的断言必须自己轮询。 */
+  async function waitGone(id, limitMs) {
+    var t0 = Date.now();
+    while (true) {
+      var l = await allPools();
+      if (!l.some(function (p) { return String(p.id) === String(id); })) return true;
+      if (Date.now() - t0 > limitMs) return false;
+      await sleep(250);
+    }
+  }
+  async function waitDomGone(query, limitMs) {   // query: () => Element|null
+    var t0 = Date.now();
+    while (true) {
+      if (!query()) return true;
+      if (Date.now() - t0 > limitMs) return false;
+      await sleep(120);
+    }
+  }
+  async function makeTemp(name) {
+    var r = await api('POST', '/api/pools', {
+      name: name, base: 'all', conds: ['close > 0'],
+      note: '删除按钮自检临时策略（跑完自动删）'
+    });
+    var id = r.json && r.json.data ? r.json.data.id : null;
+    if (id) created.push(id);
+    return id;
+  }
+  async function sweep() {                 // 收尾：临时策略一条不留
+    for (var i = 0; i < created.length; i++) {
+      try { await api('DELETE', '/api/pools/' + created[i]); } catch (e) {}
+    }
+    created = [];
+  }
+
+  (async function () {
+    var f = null, W = null, D = null;
+    try {
+      f = await loadPools();
+      W = f.contentWindow; D = f.contentDocument;
+
+      var items = await waitFor(function () {
+        var l = D.querySelectorAll('#pool-list .strat-item');
+        return l.length ? l : null;
+      }, 20000);
+      ok('左侧列表渲染出策略项', !!items && items.length > 0, '共 ' + items.length + ' 项');
+
+      /* ---------- 1. 按钮该有的有、不该有的没有 ---------- */
+      var builtinWithBtn = [], noBtn = [], multi = [], notAfterName = [], notInActs = [], badText = [];
+      var byId = {};
+      (await allPools()).forEach(function (p) { byId[String(p.id)] = p; });
+      [].slice.call(items).forEach(function (el) {
+        var p = byId[el.dataset.id] || {};
+        var nm = el.querySelector('.nm');
+        var btns = el.querySelectorAll('[data-del]');
+        var label = nm ? nm.textContent.trim() : '(' + el.dataset.id + ')';
+        if (p.builtin) {
+          if (btns.length) builtinWithBtn.push(label);      // 内置不许给删
+          return;
+        }
+        if (btns.length !== 1) { (btns.length ? multi : noBtn).push(label + '×' + btns.length); return; }
+        var b = btns[0];
+        if (b.textContent.trim() !== '删') badText.push(label + '→' + b.textContent.trim());
+        if (!b.closest('.strat-acts')) notInActs.push(label);
+        /* 按钮必须排在**名称之后**（用户要的是「名称后面」）：DOM 顺序上 .nm 在前 */
+        if (nm && (nm.compareDocumentPosition(b) & 4) === 0) notAfterName.push(label);
+      });
+      ok('每条非内置策略名称后面都有且只有一个「删」按钮',
+         noBtn.length === 0 && multi.length === 0,
+         (noBtn.concat(multi).join(' / ') || '全部 ' + items.length + ' 项都有'));
+      ok('内置策略不给删除按钮（删不掉的东西别摆个点了报错的按钮）',
+         builtinWithBtn.length === 0, builtinWithBtn.join(' / '));
+      ok('按钮文案是「删」、装在 .strat-acts 里（与买卖策略列表同一套）',
+         badText.length === 0 && notInActs.length === 0,
+         badText.concat(notInActs).join(' / '));
+      ok('按钮排在策略名称之后（不是挤在名称左边）',
+         notAfterName.length === 0, notAfterName.join(' / '));
+
+      /* ---------- 2. 建一条临时策略，点上它的「删」但取消 ---------- */
+      var idA = await makeTemp(NAME_A);
+      ok('临时策略 A 已建好（用来真点删除）', !!idA, 'id=' + idA);
+      await W.load();
+      var btnA = await waitFor(function () {
+        return D.querySelector('#pool-list [data-del="' + idA + '"]') || null;
+      }, 15000).catch(function () { return null; });
+      ok('列表里出现了 A 的删除按钮（新建后列表跟着刷新）', !!btnA);
+
+      // 先选中**另一条**别的策略：删 A 之前现场在别人身上
+      var other = (await plainPools()).filter(function (p) {
+        return String(p.id) !== String(idA);
+      })[0];
+      var otherName = '';
+      if (other) {
+        var otherItem = D.querySelector('#pool-list .strat-item[data-id="' + other.id + '"]');
+        if (otherItem) otherItem.click();
+        otherName = other.name;
+        await sleep(200);
+      }
+
+      var confirmCalls = 0;
+      W.confirm = function () { confirmCalls++; return false; };   // 取消
+      if (btnA) btnA.click();
+      await sleep(600);
+      var afterCancel = await allPools();
+      ok('点了「删」会先问一句（confirm 真被调用）', confirmCalls === 1, '调用 ' + confirmCalls + ' 次');
+      ok('confirm 取消 → 什么都没删（误点也删不掉）',
+         afterCancel.some(function (p) { return String(p.id) === String(idA); }),
+         '还剩 ' + afterCancel.length + ' 条策略');
+      ok('取消后列表里 A 还在（DOM 没被提前抹掉）',
+         !!D.querySelector('#pool-list .strat-item[data-id="' + idA + '"]'));
+      ok('点「删」不会顺手把这条选中（stopPropagation 生效）',
+         !!other && D.querySelector('#ed-name').value === otherName,
+         '编辑区仍是「' + (D.querySelector('#ed-name').value || '空') + '」');
+
+      /* ---------- 3. 真删：先选中它，再确定 ---------- */
+      var itemA = D.querySelector('#pool-list .strat-item[data-id="' + idA + '"]');
+      if (itemA) itemA.click();                     // 让它成为「当前编辑的那条」
+      await sleep(200);
+      ok('点名称只选中、不删除（删必须走按钮）',
+         D.querySelector('#ed-name').value === NAME_A,
+         '编辑区=' + (D.querySelector('#ed-name').value || '空'));
+
+      W.confirm = function () { return true; };
+      var btnA2 = D.querySelector('#pool-list [data-del="' + idA + '"]');
+      if (btnA2) btnA2.click();
+      var gone = await waitGone(idA, 20000);
+      ok('确定后 A 真被删掉（接口里没有了）', !!gone);
+      ok('列表里 A 也没了（DOM 跟着刷新）',
+         await waitDomGone(function () {
+           return D.querySelector('#pool-list .strat-item[data-id="' + idA + '"]');
+         }, 10000));
+      /* ⚠ 删完 `load()` 会顺手选中列表第一条（跟页面刚打开时一样）—— 所以这里不许断言
+         「一定停在新建态」，只能断言「编辑区不再留着那份已删掉的策略」：
+         要么回到新建态，要么停在列表里**还存在**的另一条上。 */
+      var edTitle = D.querySelector('#ed-title').textContent || '';
+      var edName = D.querySelector('#ed-name').value || '';
+      var edExists = edName === '' ? edTitle.indexOf('新建') >= 0
+        : (await allPools()).some(function (p) { return p.name === edName; });
+      ok('删的正是当前编辑的那条 → 编辑区不留一份已不存在的策略',
+         edName !== NAME_A && edTitle.indexOf(NAME_A) < 0 && edExists,
+         '标题=' + edTitle + ' / 名称=' + JSON.stringify(edName)
+           + ' / 底部删按钮disabled=' + D.querySelector('#btn-del').disabled);
+      created = created.filter(function (x) { return String(x) !== String(idA); });
+
+      /* ---------- 4. 删的不是当前那条 → 现场要留着 ---------- */
+      var idB = await makeTemp(NAME_B);
+      await W.load();
+      var btnB = await waitFor(function () {
+        return D.querySelector('#pool-list [data-del="' + idB + '"]') || null;
+      }, 15000).catch(function () { return null; });
+      ok('临时策略 B 已建好且列表里有它的删除按钮', !!btnB, 'id=' + idB);
+
+      var keep = (await plainPools()).filter(function (p) {
+        return String(p.id) !== String(idB);
+      })[0];
+      var keepName = keep ? keep.name : '';
+      if (keep) {
+        var keepItem = D.querySelector('#pool-list .strat-item[data-id="' + keep.id + '"]');
+        if (keepItem) keepItem.click();
+        await sleep(200);
+      }
+      W.confirm = function () { return true; };
+      var btnB2 = D.querySelector('#pool-list [data-del="' + idB + '"]');
+      if (btnB2) btnB2.click();
+      var goneB = await waitGone(idB, 20000);
+      ok('B 被删掉', !!goneB);
+      ok('删的不是当前那条 → 编辑区现场留着（不被清空）',
+         !!keep && D.querySelector('#ed-name').value === keepName,
+         '编辑区=' + (D.querySelector('#ed-name').value || '空') + '（应为 ' + keepName + '）');
+      created = created.filter(function (x) { return String(x) !== String(idB); });
+    } catch (e) {
+      ok('探针执行完成', false, (e && e.message) || String(e));
+    }
+    try { await sweep(); } catch (e) {}
+    var left = [];
+    try {
+      left = (await allPools()).filter(function (p) {
+        return (p.name || '').indexOf('ZZ·删除自检') === 0;
+      }).map(function (p) { return p.name + '#' + p.id; });
+    } catch (e) {}
+    ok('收尾清干净了（没把临时策略留在库里）', left.length === 0, left.join(','));
+    out.textContent = JSON.stringify({ done: true, checks: CHECKS }, null, 1);
+  })();
+})();
+</script>
+</body>
+</html>

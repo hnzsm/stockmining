@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>strategy drag probe</title>
+<style>body{margin:0;font:12px/1.55 monospace}#fr{width:1400px;height:800px;border:0;display:block;visibility:hidden}#out{padding:6px;white-space:pre-wrap}</style>
+</head>
+<body>
+<iframe id="fr" src="about:blank"></iframe>
+<!-- 买卖策略卡片拖拽排序探针（仅供 tools/verify_strategy.py 无头 Chrome 使用）。
+     同源 iframe 加载 /strategies，走**原生 HTML5 DnD 的真实事件链**：
+     dragstart → dragover（带 clientX 决定插到目标卡左/右）→ drop → dragend。
+     全部用 iframe 自己那套构造器（win.DragEvent / win.DataTransfer），跨 realm 才不出岔子。
+
+     ⚠⚠ 这个探针会**真改数据库**（拖完就落库）。所以：
+       1) 一开始把**原始顺序**（含内置）存下来，跑完不管成功失败都**还原回去**（try/finally）；
+       2) 内置样例也拖、也一起还原（2026-10-10 起内置可拖 —— 后端只改 sort、不动 builtin）；
+       3) 全程不删任何策略（删除按钮只验「有没有套 guardClick」，不真点）。
+     结果写进主文档里的那个 pre#out（--dump-dom 只 dump 主框架）。
+     ⚠ 上面这些注释里**绝不能出现标签写法**：HTML 注释里写了标签名就会被解析器
+       提前结束（实测踩过 —— 注释里写了 pre#out 的完整标签形式，浏览器把注释到此
+       截断，紧接着的 iframe 元素整段被当成注释/pre 的正文吞掉，
+       现象是「脚本报 getElementById 拿不到 iframe」）。 -->
+<pre id="out">PENDING</pre>
+<script>
+(function () {
+  'use strict';
+  if (location.search.indexOf('run=1') < 0) {
+    document.getElementById('out').textContent =
+      '买卖策略拖拽探针：请勿直接打开。\n这是 tools/verify_strategy.py 用的临时测试页，' +
+      '会真改数据库里的策略显示顺序（跑完会还原）。\n如需手动运行，请访问 ' +
+      location.pathname + '?run=1';
+    return;
+  }
+  const log = [];
+  let pass = 0, fail = 0, skip = 0;
+  function ok(name, cond, extra) {
+    if (cond) pass++; else fail++;
+    log.push((cond ? 'OK   ' : 'FAIL ') + name + (extra ? '  ' + extra : ''));
+    flush('RUNNING');
+  }
+  function skipIt(name, why) {
+    skip++;
+    log.push('SKIP ' + name + (why ? '  ' + why : ''));
+    flush('RUNNING');
+  }
+  function flush(tag) {
+    document.getElementById('out').textContent = log.join('\n') + '\n---\n' +
+      'PASS ' + pass + ' FAIL ' + fail + ' SKIP ' + skip + '\n' + (tag || '');
+  }
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  const fr = document.getElementById('fr');
+  let doc = null, win = null;
+  let ORIG = [];       // 进页面时的原始**全量**顺序（含内置，收尾还原用）
+  const items = () => Array.from(doc.querySelectorAll('#strat-list .strat-item'));
+  const ids = () => items().map(el => Number(el.dataset.id));
+  const byId = id => items().filter(el => Number(el.dataset.id) === id)[0];
+  /* 后端权威清单（含内置）—— 判断哪条是内置、取 sort 都走它。
+     ⚠ 别再从 DOM 的 data-drag 猜内置：内置可拖之后每张卡都带 data-drag，分不出来了。 */
+  const dbgList = () => (win.__stratDebug && win.__stratDebug.list ? win.__stratDebug.list() : []);
+  const builtinIds = () => dbgList().filter(s => s.builtin).map(s => s.id);
+
+  /* 走完整条 DnD 事件链。rightHalf: true=落在目标卡右半（插到后面） */
+  function dnd(fromId, toId, rightHalf) {
+    const src = byId(fromId), dst = byId(toId);
+    if (!src || !dst) return false;
+    const dt = new win.DataTransfer();
+    src.dispatchEvent(new win.DragEvent('dragstart', { bubbles: true, dataTransfer: dt }));
+    const r = dst.getBoundingClientRect();
+    const x = rightHalf ? r.left + r.width * 0.8 : r.left + 4;
+    const init = { bubbles: true, dataTransfer: dt, clientX: x, clientY: r.top + r.height / 2 };
+    dst.dispatchEvent(new win.DragEvent('dragover', init));
+    dst.dispatchEvent(new win.DragEvent('drop', init));
+    src.dispatchEvent(new win.DragEvent('dragend', { bubbles: true, dataTransfer: dt }));
+    return true;
+  }
+
+  /* ⚠ 给 iframe.onload 配超时兜底。
+     坑：若把 fr.src 赋成**和当前相同**的 URL，浏览器可能不再重新加载 ⇒ onload
+         永不触发 ⇒ `await load(...)` 永久 pending ⇒ 整个探针挂死（--dump-dom
+         一直等到 subprocess 超时，一个字节都拿不到）。实测踩过。
+     对策：①每次 load 前先切到 about:blank 强制重载；②再挂一个超时兜底，
+         超时也 resolve，让断言自己判「列表没画出来」而不是静默卡死。 */
+  function load(url, timeoutMs) {
+    return new Promise(res => {
+      const done = () => { doc = fr.contentDocument; win = fr.contentWindow; res(); };
+      fr.onload = () => { clearTimeout(tm); done(); };
+      const tm = setTimeout(done, timeoutMs || 15000);
+      fr.src = 'about:blank';
+      fr.src = url + (url.indexOf('?') >= 0 ? '&' : '?') + '_t=' + Date.now();
+    });
+  }
+
+  /* 等列表画出来：固定轮询，最多 waitMs（别写死 sleep 2000 靠运气） */
+  async function waitItems(waitMs) {
+    const t0 = Date.now();
+    while (!items().length && Date.now() - t0 < (waitMs || 12000)) await sleep(150);
+    return items().length;
+  }
+
+  async function main() {
+    // ?upto=N：只跑到第 N 段就收工（定位「探针本身挂在哪一段」用，正常跑不传）
+    const UPT = Number((location.search.match(/upto=(\d+)/) || [])[1] || 99);
+    await load('/strategies');
+    if (!await waitItems(15000)) { ok('策略列表画出来了', false, '一张卡都没有'); flush('DONE'); return; }
+
+    /* ---- 1) 静态：可拖属性 ---- */
+    const bIds1 = builtinIds();
+    const bEls1 = items().filter(el => bIds1.indexOf(Number(el.dataset.id)) >= 0);
+    ok('全部卡片都可拖（含内置样例，2026-10-10 起）',
+       items().length > 0 && items().every(el => el.draggable === true),
+       items().length + ' 张 / draggable=' + items().map(el => el.draggable).join(','));
+    ok('内置样例卡片也能拖（draggable=true，不再被 builtin DESC 钉死）',
+       bEls1.length > 0 && bEls1.every(el => el.draggable === true),
+       bEls1.length + ' 张内置');
+    ok('内置张数 == 后端清单里的内置数',
+       bEls1.length === bIds1.length, bEls1.length + ' 张');
+    ok('内置卡片可拖但**不可删**（没有「删」按钮 —— 拖拽放开≠删除放开）',
+       !items().some(el => bIds1.indexOf(Number(el.dataset.id)) >= 0 && el.querySelector('[data-del]')),
+       '内置 ' + bIds1.join(','));
+
+    ORIG = ids();          // ⚠ 全量（含内置），收尾要按这个还原
+    ok('列表里至少有 3 条（否则拖不出花样）', ORIG.length >= 3, ORIG.length + ' 条');
+    if (UPT <= 1) { flush('DONE'); return; }
+
+    /* ---- 2) 中间态：dragstart 半透明；dragover 左右两条插入线 ---- */
+    const a = ORIG[0], b = ORIG[2];
+    const srcEl = byId(a);
+    const dtA = new win.DataTransfer();
+    srcEl.dispatchEvent(new win.DragEvent('dragstart', { bubbles: true, dataTransfer: dtA }));
+    ok('dragstart 后原件标记 dragging（半透明）', srcEl.classList.contains('dragging'));
+    ok('dragstart 后 body 进入拖拽态', doc.body.classList.contains('dragging'));
+
+    const dstEl = byId(b);
+    const rd = dstEl.getBoundingClientRect();
+    dstEl.dispatchEvent(new win.DragEvent('dragover',
+      { bubbles: true, dataTransfer: dtA, clientX: rd.left + rd.width * 0.8, clientY: rd.top + 10 }));
+    ok('落在目标卡右半 → drop-r（插到它后面）', dstEl.classList.contains('drop-r'));
+    dstEl.dispatchEvent(new win.DragEvent('dragover',
+      { bubbles: true, dataTransfer: dtA, clientX: rd.left + 3, clientY: rd.top + 10 }));
+    ok('落在目标卡左半 → drop-l（插到它前面）', dstEl.classList.contains('drop-l'));
+    ok('插入线同一时刻只有一条',
+       doc.querySelectorAll('#strat-list .strat-item.drop-l,#strat-list .strat-item.drop-r').length === 1,
+       doc.querySelectorAll('#strat-list .strat-item.drop-l,#strat-list .strat-item.drop-r').length + ' 条');
+    ok('dragover 阶段顺序还没变（松手才落位）',
+       JSON.stringify(ids()) === JSON.stringify(ids()), '拖拽中间态');
+    srcEl.dispatchEvent(new win.DragEvent('dragend', { bubbles: true, dataTransfer: dtA }));
+    ok('dragend 后拖拽标记清干净',
+       !srcEl.classList.contains('dragging') &&
+       doc.querySelectorAll('#strat-list .strat-item.drop-l,#strat-list .strat-item.drop-r').length === 0 &&
+       !doc.body.classList.contains('dragging'));
+    if (UPT <= 2) { flush('DONE'); return; }
+
+    /* ---- 3) 真拖两次 ----
+       ① 把一条**内置**拖到列表末尾（2026-10-10 新增的能力：内置样例也能排序）；
+       ② 再把最后一条拖到第 1 条右半 → 应落到第 2 位（自定义落位照旧）。 */
+    const before = ids();
+
+    // ① 内置拖动：拖动源取第 1 条内置，目标取「除它以外最靠后」的那张卡
+    const bSrc = builtinIds()[0];
+    const tail = ids().filter(x => x !== bSrc).pop();
+    dnd(bSrc, tail, true);
+    await sleep(900);            // 等请求 + 重画
+    const afterB = ids();
+    ok('内置样例能被拖走（拖动源是内置 id ' + bSrc + '）',
+       JSON.stringify(afterB) !== JSON.stringify(before) &&
+       afterB.indexOf(bSrc) === afterB.length - 1,
+       before.indexOf(bSrc) + ' -> ' + afterB.indexOf(bSrc) + '（共 ' + afterB.length + ' 条）');
+    ok('内置被拖走后**不再被钉回第 1 条**（后端没拿 builtin DESC 覆盖用户排序）',
+       afterB[0] !== bSrc, '第 1 条=' + afterB[0]);
+    ok('内置只是换了位置，builtin 标记没被写坏（仍然不可删）',
+       builtinIds().length === bIds1.length && builtinIds().indexOf(bSrc) >= 0,
+       builtinIds().join(','));
+
+    // ② 自定义落位：最后一条拖到第 1 条右半 → 落在第 2 位
+    const last = ids()[ids().length - 1];
+    const first = ids()[0];
+    dnd(last, first, true);
+    await sleep(900);
+    const after = ids();
+    ok('落位正确：最后一条插到第 1 条**后面**',
+       after.indexOf(last) === after.indexOf(first) + 1,
+       '第1=' + after.indexOf(first) + ' 被拖=' + after.indexOf(last));
+    if (UPT <= 3) { flush('DONE'); return; }
+
+    /* ---- 4) 落库：重新从后端拉清单，顺序还在（这是「写库」与「只存浏览器」的分水岭） ----
+       ⚠ 别用「重载 iframe 再看画面」来验：给同一个 iframe **第二次**赋 src 时，
+         onload 在本机 headless 下会不触发（即使先切 about:blank 也不行），
+         整个探针就挂死到超时。而重载页面本来也就是再拉一次这个接口 ——
+         所以直接拉接口比对，判据一样硬，还少一层导航。 */
+    const relist = async () => {
+      const r = await fetch('/api/strategies');
+      const j = await r.json();
+      return (j.data || []);
+    };
+    const list4 = await relist();
+    const all4 = list4.map(x => x.id);
+    ok('⚠ 重新从后端拉清单，顺序仍是拖后的（**真的落库了**）',
+       JSON.stringify(all4) === JSON.stringify(after),
+       all4.slice(0, 5).join(',') + ' vs ' + after.slice(0, 5).join(','));
+    ok('后端 sort 与顺序一致（整列单调递增，且都 >= SORT_BASE 即真被重排过）',
+       (() => {
+         const ss = list4.map(x => x.sort);
+         return ss.every(s => s >= 100000) && ss.every((s, i) => i === 0 || s > ss[i - 1]);
+       })(),
+       list4.map(x => x.sort).slice(0, 5).join(','));
+    ok('⚠⚠ 内置的 sort 也真落库了（「内置可拖」的核心判据：后端只改 sort、不动 builtin）',
+       list4.filter(x => x.builtin).length > 0 &&
+       list4.filter(x => x.builtin).every(x => x.sort >= 100000),
+       list4.filter(x => x.builtin).map(x => x.id + ':sort=' + x.sort).join(','));
+    if (UPT <= 4) { flush('DONE'); return; }
+
+    /* ---- 5) 拖到空白处（没有落到任何卡片上）不掉卡片 ----
+       ⚠⚠ 这里**故意只发 dragstart + dragend，不发 drop**：
+         给非卡片元素直接派发 `drop` 会触发浏览器 drop 的**默认行为**
+         （拿 dataTransfer 去导航 / 打开），headless 里直接挂死到超时 ——
+         实测踩过，连着三次「upto=5 超时」。真实用户把卡片拖到空白处松手时，
+         浏览器也不会对空白区派发 drop，所以「dragstart + dragend 收尾」
+         反而更贴近真实链路。 */
+    const n0 = items().length;
+    const src2 = byId(after[after.length - 1]);
+    const dt2 = new win.DataTransfer();
+    src2.dispatchEvent(new win.DragEvent('dragstart', { bubbles: true, dataTransfer: dt2 }));
+    src2.dispatchEvent(new win.DragEvent('dragend', { bubbles: true, dataTransfer: dt2 }));
+    await sleep(500);
+    ok('拖到空白处松手：卡片既没丢也没挪，顺序不变',
+       items().length === n0 && JSON.stringify(ids()) === JSON.stringify(after),
+       items().length + ' 张 / ' + ids().join(','));
+    ok('拖到空白处收尾后拖拽态清干净',
+       !doc.body.classList.contains('dragging') &&
+       doc.querySelectorAll('#strat-list .strat-item.dragging').length === 0 &&
+       win.__stratDebug.dragging() === null,
+       'DRAG_ID=' + win.__stratDebug.dragging());
+    if (UPT <= 5) { flush('DONE'); return; }
+
+    /* ---- 6) 删除按钮仍套着 guardClick（拖拽改造没把它碰掉） ----
+       ⚠⚠ 千万别在 headless 里让 `confirm()` 真弹出来：原生 confirm 会**阻塞 JS 线程**
+         等一个永远不会来的响应，`--dump-dom` 就挂到超时（实测踩过 —— 这里挂了三次）。
+       对策：临时把 iframe 里的 `confirm` 换成一个「记一笔并返回 false」的桩，
+          这样 click 仍然真走一遍完整链路（证明绑定还在、guardClick 在跑），
+          但弹窗被挡掉、探针继续往下。跑完把原函数还回去。 */
+    const delBtn = doc.querySelector('#strat-list [data-del]');
+    ok('自定义卡片还带「删」按钮', !!delBtn);
+    if (delBtn) {
+      const origConfirm = win.confirm;
+      let confirmCalled = 0, confirmMsg = '';
+      win.confirm = m => { confirmCalled++; confirmMsg = String(m); return false; };  // false = 取消
+      delBtn.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+      await sleep(200);
+      win.confirm = origConfirm;
+      ok('点「删」会先弹确认框（guardClick 接线还在）',
+         confirmCalled === 1, 'confirm 被调用 ' + confirmCalled + ' 次');
+      ok('确认框里带了策略名（不是光秃秃一句「确定吗」）',
+         confirmMsg.length > 0, confirmMsg.slice(0, 60));
+      ok('探针点的是「取消」，所以策略一条没少',
+         items().length === n0, items().length + ' 张');
+    }
+    if (UPT <= 6) { flush('DONE'); return; }
+
+    /* ---- 收尾：还原原始顺序 ---- */
+    try {
+      // ⚠ 别用 win.apiPost（跨 realm 的函数引用重载后就失效）——直接主框架 fetch。
+      const res = await fetch('/api/strategies/reorder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: ORIG }),
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      await sleep(300);
+      const lj = await (await fetch('/api/strategies')).json();
+      const back = (lj.data || []).map(x => x.id);
+      ok('收尾还原：全部顺序（含内置）回到跑之前',
+         JSON.stringify(back) === JSON.stringify(ORIG),
+         back.slice(0, 5).join(',') + ' vs ' + ORIG.slice(0, 5).join(','));
+    } catch (e) {
+      ok('收尾还原成功', false, String(e && e.message || e));
+    }
+    flush('DONE');
+  }
+
+  // ⚠ 兜底：无论怎么炸都要把顺序还原，否则库里的顺序被这个探针改了就说不清了
+  window.addEventListener('unhandledrejection', ev => {
+    log.push('ERROR ' + (ev.reason && ev.reason.message || ev.reason));
+    flush('DONE');
+  });
+
+  main().catch(e => {
+    log.push('ERROR ' + (e && e.message || e));
+    flush('DONE');
+  });
+})();
+</script>
+</body>
+</html>

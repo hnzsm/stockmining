@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="dark">
+<title>今日期货页探针</title>
+<style>body{background:#0d1117;color:#c9d3e0;font:12px/1.6 Consolas,monospace;margin:12px}
+pre#out{white-space:pre-wrap}</style>
+</head>
+<body>
+<pre id="out">…</pre>
+<script>
+/* 今日期货页的前端实测探针（只给 tools/verify_futures.py 用）。
+   ---------------------------------------------------------------
+   跑法：无头 Chrome 打开 `static/_probe_futures.html?run=1`，把结果写进 `<pre id="out">`，
+   由 verify_futures.py 用 `--dump-dom` 抠出来。**别用 agent-browser**（会挂起，见 C17）。
+
+   为什么用同源 iframe 挂真页面：断言的是**真页面 + 真接口**跑起来的 DOM，
+   不是在这里重写一遍渲染逻辑 —— 重写就等于验了个假的（页面坏了它却是绿的）。
+
+   ⚠ 断言纪律（C19）：榜单是站外的、每次都变，所以只断言
+     「形状 / 关系 / 降级行为」，不写死条数与某只品种。
+     唯一用到具体值的地方是「搜索『橡胶』后每行都得含橡胶」——那是同一次响应内的自洽关系。
+
+   ⚠ 两个写探针必踩的坑（都在这页上真实踩过）：
+   1. **页面每次 render 都把整个表格 innerHTML 换掉**，所以任何 DOM 引用（`tr0`、`th`）
+      点一下就过期成了游离节点 —— 读它的 class/属性拿到的是**旧状态**，会报假 FAIL。
+      规矩：**每次操作后重新 query**（下面一律用 `rowNow()` / `q(doc,'#ft-th-pct')` 现取）。
+   2. **选择器别写太松**：`table.ft-tbl thead th` 会把展开行里那张内层合约表（`.ft-ct`）
+      的表头一起捞进来（于是「表头五列」突然多出一堆）。顶层表头要写 `#ft-tbl > thead > tr > th`。
+*/
+(function () {
+  'use strict';
+  const out = document.getElementById('out');
+  const lines = [];
+  const say = (ok, name, extra) => { lines.push((ok ? 'OK   ' : 'FAIL ') + name + (extra ? '  ' + extra : '')); paint(); };
+  const note = (s) => { lines.push('NOTE ' + s); paint(); };
+  const paint = () => { out.textContent = lines.join('\n'); };
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  function mkFrame(src) {
+    return new Promise((resolve) => {
+      const f = document.createElement('iframe');
+      f.style.cssText = 'width:1560px;height:1000px;border:0';
+      f.src = src;
+      f.onload = () => resolve(f);
+      document.body.appendChild(f);
+    });
+  }
+  const q = (d, s) => d.querySelector(s);
+  const qa = (d, s) => Array.from(d.querySelectorAll(s));
+  function click(el) {
+    if (!el) return false;
+    // 真鼠标事件：只发 click 有时候不触发（页面里用的是委托 + closest）
+    el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+    return true;
+  }
+  async function waitFor(fn, ms, step) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms) {
+      try { const v = fn(); if (v) return v; } catch (e) { /* 还没就绪 */ }
+      await sleep(step || 300);
+    }
+    return null;
+  }
+
+  (async function () {
+    if (new URLSearchParams(location.search).get('run') !== '1') { note('没有 ?run=1，跳过'); return; }
+    if (!window.fetch) { note('环境不支持 fetch'); return; }
+
+    // ---------------- 一、列表页 ----------------
+    const fr = await mkFrame('/futures');
+    const doc = fr.contentDocument;
+    const grps = await waitFor(() => {
+      const n = qa(doc, 'tbody.ft-grp').length;
+      return n ? qa(doc, 'tbody.ft-grp') : null;
+    }, 25000, 300);
+    if (!grps) { say(false, '列表页取到数据（25s 内出现主连行）'); return; }
+    say(true, '列表页取到数据', grps.length + ' 个主连行');
+
+    /* —— 一律现取，绝不缓存节点（见文件头坑 1）—— */
+    const rows = () => qa(doc, 'tbody.ft-grp > tr.ft-main');
+    const rowNow = (i) => rows()[i || 0] || null;
+    const namesOf = (rs) => (rs || rows()).map(r => q(r, '.ft-nm').textContent.trim());
+    const pctsOf = (rs) => (rs || rows())
+      .map(r => parseFloat(q(r, '.ft-pct').textContent.replace(/[^0-9.\-+]/g, '')))
+      .filter(v => !isNaN(v));
+    /* 第 i 组的展开行（`:scope >` 限定在这一层，别被内层合约表搅进来） */
+    const subOf = (i) => {
+      const tb = qa(doc, 'tbody.ft-grp')[i || 0];
+      return tb ? tb.querySelector(':scope > tr.ft-sub') : null;
+    };
+
+    // 1) 表头五列：需求那三列 + 「最近期权到期」（主连行展示对应期权最快到期还有几日）
+    //    + 「最近合约交割」（展示该品种最快交割的可交易合约距今天还剩几天）
+    const ths = qa(doc, '#ft-tbl > thead > tr > th').map(x => x.textContent.trim());
+    say(JSON.stringify(ths) === JSON.stringify(['主连', '涨跌幅', '最近期权到期', '最近合约交割', '查看K线']),
+        '表头五列 = 主连 / 涨跌幅 / 最近期权到期 / 最近合约交割 / 查看K线', JSON.stringify(ths));
+
+    // 2) 顶层每一行都必须是主连（具体月份合约只能出现在展开里）
+    //    ⚠ 换 tushare 后主连名不再统一以「主连」结尾 —— 商品所叫「原油主力」、中金所叫
+    //      「沪深300期货」。⚠⚠ **不能用名字判**：「沪深300期货」里的 300 会被当成月份
+    //      （真这么写过，假红）⇒ 判据只看**代码**：主连是 `RU.SHF` / `TL0.CFX`，
+    //      具体合约是 `RU2611.SHF`（交易所后缀前以 3~4 位数字结尾）。
+    const names = namesOf();   // 名字只给「搜索筛选」那一段用，不用来判主连
+    const codes = rows().map(r => {
+      const b = q(r, 'button[data-k]');
+      return b ? b.getAttribute('data-k') : '';
+    });
+    const notMain = codes.filter(c => /^[A-Za-z0-9_]+?\d{3,4}\./.test(c));
+    say(codes.length > 0 && codes.every(c => c) && notMain.length === 0,
+        '顶层行全部是主连（没有混进具体月份合约）',
+        notMain.length ? '混进 ' + notMain.slice(0, 3).join(',')
+                       : codes.length + ' 行全对（' + codes.slice(0, 3).join(',') + '…）');
+
+    // 3) 涨跌幅的颜色与符号一致（涨红跌绿是业务约定，不许反）
+    //    ⚠ 允许「主连暂无涨跌幅」（东财偶尔给 "-"）显示成 — 且不带涨跌色 —— 不能因此判失败，
+    //      但必须有**有值**的行，否则列就整体废了。
+    const pctCells = qa(doc, 'tbody.ft-grp > tr.ft-main .ft-pct');
+    let colorBad = [], withVal = 0, blank = 0, rounded = 0;
+    pctCells.forEach((td) => {
+      const sp = td.querySelector('span');
+      const cls = sp ? sp.className : '';
+      const v = parseFloat(td.textContent.replace(/[^0-9.\-+]/g, ''));
+      if (isNaN(v)) { blank++; if (cls !== 'flat') colorBad.push('空值却染色 ' + cls); return; }
+      withVal++;
+      // ⚠ 涨跌幅只显示 2 位小数 ⇒ -0.004% 会显示成「-0.00%」：**文本丢了符号**，而颜色是
+      // 按原始值染的。这种四舍五入成 0 的判不了颜色（up/down/flat 都有可能），放行 ——
+      // 否则数据里只要出现一个小负数就假红（2026-10-15 实测撞到过一次）。
+      if (Math.abs(v) < 0.005) { rounded++; return; }
+      const want = v > 0 ? 'up' : 'down';
+      if (cls.indexOf(want) < 0) colorBad.push(td.textContent.trim() + '/' + cls);
+    });
+    say(withVal > 0 && colorBad.length === 0,
+        '每行涨跌幅的颜色与符号一致（空值显示 — 不染色）',
+        (colorBad.length ? colorBad.slice(0, 3).join(' ') : '有值 ' + withVal + ' / 空 ' + blank)
+        + (rounded ? ' / 舍入成 0 放行 ' + rounded : ''));
+
+    // 3b) 主连行的「最近期权到期」列：每格是「N 天」或「—」，且**默认按它从小到大排**
+    //     （有值必须排在「—」前面 —— 「—」是「没这个信息」，不是「0 天后到期」）
+    const nearRaw = () => qa(doc, 'tbody.ft-grp > tr.ft-main td:nth-child(3)')
+      .map(td => td.textContent.trim());
+    const nearDays = () => nearRaw().map(v => {
+      const m = /^(\d+)\s*天$/.exec(v);
+      return m ? +m[1] : null;
+    });
+    const nRaw = nearRaw(), nDays = nearDays();
+    const nVals = nDays.filter(v => v !== null);
+    const nAsc = nVals.every((v, i) => i + 1 >= nVals.length || v <= nVals[i + 1]);
+    const nNumFirst = nDays.slice(0, nVals.length).every(v => v !== null);
+    say(nRaw.length === rows().length && nRaw.every(v => /^\d+\s*天$/.test(v) || v === '—'),
+        '每行都有「最近期权到期」（N 天 / —，不空）',
+        '有值 ' + nVals.length + '/' + nRaw.length + ' 行');
+    say(nVals.length > 0 && nAsc && nNumFirst,
+        '默认按「最近期权到期」从小到大（有值在前、没有期权的垫底）',
+        nVals.slice(0, 6).join(',') + ' …');
+    say(nVals.every(v => v >= 0),
+        '天数都是非负（已过期的不算「最快到期」，别把历史排最前）',
+        nVals.length ? 'min=' + Math.min.apply(null, nVals) : '本页没有有值的行');
+
+    // 3c) 主连行的「最近合约交割」列（第 4 列）：每格是「N 天」/「今天交割」/「已交割」/「—」。
+    //     ⚠ 这一列**默认不保证有序** —— 列表默认按「最近期权到期」排，两列不是一回事
+    //       （合成数据里就刻意让它们指向不同合约）。排序断言在下面第 7 段点表头时做。
+    const dlRaw = () => qa(doc, 'tbody.ft-grp > tr.ft-main td:nth-child(4)')
+      .map(td => td.textContent.trim());
+    const dRaw = dlRaw();
+    const dNum = dRaw.filter(v => /^\d+\s*天$/.test(v)).length;
+    say(dRaw.length === rows().length
+        && dRaw.every(v => /^\d+\s*天$/.test(v) || v === '—' || v === '今天交割' || v === '已交割'),
+        '每行都有「最近合约交割」（N 天 / 今天交割 / 已交割 / —，不空）',
+        'N 天 ' + dNum + ' / 今天交割 ' + dRaw.filter(v => v === '今天交割').length
+        + ' / 已交割 ' + dRaw.filter(v => v === '已交割').length
+        + ' / — ' + dRaw.filter(v => v === '—').length);
+    say(dNum > 0 || dRaw.some(v => v === '今天交割' || v === '已交割'),
+        '「最近合约交割」有有值的行（不是整列「—」）',
+        dRaw.slice(0, 6).join(','));
+
+    // 4) 每行都有「查看K线」按钮，且带的是 ts_code（品种码.交易所，如 RU.SHF / TL0.CFX）
+    const kbtns = qa(doc, 'tbody.ft-grp > tr.ft-main .ft-k button[data-k]');
+    const badK = kbtns.filter(b => !/^[A-Za-z0-9]{1,12}\.[A-Za-z]{3,5}$/.test(b.getAttribute('data-k') || ''))
+      .map(b => b.getAttribute('data-k'));
+    say(kbtns.length === rows().length && badK.length === 0,
+        '每行都有「查看K线」且 secid 形状对（品种码.交易所）',
+        badK.length ? '形状不对 ' + badK.slice(0, 3).join(',') : kbtns.length + ' 个');
+
+    // 5) 展开/收起：点行内任意位置（含行名）→ 出现同品种合约表，且代码真的同品种
+    const mainCode = q(rowNow(), '.ft-cd').textContent.trim();
+    click(q(rowNow(), '.ft-nm'));
+    const sub = await waitFor(() => { const s = subOf(0); return (s && !s.hasAttribute('hidden')) ? s : null; }, 6000, 200);
+    say(!!sub, '点主连行能展开同品种合约', sub ? '' : '没出现可见的 ft-sub');
+    if (sub) {
+      const trows = qa(sub, 'table.ft-ct tbody tr');
+      const codes = qa(sub, 'table.ft-ct tbody tr td:nth-child(2)').map(x => x.textContent.trim());
+      // ⚠ 换 tushare 后代码形态变了：主连是 `RU.SHF`（无月份）、合约是 `RU2611.SHF`。
+      //   判「同品种」= 交易所后缀相同 + 去掉尾部数字后前缀相同
+      //   （中金所 30 年国债主连是 `TL0.CFX`，不去掉那个 0 就匹配不上 `TL2612`）。
+      const mparts = mainCode.split('.');
+      const base = mparts[0].replace(/\d+$/, '');
+      const rx = new RegExp('^' + base + '\\d{3,4}$', 'i');
+      const badEx = codes.filter(c => (c.split('.')[1] || '') !== (mparts[1] || ''));
+      const bad = codes.filter(c => !rx.test(c.split('.')[0] || ''));
+      say(trows.length > 0 && bad.length === 0 && badEx.length === 0,
+          '展开里是同品种合约（同交易所 + 去掉月份数字后与主连同前缀）',
+          '主连 ' + mainCode + ' → ' + codes.length + ' 个'
+          + (bad.length ? '，越界 ' + bad.slice(0, 3) : '')
+          + (badEx.length ? '，跨所 ' + badEx.slice(0, 3) : ''));
+
+      // 5b) 展开表要有「到期日」「期权到期日」两列，且每格是日期或「—」（不许空白）
+      // ⚠ 下标是 0-based：合约0/代码1/最新价2/涨跌幅3/持仓量4/**到期日5/期权到期日6**/K线7
+      const cths = qa(sub, 'table.ft-ct > thead > tr > th').map(x => x.textContent.trim());
+      say(cths.length === 8 && cths.indexOf('到期日') === 5 && cths.indexOf('期权到期日') === 6,
+          '展开表 8 列且末两列是「到期日」「期权到期日」', cths.join('/'));
+      const RE_D = /^\d{4}-\d{2}-\d{2}$/;
+      const cellsOf = (n) => qa(sub, 'table.ft-ct tbody tr td:nth-child(' + n + ')')
+        .map(x => x.textContent.trim());
+      const futD = cellsOf(6), optD = cellsOf(7);
+      const badFut = futD.filter(v => !RE_D.test(v) && v !== '—');
+      const badOpt = optD.filter(v => !(RE_D.test(v) || v === '—' || /^—|^\d{4}-\d{2}-\d{2} \+\d+$/.test(v)));
+      say(futD.length === trows.length && badFut.length === 0,
+          '每行都有「到期日」（日期或 —，不空）',
+          badFut.length ? '坏值 ' + badFut.slice(0, 3).join(',')
+                        : futD.length + ' 行，样例 ' + futD.slice(0, 2).join(','));
+      say(optD.length === trows.length && badOpt.length === 0,
+          '每行都有「期权到期日」（日期 / 日期+N / —）',
+          badOpt.length ? '坏值 ' + badOpt.slice(0, 3).join(',')
+                        : optD.filter(v => v !== '—').length + ' 行有期权到期日');
+
+      // 5b2) 到期日列必须**近→远**（需求 2026-09-28：展开行默认按合约到期日排）。
+      //      「—」（没接过到期日）当最大 ⇒ 垫底。只有 1 个合约时无从比较，照过。
+      const dk = futD.map(v => (RE_D.test(v) ? v : '\uffff'));
+      const dSorted = dk.every((v, i) => i + 1 >= dk.length || v <= dk[i + 1]);
+      const oiCol = cellsOf(5).map(v => Number(v.replace(/,/g, '')) || 0);
+      if (trows.length > 1) {
+        say(dSorted, '展开的合约按**到期日近→远**排（缺到期日垫底）',
+            futD.slice(0, 5).join(' → ') + '　｜持仓量列 ' + oiCol.slice(0, 5).join(','));
+      } else {
+        say(true, '展开的合约按到期日近→远排（本次只展开出 1 个合约，无可比较）',
+            futD.join(','));
+      }
+
+      // 5c) 主连格上的天数 = 展开行里**最早的未过期**期权到期日（同一份数据、交叉验口径）
+      //     ⚠ 展开行的日期格可能带「 +N」尾巴（连续月份期权）⇒ 只取第一段日期。
+      const nearTxt = q(rowNow(), 'td:nth-child(3)').textContent.trim();
+      const nm = /^(\d+)\s*天$/.exec(nearTxt);
+      const two = (n) => String(n).padStart(2, '0');
+      const nowD = new Date();
+      const todayStr = nowD.getFullYear() + '-' + two(nowD.getMonth() + 1) + '-' + two(nowD.getDate());
+      const mdays = (s) => Math.round(
+        (new Date(+s.slice(0, 4), +s.slice(5, 7) - 1, +s.slice(8, 10))
+         - new Date(+todayStr.slice(0, 4), +todayStr.slice(5, 7) - 1, +todayStr.slice(8, 10)))
+        / 86400000);
+      const live = optD.map(v => v.split(' ')[0]).filter(v => RE_D.test(v) && v >= todayStr);
+      say(!!nm && live.length > 0 && +nm[1] === Math.min.apply(null, live.map(mdays)),
+          '主连格上的天数 = 展开行里最早的未过期期权到期日（两条路同一口径）',
+          '格子 ' + nearTxt + ' / 展开最早 ' + live.slice().sort()[0] + '（今天 ' + todayStr + '）');
+
+      // 5c2) 主连格上的「最近合约交割」= 展开行里**最早交割**的合约（两条路同一口径）。
+      //      ⚠ 与 5c 的期权不同：这里**含已交割的**（今天之前、最后一个行情日之后交割的合约
+      //         还在展开行里）⇒ 不过滤 todayStr，直接取展开行到期日列的最小值；主连格显示
+      //         「已交割」时那个最小值应为负、显示「今天交割」时应为 0。
+      //      ⚠ 展开行第一行未必带到期日（全品种都没接过到期日时）⇒ 那种主连格是「—」。
+      const dlTxt = q(rowNow(), 'td:nth-child(4)').textContent.trim();
+      const allFut = futD.filter(v => RE_D.test(v));
+      const minFut = allFut.length ? Math.min.apply(null, allFut.map(mdays)) : null;
+      say((/^\d+\s*天$/.test(dlTxt) && minFut !== null && +dlTxt.replace(/[^\d]/g, '') === minFut && minFut > 0)
+          || (dlTxt === '今天交割' && minFut === 0)
+          || (dlTxt === '已交割' && minFut !== null && minFut < 0)
+          || (dlTxt === '—' && minFut === null),
+          '主连格上的「最近合约交割」= 展开行里最早交割的合约（两条路同一口径）',
+          '格子 ' + dlTxt + ' / 展开最早 ' + (minFut === null ? '无到期日' : minFut + ' 天')
+          + '（今天 ' + todayStr + '）');
+
+      // 展开后箭头状态要跟着变（aria-expanded 与行/箭头状态一致）—— 重查，别用展开前的节点
+      const rn = rowNow(), exp = rn ? q(rn, '.ft-exp') : null;
+      say(!!exp && exp.getAttribute('aria-expanded') === 'true' && rn.classList.contains('open'),
+          '展开后箭头状态同步（aria-expanded=true + 行加 .open）',
+          exp ? 'aria=' + exp.getAttribute('aria-expanded') : '没找到 .ft-exp');
+      // 再点「展开」那个三角按钮收起（两条点击路径都走一遍）
+      click(q(rowNow(), '.ft-exp'));
+      const closed = await waitFor(() => { const s = subOf(0); return (s && s.hasAttribute('hidden')) ? s : null; }, 4000, 200);
+      say(!!closed, '再点一次能收起');
+    }
+
+    // 6) 点「查看K线」→ 弹窗 + iframe 指向 /futures/kline（同源 iframe，K线只有一份实现）
+    //    先确认第 5 步的展开**没有**误开弹窗（分组属性与按钮属性撞名时就会误开，实测踩过）
+    const stray = qa(doc, '.modal-bg').length;
+    say(stray === 0, '展开操作不会误开 K 线弹窗（分组 key 与按钮 key 没撞名）', stray + ' 个弹窗');
+    const k0 = q(doc, 'tbody.ft-grp > tr.ft-main .ft-k button[data-k]');
+    const wantSecid = k0 ? (k0.getAttribute('data-k') || '') : '';
+    click(k0);
+    const modal = await waitFor(() => q(doc, '.modal-bg'), 6000, 200);
+    let src = '';
+    if (modal) {
+      const f = q(modal, 'iframe.kl-frame');
+      src = f ? (f.getAttribute('src') || '') : '';
+    }
+    say(!!modal, '点「查看K线」弹出弹窗', modal ? '' : '没出现 .modal-bg');
+    say(src.indexOf('/futures/kline?secid=') === 0 && src.indexOf('embed=1') > 0
+        && src.indexOf(encodeURIComponent(wantSecid)) > 0,
+        '弹窗里是同源 iframe 指向 /futures/kline?embed=1 且带的是这一行的 secid', src);
+    if (modal) {
+      click(q(modal, '[data-close]'));
+      const gone = await waitFor(() => (qa(doc, '.modal-bg').length === 0 ? 1 : null), 4000, 200);
+      say(!!gone, '关掉弹窗不留残壳', gone ? '' : '还剩 ' + qa(doc, '.modal-bg').length + ' 个');
+    }
+
+    // 7) 排序：默认「最近期权到期」升序；三列表头都能切字段 / 反向
+    //    ⚠ 比的是同一份数据的大小关系（不写死数值），且**切完必须重查节点**（render 换了整个 thead）
+    const thOpt0 = q(doc, '#ft-th-opt'), thPct0 = q(doc, '#ft-th-pct');
+    say(!!thOpt0 && thOpt0.classList.contains('sort-asc') && !thOpt0.classList.contains('sort-desc')
+        && !thPct0.classList.contains('sort-asc') && !thPct0.classList.contains('sort-desc'),
+        '默认排序箭头只亮「最近期权到期」那列（升序）',
+        'opt=' + (thOpt0 ? thOpt0.className : '?') + ' / pct=' + thPct0.className);
+
+    // 7a) 同列再点 → 反向（从大到小）
+    click(q(doc, '#ft-th-opt'));
+    await sleep(450);
+    const dDesc = nearDays().filter(v => v !== null);
+    say(q(doc, '#ft-th-opt').classList.contains('sort-desc') && dDesc.length > 0
+        && dDesc.every((v, i) => i + 1 >= dDesc.length || v >= dDesc[i + 1]),
+        '再点「最近期权到期」表头能反向（从大到小）', dDesc.slice(0, 5).join(','));
+
+    // 7b) 点另一列 → 换排序字段（涨跌幅的直觉默认方向是「从大到小」）
+    click(q(doc, '#ft-th-pct'));
+    await sleep(450);
+    const afterPct = pctsOf();
+    const thPctNow = q(doc, '#ft-th-pct');
+    say(thPctNow.classList.contains('sort-desc') && !thPctNow.classList.contains('sort-asc')
+        && afterPct.length > 0
+        && afterPct[0] === Math.max.apply(null, afterPct.concat([-Infinity]))
+        && afterPct.every((v, i) => i + 1 >= afterPct.length || v >= afterPct[i + 1]),
+        '点「涨跌幅」表头改成按涨跌幅从大到小（箭头换到这一列）', afterPct.slice(0, 5).join(','));
+
+    // 7c) 同一列再点 → 升序
+    click(q(doc, '#ft-th-pct'));
+    await sleep(450);
+    const ascPct = pctsOf();
+    say(q(doc, '#ft-th-pct').classList.contains('sort-asc') && ascPct.length > 0
+        && ascPct.every((v, i) => i + 1 >= ascPct.length || v <= ascPct[i + 1]),
+        '再点一次切到升序', ascPct.slice(0, 5).join(','));
+
+    // 7d) 点第三列「最近合约交割」→ 换排序字段。直觉默认方向是**从小到大**（快交割的在前，
+    //     与「最近期权到期」同向 —— 三列里只有涨跌幅默认从大到小）。
+    //     「已交割」文本不给具体负数 ⇒ 映射成 -Infinity（只知 <=0，且必排在最前）；
+    //     「今天交割」= 0；「—」= null，**无论方向都垫底**（没这个信息不是「0 天后交割」）。
+    const dlVal = (v) => {
+      const m = /^(\d+)\s*天$/.exec(v);
+      if (m) return +m[1];
+      if (v === '今天交割') return 0;
+      if (v === '已交割') return -Infinity;
+      return null;
+    };
+    click(q(doc, '#ft-th-dl'));
+    await sleep(450);
+    const dlAscRaw = qa(doc, 'tbody.ft-grp > tr.ft-main td:nth-child(4)')
+      .map(td => td.textContent.trim());
+    const dlAsc = dlAscRaw.map(dlVal);
+    const dlAscVals = dlAsc.filter(v => v !== null);
+    say(q(doc, '#ft-th-dl').classList.contains('sort-asc')
+        && !q(doc, '#ft-th-dl').classList.contains('sort-desc')
+        && dlAscVals.length > 0
+        && dlAscVals.every((v, i) => i + 1 >= dlAscVals.length || v <= dlAscVals[i + 1])
+        && dlAsc.slice(0, dlAscVals.length).every(v => v !== null),
+        '点「最近合约交割」表头改成按它从小到大（快交割/已交割在前、「—」垫底）',
+        dlAscRaw.slice(0, 6).join(','));
+
+    // 7e) 同一列再点 → 反向（从大到小）；「—」仍然垫底（不该因为反向跑到最前）
+    click(q(doc, '#ft-th-dl'));
+    await sleep(450);
+    const dlDescRaw = qa(doc, 'tbody.ft-grp > tr.ft-main td:nth-child(4)')
+      .map(td => td.textContent.trim());
+    const dlDesc = dlDescRaw.map(dlVal);
+    const dlDescVals = dlDesc.filter(v => v !== null);
+    say(q(doc, '#ft-th-dl').classList.contains('sort-desc')
+        && dlDescVals.length > 0
+        && dlDescVals.every((v, i) => i + 1 >= dlDescVals.length || v >= dlDescVals[i + 1])
+        && dlDesc.slice(0, dlDescVals.length).every(v => v !== null),
+        '再点一次切到从大到小（「—」还是垫底）',
+        dlDescRaw.slice(0, 6).join(','));
+
+    // 收尾：切回默认（期权升序），别把后面的搜索 / 筛选断言带偏
+    click(q(doc, '#ft-th-opt'));
+    await sleep(400);
+    say(q(doc, '#ft-th-opt').classList.contains('sort-asc'),
+        '能从别的列切回「最近期权到期」升序');
+
+    // 8) 搜索：只留匹配的
+    const inp = q(doc, '#ft-q');
+    inp.value = '橡胶';
+    inp.dispatchEvent(new Event('input', { bubbles: true }));
+    await sleep(600);
+    const left = namesOf();
+    say(left.length > 0 && left.length < names.length && left.every(n => n.indexOf('橡胶') >= 0),
+        '搜索「橡胶」能筛出子集且都含关键词', names.length + ' → ' + left.length + '：' + left.slice(0, 3).join('/'));
+    inp.value = '';
+    inp.dispatchEvent(new Event('input', { bubbles: true }));
+    await sleep(500);
+
+    // 9) 市场筛选
+    const sel = q(doc, '#ft-mkt');
+    const opt = qa(doc, '#ft-mkt option').filter(o => o.value)[0];
+    if (sel && opt) {
+      sel.value = opt.value;
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+      await sleep(450);
+      const after2 = rows();
+      const tags = Array.from(new Set(after2.map(r => { const t = q(r, '.tag'); return t ? t.textContent.trim() : ''; })));
+      say(after2.length > 0 && after2.length <= grps.length && tags.length === 1,
+          '按交易所筛选后只剩这一家', opt.textContent.trim() + ' → ' + after2.length + ' 行，tag=' + tags.join(','));
+      sel.value = '';
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+      await sleep(350);
+    } else {
+      note('市场下拉没找到可选项，跳过筛选实测');
+    }
+
+    // ---------------- 二、K 线页（弹窗里嵌的那一页） ----------------
+    const kf = await mkFrame('/futures/kline?secid=RU.SHF&name=%E6%A9%A1%E8%83%B6%E4%B8%BB%E5%8A%9B&embed=1');
+    const kdoc = kf.contentDocument;
+    const cv = await waitFor(() => {
+      const c = q(kdoc, '#fk-chart canvas');
+      return (c && c.width > 50 && c.height > 50) ? c : null;
+    }, 20000, 300);
+    say(!!cv, 'K 线页真画出图（canvas 有尺寸）', cv ? cv.width + 'x' + cv.height : '没等到 canvas');
+    say(!!q(kdoc, '#fk-klt') && !!q(kdoc, '#fk-limit'), 'K 线页有周期 / 根数切换');
+    const title = kdoc.title || '';
+    say(title.indexOf('期货K线') >= 0, 'K 线页标题带上是哪个合约', title);
+    // 切周 K 后仍然有图（真打接口，验「换口径也画得出来」）
+    if (q(kdoc, '#fk-klt')) {
+      const s2 = q(kdoc, '#fk-klt');
+      s2.value = '102';
+      s2.dispatchEvent(new Event('change', { bubbles: true }));
+      const cv2 = await waitFor(() => {
+        const c = q(kdoc, '#fk-chart canvas');
+        return (c && c.width > 50) ? c : null;
+      }, 12000, 300);
+      say(!!cv2, '切到周K仍能画出来');
+    }
+
+    lines.push('DONE ' + lines.filter(l => l.indexOf('OK') === 0).length + ' OK / '
+      + lines.filter(l => l.indexOf('FAIL') === 0).length + ' FAIL');
+    paint();
+  })().catch(e => { say(false, '探针自身异常', (e && e.message) || String(e)); note('探针中断'); });
+})();
+</script>
+</body>
+</html>

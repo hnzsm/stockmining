@@ -1,0 +1,1511 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>个股诊断图表探针</title>
+<style>
+  body{margin:0;background:#0d1117;color:#e6ebf4;font:13px/1.6 Consolas,monospace}
+  #out{white-space:pre-wrap;padding:12px;margin:0}
+  iframe{position:fixed;left:-99999px;top:0;width:1440px;height:1400px;border:0}
+</style>
+</head>
+<body>
+<pre id="out">未运行 —— 本页是自检探针，加 ?run=1 才开始（只读 DOM、只操作图表，不写任何数据）。</pre>
+<script>
+/* ============================================================================
+   个股诊断「K线 + 下挂指标」探针
+   ----------------------------------------------------------------------------
+   要验的三件事，光读模板文本一个都验不出来：
+     1) MACD / KDJ 真的排在 K 线**下面**，且和 K 线是同一个实例（不是各画各的）；
+     2) 拖 K 线的时间轴，下挂格**真的**跟着走 —— 也就是每个 grid（K线 / 成交量 / 各下挂格）的 x 轴可见窗口
+        是同一段。光看 dataZoom 里写了 xAxisIndex:[0,1,2] 不够，得真拖一下、
+        再逐个 grid 比对同一日期映射到的像素；
+     3) 下挂指标真的能切换（切完是另一个指标的线，不是没反应）；
+     4) K 线上方 4 张卡片里，第 3 张是**基本面**（PE/PB/PS/总市值/流通市值/换手率），
+        内容与后端给的 fundamental 逐字一致 —— 前端只铺格子，不自己算「万元→亿」；
+     5) 策略信号（命中/买入/卖出）真的画在 K 线上：锚在当日最低/最高价、偏移朝对的一边、
+        图例能单独开关，并且**换策略点「查询」之后跟着换**；
+     6) 第 4 张卡片是**策略收益**：主数/4 个小项/涨跌色全部逐字等于后端 perf，
+        区间与图上窗口同段，并且换策略点「查询」之后重算（不是留着上一份数字）；
+     7) K 线能切**周线**：换的是另一份面板（只画已收盘的完整周、指标按周K重算），
+        周K 的 close/open 必须等于该周最后/第一个交易日的日线复权价（同一份数），
+        并且「策略条件被搬到周K上重算」这件事要在标签 + 悬停里说出口。
+
+   注意：这里**不去读画布像素**。试过（getImageData 采样 + 图例开合做 A/B），
+   同一段代码在这套无头环境里三次跑出三种结果 —— 这种检查只会产出假红，按项目
+   规矩不如不验。改成验 option 里可确定的事实。
+
+   做法（沿用本项目探针的既有套路）：
+     · 把 /stock/600519.SH 塞进**同源 iframe**（src 必须用 JS 设，否则 load 监听挂不上）；
+     · 拿到 ECharts 实例：getOption() 验结构、convertToPixel 验对齐；
+     · 「拖动」用真的 MouseEvent 序列（mousedown → mousemove → mouseup），依次试
+       滑块手柄 / 滑块窗口体 / 主图平移，三种都改不动才判失败；
+     · 结果 JSON 写进 <pre id="out">，由 tools/verify_stock_ui.py 解析。
+   ============================================================================ */
+(function () {
+  var params = new URLSearchParams(location.search);
+  var out = document.getElementById('out');
+  if (params.get('run') !== '1') return;      // 门禁：防用户误开
+
+  var CHECKS = [];
+  // 信号标记的期望配色（A 股习惯：涨红跌绿；选股命中用品牌蓝）—— 换主题也不许动
+  var SIG_EXPECT = { entry: '#4b83ff', buy_trigger: '#e5352b', sell_signal: '#12a06a' };
+  function ok(name, cond, extra) {
+    CHECKS.push({ name: name, ok: !!cond, extra: extra == null ? '' : String(extra) });
+    out.textContent = JSON.stringify({ done: false, checks: CHECKS }, null, 1);
+  }
+
+  function waitFor(fn, limitMs, stepMs) {
+    return new Promise(function (resolve, reject) {
+      var t0 = Date.now();
+      (function tick() {
+        var v;
+        try { v = fn(); } catch (e) { v = null; }
+        if (v) return resolve(v);
+        if (Date.now() - t0 > limitMs) return reject(new Error('等待超时'));
+        setTimeout(tick, stepMs || 200);
+      })();
+    });
+  }
+
+  function loadPage(href) {
+    return new Promise(function (resolve) {
+      var f = document.createElement('iframe');
+      f.width = 1440; f.height = 1400;
+      f.addEventListener('load', function () { resolve(f); });
+      f.src = href;                        // 必须先挂 load 监听再赋 src
+      document.body.appendChild(f);
+    });
+  }
+
+  /* 每个 grid 的 x 轴是不是同一段窗口：同一个日期取样点必须映射到同一个像素 */
+  function axisDrift(inst, dates) {
+    var n = inst.getOption().grid.length, worst = 0;
+    for (var i = 0; i < dates.length; i++) {
+      var base = null;
+      for (var ax = 0; ax < n; ax++) {
+        var v;
+        try { v = inst.convertToPixel({ xAxisIndex: ax }, dates[i]); } catch (e) { v = NaN; }
+        if (!isFinite(v)) return Infinity;
+        if (base === null) base = v;
+        worst = Math.max(worst, Math.abs(v - base));
+      }
+    }
+    return worst;
+  }
+
+  (async function () {
+    try {
+      var f = await loadPage('/stock/600519.SH');
+      var W = f.contentWindow, D = f.contentDocument;
+
+      /* 真鼠标事件。两个坑（都是实测踩出来的）：
+         1) zrender 的监听（含全局的 move/up）都挂在**画布/视口根**上，
+            事件发到 document/window 它收不到 —— 必须发到 canvas，靠冒泡上去；
+         2) 合成事件的 offsetX/offsetY 恒为 0，而 zrender 优先读它算命中点，
+            不改的话命中点永远是左上角。合成时在实例上重定义成正确的本地坐标。
+         另外支持 PointerEvent 的浏览器里 zrender 走 pointer* 那一套，两套都发。 */
+      var cv = null;    // 画布：等 #chart-stock 出来后再取（下面 await 之后赋值）
+      var rc = null;    // 画布 rect，用来算本地坐标
+      function mkEvent(type, x, y, buttons, Ctor, extra) {
+        var o = { bubbles: true, cancelable: true, view: W,
+                  clientX: x, clientY: y, button: 0, buttons: buttons };
+        if (extra) Object.keys(extra).forEach(function (k) { o[k] = extra[k]; });
+        var e = new Ctor(type, o);
+        [['offsetX', x - rc.left], ['offsetY', y - rc.top],
+         ['layerX', x - rc.left], ['layerY', y - rc.top]].forEach(function (kv) {
+          Object.defineProperty(e, kv[0], { value: kv[1], configurable: true });
+        });
+        return e;
+      }
+      function fire(type, x, y, buttons) {
+        cv.dispatchEvent(mkEvent(type, x, y, buttons, W.MouseEvent));
+        var pmap = { mousedown: 'pointerdown', mousemove: 'pointermove', mouseup: 'pointerup' };
+        if (W.PointerEvent && pmap[type]) {
+          cv.dispatchEvent(mkEvent(pmap[type], x, y, buttons, W.PointerEvent,
+                                   { pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+        }
+      }
+      function down(x, y) { fire('mousedown', x, y, 1); }
+      function move(x, y) { fire('mousemove', x, y, 1); }
+      function up(x, y) { fire('mouseup', x, y, 0); }
+      function drag(x0, y0, steps) {
+        down(x0, y0);
+        steps.forEach(function (dx) { move(x0 + dx, y0); });
+        up(x0 + steps[steps.length - 1], y0);
+      }
+
+      var box = await waitFor(function () {
+        var el = D.getElementById('chart-stock');
+        return el && el.clientWidth > 300 ? el : null;
+      }, 40000);
+      ok('图表容器渲染完成且宽度合理', box.clientWidth > 300, box.clientWidth + 'x' + box.clientHeight);
+      cv = box.querySelector('canvas');
+      rc = cv.getBoundingClientRect();      // 本地坐标换算基准（zrender 按这个算命中点）
+
+      var inst = await waitFor(function () {
+        var c = W.echarts && W.echarts.getInstanceByDom(box);
+        return c && c.getOption().series && c.getOption().series.length > 5 ? c : null;
+      }, 40000);
+      var dbg = W.__stDebug;
+      ok('页面暴露了探针钩子 __stDebug', !!dbg);
+
+      /* ---------------- 1. 结构：K线在上、两格下挂在下面，共用一个实例 ------------- */
+      // 页面上还有筹码两张小图（股东户数 / 两融），它们本来就该是独立实例；
+      // 这条只针对 **K 线卡片内部** —— 下挂指标必须合并进 K 线那一个实例里。
+      var kCard = D.getElementById('chart-stock').closest('.card') || D;
+      ok('K线卡片里只有一个图表容器（下挂指标合并在同一个实例，不是各画各的）',
+         !D.getElementById('chart-macd') && !D.getElementById('chart-kdj') &&
+         kCard.querySelectorAll('.chart').length === 1,
+         'K线卡片内 .chart ' + kCard.querySelectorAll('.chart').length +
+         ' 个 / 全页 ' + D.querySelectorAll('.chart').length + ' 个（另有筹码两张小图）');
+
+      var selA = D.getElementById('st-ind-a'), selB = D.getElementById('st-ind-b');
+      ok('两个下挂指标下拉都在卡片标题栏里（不占图表高度）',
+         !!selA && !!selB && !!D.querySelector('.card-head .ind-picks #st-ind-a'));
+      var cat = dbg.catalog();
+      var catKeys = cat.map(function (g) { return g.key; });
+      /* 成交量（vol）是**固定格**：它贴在 K 线正下方，不进下拉（否则能选第二次、
+         同一格画两遍）。所以选项数 = 目录 - 1（vol）+ 1（「不显示」）。 */
+      ok('下拉选项 = 后端目录去掉固定的成交量那一组 + 「不显示」',
+         selA.options.length === cat.length - 1 + 1,
+         selA.options.length + ' 项 vs 目录 ' + cat.length + ' 组（含固定的 vol）');
+      ok('默认选中 MACD + KDJ', selA.value === 'macd' && selB.value === 'kdj',
+         selA.value + ' / ' + selB.value);
+      var optNames = [].slice.call(selA.options).map(function (o) { return o.value; });
+      ok('除固定的成交量外，目录里每一组都能在下拉里选到（且 vol 不在下拉里）',
+         catKeys.filter(function (kk) { return kk !== 'vol'; })
+                .every(function (kk) { return optNames.indexOf(kk) >= 0; }) &&
+         optNames.indexOf('vol') < 0, catKeys.join(','));
+
+      var o = inst.getOption();
+      /* ⚠ 只验「top 递增」是不够的：每格只挪 GAP、忘了加本格高度时，top 照样递增，
+         格子却全叠在一起（成交量盖住 MACD 那次就是这么从断言底下溜过去的）。
+         真正的判据是**不重叠**：下一格的 top ≥ 上一格的底。 */
+      var geo = o.grid.map(function (g) {
+        return Math.round(g.top) + '~' + Math.round(g.top + g.height);
+      });
+      ok('各格自上而下排列、互不重叠（下一格 top ≥ 上一格底）',
+         o.grid.every(function (g, i) {
+           return i === 0 || g.top >= o.grid[i - 1].top + o.grid[i - 1].height - 0.5;
+         }), geo.join(' , '));
+      var lgeo = [];
+      (o.legend || []).forEach(function (l, i) {
+        if (i === 0) return;                         // 第 0 组是 K 线图例，贴顶部
+        var prev = o.grid[i - 1];
+        if (typeof l.top === 'number' && l.top + 2 < prev.top + prev.height) {
+          lgeo.push(i + ' 组图例 top=' + l.top + ' 压到上一格 ' + Math.round(prev.top + prev.height));
+        }
+      });
+      ok('每格图例贴在自己那格上方，没压到上一格的内容', lgeo.length === 0, lgeo.join(' ; '));
+      /* 需求的原文就是「在 K 线预览的下面、macd 指标图的上面，加上成交量」——
+         所以这条断言锁的是**顺序**：K线 → 成交量 → 其余下挂指标。 */
+      ok('K线在最上、成交量紧随其后、两格下挂依次排在下面（top 递增）',
+         o.grid.length === 4 && o.grid[0].top < o.grid[1].top &&
+         o.grid[1].top < o.grid[2].top && o.grid[2].top < o.grid[3].top,
+         o.grid.map(function (g) { return Math.round(g.top); }).join(' < '));
+      ok('成交量画在 grid 1（K 线正下方那一格），不是混在下挂指标里',
+         (function () {
+           var vb = o.series.filter(function (s) { return s.name === '成交量'; })[0];
+           return !!vb && vb.xAxisIndex === 1 && vb.yAxisIndex === 1;
+         })(),
+         JSON.stringify((o.series.filter(function (s) { return s.name === '成交量'; })[0] || {})
+                        .xAxisIndex));
+      ok('成交量格比下挂指标格矮一档（辅助格，不抢主图高度）',
+         o.grid[0].height > o.grid[1].height && o.grid[1].height < o.grid[2].height,
+         o.grid.map(function (g) { return g.height; }).join(' / '));
+
+      var dz = o.dataZoom || [];
+      ok('两个缩放组件都作用在全部 x 轴上（这就是同步的实现本体）',
+         dz.length === 2 && dz.every(function (z) { return [].concat(z.xAxisIndex || []).length === o.grid.length; }),
+         dz.map(function (z) { return JSON.stringify(z.xAxisIndex); }).join(' | '));
+      var link = o.axisPointer && o.axisPointer[0] && o.axisPointer[0].link;
+      ok('十字光标联动覆盖全部 x 轴',
+         !!link && link.some(function (l) { return l.xAxisIndex === 'all'; }), JSON.stringify(link));
+      ok('只有最下面一格显示日期标签（其余留白给指标）',
+         o.xAxis.every(function (a, i) { return a.axisLabel.show === (i === o.grid.length - 1); }),
+         o.xAxis.map(function (a) { return a.axisLabel.show; }).join(','));
+
+      var rows = dbg.rows();
+      var mf = o.series.filter(function (s) { return s.type === 'candlestick'; })[0];
+      var kd = (mf.data || [])[0];
+      ok('K线数据顺序是 [开, 收, 低, 高]（不是 OHLC）',
+         Array.isArray(kd) && kd.length === 4 && kd[1] === rows[0].close && kd[3] === rows[0].high,
+         JSON.stringify(kd) + ' vs 行收' + rows[0].close + ' 高' + rows[0].high);
+      // scatter 是「信号点清单」（只有命中的那些根），本来就不是逐根数组
+      ok('每根线/柱的数据长度都等于 K 线根数（没有错位；信号 scatter 除外）',
+         o.series.every(function (s) {
+           return s.type === 'scatter' || !s.data || s.data.length === 0 || s.data.length === rows.length;
+         }),
+         '行数 ' + rows.length + '；scatter ' +
+         o.series.filter(function (s) { return s.type === 'scatter'; })
+                 .map(function (s) { return s.name + '=' + ((s.data || []).length); }).join(','));
+
+      /* ---------------- 2. 真拖时间轴 → 每格必须同步 ------------- */
+      var xd = o.xAxis[0].data;
+      var dates = [];
+      for (var k = 0; k < xd.length; k += Math.max(1, Math.floor(xd.length / 12))) dates.push(xd[k]);
+      dates.push(xd[xd.length - 1]);
+
+      var zoomOf = function () {
+        var z = inst.getOption().dataZoom[0];
+        return { start: Number(z.start), end: Number(z.end) };
+      };
+      var gr = 58, gw = box.clientWidth - 116;
+      var ySlider = Math.round(box.clientHeight - 20);
+      var yGrid0 = Math.round(o.grid[0].top + o.grid[0].height / 2);
+      var used = [];
+
+      var z0 = zoomOf();
+      drag(Math.round(rc.left + gr + (z0.start / 100) * gw) + 4, rc.top + ySlider, [12, 40, 80, 120]);
+      if (zoomOf().start !== z0.start) used.push('拖滑块手柄');
+      if (!used.length) {
+        var zb = zoomOf();
+        var xb = Math.round(rc.left + gr + ((zb.start + zb.end) / 200) * gw);
+        drag(xb, rc.top + ySlider, [-20, -60, -110]);
+        if (zoomOf().start !== zb.start) used.push('拖滑块窗口');
+      }
+      if (!used.length) {
+        var zg = zoomOf();
+        drag(Math.round(rc.left + gr + gw * 0.3), rc.top + yGrid0, [30, 90, 160]);
+        if (zoomOf().start !== zg.start) used.push('在主图上平移');
+      }
+      var z1 = zoomOf();
+      ok('真的能拖动时间轴（鼠标事件生效，缩放窗口变了）', used.length > 0,
+         used.length ? ('方式 ' + used.join('/') + '，start ' + z0.start.toFixed(1) + '→' + z1.start.toFixed(1))
+                     : '三种拖法都没改动窗口');
+
+      var drift = axisDrift(inst, dates);
+      ok('拖完之后每一格（含成交量格）的 x 轴窗口完全一致（下挂格真的跟着走）',
+         drift < 0.5, '最大像素偏差 ' + (drift === Infinity ? 'Infinity' : drift.toFixed(4)) + 'px');
+
+      /* ---------------- 3. 切换下挂指标 ------------- */
+      function names() { return inst.getOption().series.map(function (s) { return s.name; }); }
+      ok('默认两格下挂 = MACD + KDJ 的线都在图上（外加固定的成交量格）',
+         o.grid.length === 4 && names().indexOf('DIF') >= 0 && names().indexOf('DEA') >= 0 &&
+         names().indexOf('K') >= 0 && names().indexOf('J') >= 0,
+         o.grid.length + ' 格：' + names().join(','));
+
+      selA.value = 'rsi';
+      selA.dispatchEvent(new W.Event('change', { bubbles: true }));
+      await waitFor(function () { return names().indexOf('RSI6') >= 0 ? 1 : null; }, 5000, 60);
+      var after = names();
+      ok('把第 1 格切到 RSI：新指标的线出现、旧指标的线消失',
+         after.indexOf('RSI6') >= 0 && after.indexOf('RSI12') >= 0 && after.indexOf('RSI24') >= 0 &&
+         after.indexOf('DIF') < 0 && after.indexOf('DEA') < 0, after.join(','));
+      ok('切换后栅格数不变（K线+成交量还在，第 2 格 KDJ 还在）',
+         inst.getOption().grid.length === 4 && after.indexOf('K') >= 0,
+         inst.getOption().grid.length + ' 格');
+      var z2 = zoomOf();
+      ok('切指标不会把已缩放的窗口顶回默认（记得住当前窗口）',
+         Math.abs(z2.start - z1.start) < 0.6 && Math.abs(z2.end - z1.end) < 0.6,
+         '拖后 ' + z1.start.toFixed(1) + '~' + z1.end.toFixed(1) +
+         ' → 切后 ' + z2.start.toFixed(1) + '~' + z2.end.toFixed(1));
+
+      selA.value = '';
+      selA.dispatchEvent(new W.Event('change', { bubbles: true }));
+      await waitFor(function () { return inst.getOption().grid.length === 3 ? 1 : null; }, 5000, 60);
+      ok('第 1 格选「不显示」→ 只剩 K线 + 成交量 + 1 格',
+         inst.getOption().grid.length === 3, inst.getOption().grid.length + ' 格');
+
+      selB.value = '';
+      selB.dispatchEvent(new W.Event('change', { bubbles: true }));
+      await waitFor(function () { return inst.getOption().grid.length === 2 ? 1 : null; }, 5000, 60);
+      var o1 = inst.getOption();
+      ok('两格都关掉 → 只剩 K线 + 成交量两格（成交量是固定格，关不掉），缩放仍作用在两格上',
+         o1.grid.length === 2 && [].concat(o1.dataZoom[0].xAxisIndex).length === 2,
+         o1.grid.length + ' 格 / xAxisIndex=' + JSON.stringify(o1.dataZoom[0].xAxisIndex));
+
+      /* ---------------- 4. 恢复默认、验量柱着色、验 tooltip ------------- */
+      selA.value = 'macd'; selB.value = 'kdj';
+      selA.dispatchEvent(new W.Event('change', { bubbles: true }));
+      await waitFor(function () { return inst.getOption().grid.length === 4 ? 1 : null; }, 5000, 60);
+
+      // 成交量柱必须按当日 K 线阴阳着色（A 股习惯：收阳红 / 收阴绿），
+      // 不是按数值正负 —— 量恒为正，那样会全是红的。
+      // ⚠ 它现在是**固定格**，直接量默认那根柱就行；**别再写 `selB.value = 'vol'`** ——
+      //   它已经不在下拉里，赋一个不存在的选项会把 select 打成空值 → 图反而少一格，
+      //   后面每一段 waitFor 都要等满超时才收场（探针会一路卡到 dump 超时）。
+      var vbar = inst.getOption().series.filter(function (s) { return s.name === '成交量'; })[0];
+      var badColor = [], checked = 0;
+      ((vbar && vbar.data) || []).forEach(function (dd, i) {
+        var r = rows[i];
+        if (!r || r.close == null || r.open == null || dd.value == null) return;
+        checked++;
+        var want = r.close >= r.open ? '#e5352b' : '#12a06a';
+        if (dd.itemStyle.color !== want) badColor.push(i + ':' + dd.itemStyle.color + '≠' + want);
+      });
+      ok('成交量柱按当日阴阳着色（收阳红 / 收阴绿，不是按数值正负）',
+         checked > 100 && badColor.length === 0,
+         checked + ' 根，异常 ' + (badColor.slice(0, 3).join(',') || '0'));
+      selB.value = 'kdj';
+      selB.dispatchEvent(new W.Event('change', { bubbles: true }));
+      await waitFor(function () { return names().indexOf('K') >= 0 ? 1 : null; }, 5000, 60);
+
+      var og = inst.getOption();
+      // 悬停点取**第一个真正的下挂指标格**（MACD）的中点 —— grid 1 现在是成交量格
+      var ySub = Math.round(og.grid[2].top + og.grid[2].height / 2);
+      move(rc.left + box.clientWidth / 2, rc.top + ySub - 4);
+      move(rc.left + Math.round(gr + gw * 0.5), rc.top + ySub);
+      await new Promise(function (r) { setTimeout(r, 400); });
+
+      var cand = [].slice.call(box.querySelectorAll('div')).filter(function (d) {
+        return d.style && d.style.position === 'absolute' && d.offsetWidth > 20 && d.innerText;
+      });
+      var tip = cand.filter(function (d) { return d.innerText.indexOf('开 ') >= 0; })[0];
+      ok('在指标格上悬停能出 tooltip（带 K 线开高低收，便于对着形态看指标）',
+         !!tip, tip ? tip.innerText.replace(/\s+/g, ' ').slice(0, 140)
+                    : ('候选 ' + cand.length + ' 个都不含「开 」'));
+      if (tip) {
+        var tt = tip.innerText;
+        ok('tooltip 里同时有 DIF/DEA/MACD 三条的读数',
+           tt.indexOf('DIF') >= 0 && tt.indexOf('DEA') >= 0 && tt.indexOf('MACD') >= 0,
+           tt.replace(/\s+/g, ' ').slice(0, 140));
+      }
+
+      /* ---------------- 5. 口径一致性：目录 / 调色板 / 数值格式 ------------- */
+      var palKeys = Object.keys(dbg.pal()), fmtOk = dbg.fmtTokens();
+      ok('调色板覆盖目录里的每一组（配色不会漏组落到灰线）',
+         catKeys.every(function (k) { return palKeys.indexOf(k) >= 0; }),
+         '目录 ' + catKeys.join(',') + ' | 调色板 ' + palKeys.join(','));
+      var extraPal = palKeys.filter(function (k) { return catKeys.indexOf(k) < 0; });
+      ok('调色板没有多余项（目录里没有的组不该留配色）', extraPal.length === 0, extraPal.join(','));
+
+      var tokens = {}, needF = {};
+      cat.forEach(function (g) {
+        (g.series || []).forEach(function (s) {
+          tokens[s.fmt || 'plain'] = 1;
+          needF[s.f] = 1;
+        });
+      });
+      var missTok = Object.keys(tokens).filter(function (t) { return fmtOk.indexOf(t) < 0; });
+      ok('目录里的数值格式 token 前端都实现（单位不会退化成裸数字）',
+         missTok.length === 0, missTok.join(',') || Object.keys(tokens).join(','));
+      var missF = Object.keys(needF).filter(function (kk) { return !(kk in rows[0]); });
+      ok('目录引用的字段在行数据里都存在（不会画出空线）', missF.length === 0, missF.join(','));
+
+      var guides = inst.getOption().series.filter(function (s) { return s.name.indexOf('__guide__') === 0; });
+      var gk = guides.map(function (s) { return s.name.replace('__guide__', ''); });
+      // 只对**当前画着的那两格**要求有参考线 series（目录里其它组这会儿根本没画）
+      var shown = dbg.picked().groups.map(function (g) { return g.key; });
+      var wantG = cat.filter(function (g) {
+        return shown.indexOf(g.key) >= 0 && (g.guides || []).length;
+      }).map(function (g) { return g.key; });
+      ok('要画参考线的组都挂了空数据 series（免得跟着数据线被图例一起点掉）',
+         wantG.length > 0 && wantG.every(function (kk) { return gk.indexOf(kk) >= 0; }),
+         '当前画着 ' + shown.join(',') + ' | 需要 ' + wantG.join(',') + ' | 实有 ' + gk.join(','));
+      ok('参考线数值与目录一致',
+         guides.every(function (s) {
+           var g = cat.filter(function (x) { return x.key === s.name.replace('__guide__', ''); })[0];
+           var ml = (s.markLine && s.markLine.data) || [];
+           return !!g && ml.length === g.guides.length &&
+                  ml.every(function (m, i) { return m.yAxis === g.guides[i]; });
+         }),
+         guides.map(function (s) {
+           return s.name.replace('__guide__', '') + ':' +
+                  JSON.stringify(((s.markLine && s.markLine.data) || []).map(function (m) { return m.yAxis; }));
+         }).join(' '));
+
+      ok('筹码两张小图各占一格的双列网格，K 线**不在**里面（各画各的，不抢主轴）',
+         D.querySelectorAll('.grid.g2').length === 1 &&
+         !D.querySelector('.grid.g2 #chart-stock') &&
+         !!D.querySelector('.grid.g2 #chart-holder') &&
+         !!D.querySelector('.grid.g2 #chart-margin'),
+         D.querySelectorAll('.grid.g2').length + ' 个 g2；K线在 g2 里=' +
+         !!D.querySelector('.grid.g2 #chart-stock'));
+      ok('图例分组跟着格子走（K线 / 成交量 / 每格下挂各一组，各自贴在自己那格上方）',
+         (inst.getOption().legend || []).length === 4,
+         (inst.getOption().legend || []).map(function (l) { return l.top; }).join(','));
+
+      /* ---------------- 6. K 线上方那 4 张卡片：第 3 张必须是基本面 ------------- */
+      var cards = [].slice.call(D.querySelectorAll('#st-head > .stat'));
+      var labels = cards.map(function (c) {
+        var l = c.querySelector('.label');
+        return l ? l.textContent.replace(/\s+/g, ' ').trim() : '';
+      });
+      ok('K线上方仍是 4 张方块卡片', cards.length === 4,
+         cards.length + ' 张：' + labels.join(' | '));
+      // ⚠ 2026-10-09 起第 2 张**不再是「最新收盘」**，而是「开盘形态概率」；
+      //   原来那个收盘读数并进了第 1 张「股票」卡的 `.sub`（`#st-head-close`）。
+      ok('第 1 张仍是「股票」，且带上了原「最新收盘」的读数',
+         cards.length === 4 && labels[0].indexOf('股票') === 0 &&
+         !!cards[0].querySelector('#st-head-close'),
+         labels.join(' | '));
+      ok('第 2 张是「开盘形态概率」（顶替了原来的「最新收盘」）',
+         cards.length === 4 && labels[1].indexOf('开盘形态概率') === 0 &&
+         cards[1].id === 'st-head-open', labels.join(' | '));
+      ok('不再有独立的「最新收盘」卡（读数已并进「股票」卡）',
+         D.querySelectorAll('#st-head > .stat #st-head-close').length === 1,
+         '页面上 #st-head-close 出现 ' +
+         D.querySelectorAll('#st-head-close').length + ' 次');
+
+      var fcard = cards[2];
+      var flat = fcard ? [].slice.call(fcard.querySelectorAll('.fund span')) : [];
+      var fval = fcard ? [].slice.call(fcard.querySelectorAll('.fund b')) : [];
+      ok('第 3 张卡片是「基本面」，标签与数值成对渲染',
+         cards.length === 4 && labels[2].indexOf('基本面') === 0 &&
+         flat.length === 6 && fval.length === 6,
+         labels[2] + ' → ' + flat.map(function (s, i) {
+           return s.textContent + ' ' + (fval[i] ? fval[i].textContent : '');
+         }).join(' · '));
+      ok('第 3 张卡片不再显示 BOLL 下轨/中轨（位置让给基本面）',
+         cards.length === 4 && labels[2].indexOf('BOLL') < 0 &&
+         (fcard ? fcard.textContent : '').indexOf('BOLL') < 0, labels[2]);
+
+      // 卡片内容必须**逐字等于**后端给的那份（前端只是铺格子，不该自己改单位/挑字段）
+      var fd = dbg.fund() || { items: [] };
+      var want = (fd.items || []).map(function (i) { return i.label + '\u0000' + i.text; }).join('|');
+      var got = flat.map(function (s, i) {
+        return s.textContent + '\u0000' + (fval[i] ? fval[i].textContent : '');
+      }).join('|');
+      ok('卡片上每个标签/数值都与后端 fundamental 完全一致（单位换算没在 JS 里重算）',
+         want === got && (fd.items || []).length === 6, 'want ' + want + ' / got ' + got);
+      ok('基本面有真实数据（不是清一色「—」，说明 daily_basic 已同步）',
+         fval.filter(function (b) { return b.textContent.trim() !== '—'; }).length >= 6,
+         fval.map(function (b) { return b.textContent; }).join(','));
+      ok('市值带单位（亿 / 万亿），不是裸数字',
+         fval.some(function (b) { return /亿$/.test(b.textContent); }) &&
+         fval.every(function (b) {
+           var t = b.textContent.trim();
+           return t === '—' || /亿$/.test(t) || /^\d+(\.\d+)?%?$/.test(t);
+         }), fval.map(function (b) { return b.textContent; }).join(','));
+      ok('基本面卡片标了数据日期（取自最新那根 K 线）',
+         /^\d{4}-\d{2}-\d{2}$/.test((fd.as_of || '')) &&
+         labels[2].indexOf(fd.as_of) >= 0, labels[2] + ' / as_of=' + fd.as_of);
+
+      // 版式几何：两列网格最容易「标签压到数值上 / 数值被卡片裁掉」，读文本看不出来
+      var geo = [];
+      if (fcard && flat.length === 6 && fval.length === 6) {
+        var cr = fcard.getBoundingClientRect();
+        if (fcard.scrollWidth > fcard.clientWidth + 1) {
+          geo.push('卡片横向溢出 ' + fcard.scrollWidth + '>' + fcard.clientWidth);
+        }
+        for (var q = 0; q < 6; q++) {
+          var lr = flat[q].getBoundingClientRect(), vr = fval[q].getBoundingClientRect();
+          if (lr.right > vr.left + 0.5) geo.push(q + ' 标签与数值重叠');
+          if (vr.right > cr.right + 0.5 || vr.bottom > cr.bottom + 0.5) geo.push(q + ' 数值出界');
+        }
+      } else {
+        geo.push('标签/数值没取满 6 组');
+      }
+      ok('基本面卡片没被挤爆（标签不压数值、数值不出卡片）', geo.length === 0, geo.join('; '));
+
+      var hs = cards.map(function (c) { return Math.round(c.getBoundingClientRect().height); });
+      ok('四张方块卡片高度基本齐平（最高与最矮差 < 24px）',
+         hs.length === 4 && Math.max.apply(null, hs) - Math.min.apply(null, hs) < 24,
+         hs.join(' / ') + ' px');
+
+      /* ---------- 6b. 第 4 张卡片 = 策略收益（点查询就跟着算出来） ---------- */
+      var pcard = cards[3];
+      var pd = dbg.perf() || {};
+      var plabels = pcard ? [].slice.call(pcard.querySelectorAll('.fund span')) : [];
+      var pvals = pcard ? [].slice.call(pcard.querySelectorAll('.fund b')) : [];
+      var phero = pcard ? pcard.querySelector('.value') : null;
+      ok('第 4 张卡片是「策略收益」：主数是收益%，下面 4 个小项',
+         cards.length === 4 && labels[3].indexOf('策略收益') === 0 &&
+         !!phero && plabels.length === 4 && pvals.length === 4,
+         labels[3] + ' → ' + (phero ? phero.textContent : '?') + ' / ' +
+           plabels.map(function (s, i) {
+             return s.textContent + ' ' + (pvals[i] ? pvals[i].textContent : '');
+           }).join(' · '));
+      ok('主数与后端 perf.hero 逐字一致，涨跌色也用后端的（前端不自己判断正负）',
+         !!pd.hero && !!phero && phero.textContent.trim() === pd.hero.text &&
+         phero.classList.contains(pd.hero.cls),
+         (phero ? phero.textContent : '?') + ' vs ' + (pd.hero && pd.hero.text) +
+         ' cls=' + (pd.hero && pd.hero.cls));
+      var pw = (pd.items || []).map(function (i) { return i.label + '\u0000' + i.text; }).join('|');
+      var pg = plabels.map(function (s, i) {
+        return s.textContent + '\u0000' + (pvals[i] ? pvals[i].textContent : '');
+      }).join('|');
+      ok('4 个小项的标签/文本也与后端 perf.items 逐字一致（「几笔」「±%」没在 JS 里拼）',
+         pw === pg && (pd.items || []).length === 4, 'want ' + pw + ' / got ' + pg);
+      ok('收益小项的涨跌色 class 与后端一致（回撤/买入持有为负时走绿色）',
+         [].slice.call(pvals).every(function (b, i) {
+           var want = (pd.items || [])[i] ? ((pd.items[i].cls) || '') : '';
+           return want ? b.classList.contains(want) : !b.classList.contains('up') && !b.classList.contains('down');
+         }),
+         (pd.items || []).map(function (i, i2) {
+           return i.text + '=' + (i.cls || '无色') + '/' + (pvals[i2] ? pvals[i2].className : '?');
+         }).join(' '));
+      ok('收益数值都带单位或符号（「26 笔」/「+7.68%」），不是裸数字',
+         [].slice.call(pvals).every(function (b) {
+           return /^[+-]?\d+(\.\d+)?%$/.test(b.textContent.trim()) || /^\d+ 笔$/.test(b.textContent.trim());
+         }), [].slice.call(pvals).map(function (b) { return b.textContent; }).join(','));
+      ok('卡片标了收益口径（满仓单票 · N 根），鼠标悬停能看到区间',
+         (pd.badge || '').indexOf('满仓单票') >= 0 && labels[3].indexOf(pd.badge) >= 0 &&
+         (pcard.getAttribute('title') || '').indexOf(pd.range.start) >= 0 &&
+         (pcard.getAttribute('title') || '').indexOf(pd.range.end) >= 0,
+         pd.badge + ' / ' + (pcard.getAttribute('title') || ''));
+      ok('收益项就是「交易/胜率/最大回撤/买入持有」这 4 项',
+         (pd.items || []).map(function (i) { return i.label; }).join(',') === '交易,胜率,最大回撤,买入持有',
+         (pd.items || []).map(function (i) { return i.label; }).join(','));
+      var sub4 = pcard ? pcard.querySelector('.sub') : null;
+      var wHit = rows.filter(function (r) { return r.entry; }).length;
+      var wBuy = rows.filter(function (r) { return r.buy_trigger; }).length;
+      var wSell = rows.filter(function (r) { return r.sell_signal; }).length;
+      ok('原来的三档信号数挪到卡片下方小字，且与行内真值数一致',
+         !!sub4 && sub4.textContent.indexOf('命中 ' + wHit) >= 0 &&
+         sub4.textContent.indexOf('买入 ' + wBuy) >= 0 &&
+         sub4.textContent.indexOf('卖出 ' + wSell) >= 0,
+         (sub4 ? sub4.textContent.replace(/\s+/g, ' ') : '') + ' / 真值 ' + wHit + ',' + wBuy + ',' + wSell);
+      // 收益统计必须是**本区间**的：区间根数要等于图上画的根数，否则卡片和图不是一回事
+      ok('收益统计区间与图上窗口严格同段（起止日期 = 首尾 K 线）',
+         pd.range && pd.range.start === rows[0].trade_date &&
+         pd.range.end === rows[rows.length - 1].trade_date && pd.range.bars === rows.length,
+         JSON.stringify(pd.range) + ' vs ' + rows[0].trade_date + '~' + rows[rows.length - 1].trade_date);
+
+      var pgeo = [];
+      if (pcard && plabels.length === 4 && pvals.length === 4) {
+        var pcr = pcard.getBoundingClientRect();
+        if (pcard.scrollWidth > pcard.clientWidth + 1) {
+          pgeo.push('卡片横向溢出 ' + pcard.scrollWidth + '>' + pcard.clientWidth);
+        }
+        for (var pq = 0; pq < 4; pq++) {
+          var plr = plabels[pq].getBoundingClientRect(), pvr = pvals[pq].getBoundingClientRect();
+          if (plr.right > pvr.left + 0.5) pgeo.push(pq + ' 标签与数值重叠');
+          if (pvr.right > pcr.right + 0.5 || pvr.bottom > pcr.bottom + 0.5) pgeo.push(pq + ' 数值出界');
+        }
+        if (phero) {
+          var hr2 = phero.getBoundingClientRect();
+          if (hr2.right > pcr.right + 0.5) pgeo.push('主数出界');
+        }
+      } else {
+        pgeo.push('收益小项没取满 4 组');
+      }
+      ok('收益卡片没被挤爆（标签不压数值、数值/主数不出卡片）', pgeo.length === 0, pgeo.join('; '));
+      var heroBefore = (pd.hero && pd.hero.text) || '';
+      var perfBefore = JSON.stringify((pd.items || []).map(function (i) { return i.text; }));
+
+      /* ---------------- 7. 策略信号画在 K 线上 ----------------
+         要验的是「信号真的落在 K 线图上、位置对、换策略会换」。
+         做法刻意**不碰画布像素**：canvas 采样在这套无头环境里读数不稳定
+         （同一段代码三次跑出三种结果），会给出假红，不如不验。
+         改成验 option 里可确定的事实：哪几条 series、锚在哪个价位、偏移朝哪边、
+         图例带没带、点数等不等于行内真值数；再真切一次策略 + 点「查询」看它换。 */
+      // ⚠ 只认后端 signals() 清单里那几档：图上前几轮新加了「高开 / 低开」标记，
+      // 它们同样是 scatter，一刀切按 type 筛会误判成「目录外的信号」。
+      function sigSeries() {
+        var names = (dbg.signals() || []).map(function (s) { return s.name; });
+        return inst.getOption().series.filter(function (s) {
+          return s.type === 'scatter' && names.indexOf(s.name) >= 0;
+        });
+      }
+      // 后端 spec（side/shape/count/draw）与图上 series 对一遍，返回问题清单
+      function auditSignals() {
+        var list = dbg.signals() || [], rr = dbg.rows(), bad = [];
+        list.forEach(function (sp) {
+          var n = rr.filter(function (r) { return !!r[sp.f]; }).length;
+          if (n !== sp.count) bad.push(sp.name + ' 后端 ' + sp.count + '≠行内 ' + n);
+        });
+        var shown = sigSeries().map(function (s) { return s.name; });
+        var want = list.filter(function (s) { return s.draw && s.count > 0; }).map(function (s) { return s.name; });
+        if (shown.length !== want.length) bad.push('图上 ' + shown.join(',') + ' ≠ 该画 ' + want.join(','));
+        want.forEach(function (x) { if (shown.indexOf(x) < 0) bad.push('少画了 ' + x); });
+        sigSeries().forEach(function (s) {
+          var sp = list.filter(function (x) { return x.name === s.name; })[0];
+          if (!sp) { bad.push('图上有目录外的 ' + s.name); return; }
+          if (s.xAxisIndex !== 0 || s.yAxisIndex !== 0) bad.push(s.name + ' 没画在 K 线那一格');
+          var off = (s.symbolOffset || [0, 0])[1];
+          if (sp.side === 'below' ? !(off > 0) : !(off < 0)) {
+            bad.push(s.name + ' 偏移 ' + off + ' 与 side=' + sp.side + ' 反向');
+          }
+          if (sp.shape === 'arrow' && sp.side === 'above' && s.symbolRotate !== 180) {
+            bad.push(s.name + ' 上方箭头没翻转');
+          }
+          ((s.data) || []).forEach(function (d) {
+            var r = rr[d[0]] || {};
+            var w = sp.side === 'above' ? r.high : r.low;
+            if (typeof w !== 'number' || Math.abs(d[1] - w) > 1e-9) {
+              bad.push(s.name + ' 第' + d[0] + '根锚在 ' + d[1] + '（应为 ' + w + '）');
+            }
+          });
+        });
+        return { bad: bad, want: want, shown: shown, list: list };
+      }
+
+      var A1 = auditSignals();
+      ok('后端给了「策略信号怎么画」的清单（命中 / 买入 / 卖出三档）',
+         A1.list.length === 3 && ['entry', 'buy_trigger', 'sell_signal'].every(function (k) {
+           return A1.list.some(function (s) { return s.key === k; });
+         }), A1.list.map(function (s) { return s.key + '=' + s.count; }).join(' '));
+      ok('每档根数与行内真值数一致，且都锚在当日最低价（下）/ 最高价（上）、都画在 K 线格',
+         A1.bad.length === 0, A1.bad.slice(0, 4).join('; ') || (A1.want.join(',') + ' 共 ' + A1.shown.length + ' 条'));
+
+      var cbad = sigSeries().filter(function (s) {
+        var sp = A1.list.filter(function (x) { return x.name === s.name; })[0];
+        return !sp || s.itemStyle.color !== SIG_EXPECT[sp.key];
+      }).map(function (s) { return s.name + '=' + s.itemStyle.color; });
+      ok('信号配色按涨红跌绿（买入红 #e5352b / 卖出绿 #12a06a / 命中蓝）',
+         cbad.length === 0, cbad.join(',') || Object.keys(SIG_EXPECT).map(function (k) {
+           return k + '=' + SIG_EXPECT[k];
+         }).join(' '));
+
+      /* 两档都在下侧时必须错开：同一天既命中又触发买入的话，红三角会整个盖住蓝点
+         （600519 + 内置策略1 实测 99 天命中里有 40 天同时触发买入）。
+         ⚠ 偏移量是**按档位定的常量**（页面 `SIG_OFF`），所以这条**不该**依赖
+         「图上恰好同时画出了 entry 与 buy_trigger」：2026-10-11 起「没带选股条件就不铺
+         命中点」（用户：「别兜底，没有就没有」），整页诊断常常只剩买入/卖出两档，
+         照旧写法就成了看数据脸色（必假红）。改成两件事：
+           ① 从页面读 `SIG_OFF`，验「同在下侧的两档错开 ≥ 8px」（口径仍是一处）；
+           ② 验**画出来的每一档**的 `symbolOffset` 真的等于 `SIG_OFF` 里那一项
+              （防止常量改了、或某处又覆盖回去，图上与常量悄悄分岔）。 */
+      var so = (W.__stDebug && W.__stDebug.sigOff) ? W.__stDebug.sigOff() : null;
+      var offBad = [];
+      if (so) {
+        sigSeries().forEach(function (s) {
+          var sp = A1.list.filter(function (x) { return x.name === s.name; })[0];
+          var want = (sp && so[sp.side]) ? so[sp.side][sp.key] : null;
+          var got = (s.symbolOffset || [0, 0])[1];
+          if (want === null || got !== want) {
+            offBad.push(s.name + ' 图上 ' + got + ' ≠ SIG_OFF'
+                        + (sp ? '[' + sp.side + '][' + sp.key + ']' : '') + '=' + want);
+          }
+        });
+      }
+      var pad = so ? Math.abs(so.below.entry - so.below.buy_trigger) : -1;
+      ok('同在下侧的「命中」与「买入触发」错开 ≥ 8px（不会互相盖住），且图上每档偏移都按 SIG_OFF 来',
+         so !== null && pad >= 8 && so.below.entry > 0 && so.below.buy_trigger > 0
+           && so.below.entry === -so.above.entry && offBad.length === 0,
+         offBad.join('; ') || ('SIG_OFF=' + JSON.stringify(so) + '，错开 ' + pad
+                               + 'px，图上画了 ' + sigSeries().length + ' 档'));
+
+      var lgK = (inst.getOption().legend || [])[0] || {};
+      ok('K 线图例里带上了这几档信号（用户能自己点掉某一档）',
+         A1.want.length > 0 && A1.want.every(function (x) { return (lgK.data || []).indexOf(x) >= 0; }),
+         (lgK.data || []).join(','));
+      ok('「买入触发 / 卖出信号」未设条件时不硬铺箭头，且写明原因',
+         A1.list.filter(function (s) { return s.key !== 'entry' && !s.draw && s.count >= 0; })
+                 .every(function (s) { return s.note && s.note.length > 0; }),
+         A1.list.map(function (s) { return s.name + (s.note ? '(' + s.note + ')' : ''); }).join(' | '));
+
+      // 悬停到一根真有信号的日子：tooltip 表头要把信号名写出来（标记点小，容易看漏）
+      var dsp = A1.list.filter(function (s) { return s.draw; })[0];
+      var lastSig = -1;
+      if (dsp) {
+        dbg.rows().forEach(function (r, i) { if (r[dsp.f]) lastSig = i; });
+      }
+      if (lastSig < 0) {
+        ok('悬停到有信号的那一根时 tooltip 列出信号名', false, '窗口内找不到任何信号，没法验');
+      } else {
+        var sx = inst.convertToPixel({ xAxisIndex: 0 }, lastSig);
+        move(rc.left + sx - 4, rc.top + yGrid0);
+        move(rc.left + sx, rc.top + yGrid0);
+        await new Promise(function (r) { setTimeout(r, 400); });
+        var tip2 = [].slice.call(box.querySelectorAll('div')).filter(function (d) {
+          return d.style && d.style.position === 'absolute' && d.offsetWidth > 20 &&
+                 d.innerText && d.innerText.indexOf('开 ') >= 0;
+        })[0];
+        ok('悬停到有信号的那一根时 tooltip 列出信号名',
+           !!tip2 && tip2.innerText.indexOf(dsp.name) >= 0,
+           tip2 ? tip2.innerText.replace(/\s+/g, ' ').slice(0, 120) : '没出 tooltip');
+        // 蜡烛图的 value 首位是 dataIndex —— 直接当价格打会多一个假数字（259.00）
+        var tk2 = tip2 ? tip2.innerText.replace(/\s+/g, ' ') : '';
+        var mk = tk2.match(/K线: ([^ ]+(?: \/ [^ ]+)*)/);
+        var nk = mk ? mk[1].split(' / ').length : -1;
+        ok('tooltip 里 K 线那行正好 4 个价（没把 dataIndex 当价格打出来）',
+           nk === 4, 'K线: ' + (mk ? mk[1] : '（没有这一行）'));
+      }
+
+      /* ---------------- 8. 换策略 + 点「查询」→ 信号跟着换 ----------------
+         ⚠ 「查询」按钮走 `guardClick`（C38）：**两次点击间隔 < 600ms 会被静默忽略**。
+         探针要连点好几次，必须先等到上一次的锁放开再点 —— 直接 `.click()` 会被吞掉，
+         现象是「点了查询但图没换」，看起来像前端坏了（2026-10-07 实测：
+         第 8 段的循环 200ms 内就退出，紧接第 10 段的点击落在 600ms 窗口里 → 周K 整段假红）。 */
+      async function clickLoad() {
+        var el = D.getElementById('btn-load');
+        for (var i = 0; i < 60; i++) {
+          var gap = Date.now() - Number(el.dataset.lockTs || 0);
+          if (gap >= 650 && el.dataset.busy !== '1' && !el.disabled) break;
+          await new Promise(function (r) { setTimeout(r, 120); });
+        }
+        el.click();
+      }
+
+      var sel = D.getElementById('st-strategy');
+      var before = A1.list.map(function (s) { return s.name + '=' + s.count; }).join(',');
+      var picked = '', triedNames = [];
+      for (var oi = 0; oi < sel.options.length && !picked; oi++) {
+        if (sel.options[oi].value === sel.value) continue;
+        sel.value = sel.options[oi].value;
+        await clickLoad();
+        try {
+          await waitFor(function () {
+            var cur = (dbg.signals() || []).map(function (s) { return s.name + '=' + s.count; }).join(',');
+            return cur !== before ? 1 : null;
+          }, 30000, 200);
+          picked = sel.options[oi].text;
+        } catch (e) { triedNames.push(sel.options[oi].text); }
+      }
+      ok('换一个策略点「查询」，信号清单真的跟着换了',
+         !!picked, picked ? ('换到「' + picked + '」：' + before + ' → ' +
+                             (dbg.signals() || []).map(function (s) { return s.name + '=' + s.count; }).join(','))
+                          : ('试过的都没变：' + triedNames.join('、')));
+      var A2 = auditSignals();
+      ok('换完策略后，图上标记的条数/锚点/画法依然对得上（不是只换了数字）',
+         A2.bad.length === 0, A2.bad.slice(0, 4).join('; ') ||
+         ('该画 ' + A2.want.join(',') + '，实有 ' + A2.shown.join(',')));
+
+      /* ---------------- 9. 换策略后「策略收益」卡片跟着重算 ----------------
+         卡片是 render() 重写的（旧节点已作废），必须重新取一次。 */
+      var pd2 = dbg.perf() || {};
+      var pc2 = [].slice.call(D.querySelectorAll('#st-head > .stat'))[3];
+      var hero2 = pc2 ? pc2.querySelector('.value') : null;
+      ok('换策略点查询后，策略收益重新算过（不是留着上一份数字）',
+         !!pd2.hero && !!hero2 && pd2.hero.text !== heroBefore &&
+         hero2.textContent.trim() === pd2.hero.text,
+         heroBefore + ' → ' + (pd2.hero && pd2.hero.text));
+      var it2 = JSON.stringify((pd2.items || []).map(function (i) { return i.text; }));
+      ok('4 个小项也跟着换了（交易笔数/胜率/回撤/买入持有都重算）',
+         it2 !== perfBefore && !!(pd2.items || []).length,
+         perfBefore + ' → ' + it2);
+      ok('换策略后卡片仍显示 4 项、且区间与当前窗口一致',
+         (pd2.items || []).length === 4 && pd2.range.start === dbg.rows()[0].trade_date &&
+         pd2.range.end === dbg.rows()[dbg.rows().length - 1].trade_date,
+         JSON.stringify(pd2.range));
+      // 前端只铺格子：重渲染后的文本仍要逐字等于后端那一份
+      var pl2 = [].slice.call(pc2.querySelectorAll('.fund span'));
+      var pv2 = [].slice.call(pc2.querySelectorAll('.fund b'));
+      var pg2 = pl2.map(function (s, i) {
+        return s.textContent + '\u0000' + (pv2[i] ? pv2[i].textContent : '');
+      }).join('|');
+      ok('重渲染后卡片文本依旧与后端 perf.items 逐字一致',
+         pg2 === pw2(pd2), 'got ' + pg2);
+      function pw2(p) {
+        return (p.items || []).map(function (i) { return i.label + '\u0000' + i.text; }).join('|');
+      }
+      /* ---------------- 10. 切周期：K线可切周线 ----------------
+         周K**不是**「把日K画稀一点」：它是另一份面板 —— 只画已收盘的完整周、指标按周K
+         重算、策略条件也被搬到周K上求值（`w_close` 去掉前缀就是它自己）。三件事都得在
+         真页面上验，读模板一个字都读不出来：
+           1) 周期下拉真的换了数据集（不是没反应）；
+           2) 周K 的 close/open 确实等于「该周最后/第一个交易日」的日线复权价（同一份数，
+              不是另算一套），用页面上现成的日K行数据独立复算；
+           3) 「这不是原策略」这件事**说出口了**（标签 + 悬停说明），不能悄悄换口径。 */
+      var selF = D.getElementById('st-freq');
+      ok('查询条件里有「周期」下拉（日线 / 周线）',
+         !!selF && selF.options.length === 2 &&
+         [].slice.call(selF.options).map(function (x) { return x.value; }).join(',') === 'daily,weekly',
+         selF ? [].slice.call(selF.options).map(function (x) { return x.text + '=' + x.value; }).join(',') : '没有这个下拉');
+
+      var vtag = D.getElementById('st-view-tag');
+      ok('图表标题栏挂着「当前是什么周期」的标签（不看坐标轴也知道在看日K还是周K）',
+         !!vtag && (vtag.textContent || '').length > 0 && vtag.className.indexOf('tag') >= 0,
+         vtag ? vtag.textContent + ' / class=' + vtag.className : '没有 #st-view-tag');
+
+      var dailyRows = dbg.rows();
+      var dv = dbg.view() || {};
+      var dmap = {};
+      dailyRows.forEach(function (r) { dmap[r.trade_date] = r; });
+      ok('日线视图的周期说明来自后端，且默认跟策略口径一致（tag/标签都不是前端拼的）',
+         dv.freq === 'daily' && dv.bar_label === '日K' && vtag.textContent === dv.tag &&
+         (D.querySelectorAll('#st-head > .stat .label')[1] || {}).textContent
+           .indexOf('开盘形态概率') === 0,
+         JSON.stringify(dv.tag) + ' / ' + dv.last_label + ' / notes=' + (dv.notes || []).length);
+
+      // 找一只周线口径的策略：换到它，周期应当自动跟着拨到周线
+      var selS = D.getElementById('st-strategy'), wId = '';
+      (dbg.strategies() || []).forEach(function (s) {
+        if (!wId && s.timeframe === 'weekly') wId = String(s.id);
+      });
+      ok('库里存在周线口径的策略（用来验「周期跟着策略的口径走」）', !!wId,
+         '周线策略 id=' + wId + '；可选 ' + (dbg.strategies() || []).length + ' 条');
+      selS.value = wId;
+      selS.dispatchEvent(new W.Event('change', { bubbles: true }));
+      ok('选到周线策略后「周期」自己拨到周线（用户不必记住口径；还没点查询，图不动）',
+         selF.value === 'weekly' && dbg.rows() === dailyRows,
+         '周期=' + selF.value + '，行数未变=' + (dbg.rows() === dailyRows));
+
+      await clickLoad();      // ⚠ 必须等 guardClick 的 600ms 窗口过去（见第 8 段说明）
+      var wv = null, wrows = null;
+      try {
+        await waitFor(function () {
+          var v = dbg.view(), rr = dbg.rows();
+          return (v && v.freq === 'weekly' && rr.length &&
+                  rr[rr.length - 1].trade_date !== dailyRows[dailyRows.length - 1].trade_date) ? 1 : null;
+        }, 40000, 200);
+      } catch (e) { /* 下面照常断言，报出来的原因更具体 */ }
+      wv = dbg.view() || {};
+      wrows = dbg.rows() || [];
+      /* ⚠ 周K 的「查询日那一根」未必是末根：最新交易日落在**周中**时（例：国庆前最后
+         一个交易日 2026-09-30 是周三），周线 anchor 回退到最近已收盘的完整周（09-25），
+         但面板**照画**之后那几根 —— 硬规矩 27 / C9：只走行情与指标、信号被清零、不进收益。
+         ⇒ 下面所有「截止查询日」的断言都按 **anchor 那根** 算，别按末根（假期必假红）。 */
+      var wanc = dbg.anchor() || {};
+      var wadi = (typeof wanc.index === 'number') ? wanc.index : (wrows.length - 1);
+      var wAncD = wrows[wadi] ? wrows[wadi].trade_date : null;
+      var wPost = wrows.slice(wadi + 1);        // anchor 之后「照画但不计」的那几根
+      var wNb = wadi + 1;                       // 截止 anchor 的根数
+      ok('点「查询」后 K 线真的换成了周K（换的是另一份面板，不是没反应）',
+         wv.freq === 'weekly' && !!wrows.length && wrows.length < dailyRows.length,
+         wv.freq + '：' + wrows.length + ' 根周K（日K ' + dailyRows.length + ' 根）');
+
+      // 周K 的每一根都必须等于「那一周在日线上的样子」——同源，不是另算一套
+      function weekDays(label) {
+        var t = new Date(label + 'T00:00:00Z').getTime(), out = [];
+        for (var k = 6; k >= 0; k--) {
+          var s = new Date(t - k * 86400000).toISOString().slice(0, 10);
+          if (dmap[s]) out.push(s);
+        }
+        return out;
+      }
+      var cmpk = 0, badc = [], bado = [];
+      var firstD = dailyRows[0].trade_date;
+      wrows.forEach(function (w) {
+        // 日线窗口的起点把一个自然周切了一半时，这一周不可比（周K 的 open 是它周一的开盘，
+        // 而 tail(N) 里的日线可能从周三才开始）—— 跳过，别拿半周去比出假红
+        var mon = new Date(new Date(w.trade_date + 'T00:00:00Z').getTime() - 6 * 86400000)
+                    .toISOString().slice(0, 10);
+        if (mon < firstD) return;
+        var days = weekDays(w.trade_date);
+        if (!days.length) return;
+        cmpk++;
+        var cl = dmap[days[days.length - 1]].close, op = dmap[days[0]].open;
+        if (Math.abs(cl - w.close) > 1e-6) badc.push(w.trade_date);
+        if (Math.abs(op - w.open) > 1e-6) bado.push(w.trade_date);
+      });
+      ok('周K 的每根收盘 == 该周最后一个交易日的日线收盘（同一份数，不是另算）',
+         cmpk >= 20 && badc.length === 0, cmpk + ' 周可比，不一致 ' + badc.length + ' 条 ' + badc.slice(0, 3));
+      ok('周K 的每根开盘 == 该周第一个交易日的日线开盘',
+         cmpk >= 20 && bado.length === 0, cmpk + ' 周可比，不一致 ' + bado.length + ' 条 ' + bado.slice(0, 3));
+
+      var wlast = new Date(wrows[wrows.length - 1].trade_date + 'T00:00:00Z').getUTCDay();
+      ok('每根周K 的日期都是周五（W-FRI 标签，不是随便挑一天）',
+         wrows.every(function (w) { return new Date(w.trade_date + 'T00:00:00Z').getUTCDay() === 5; }),
+         wrows.length + ' 根，末根 ' + wrows[wrows.length - 1].trade_date);
+      /* 「不画半周线」管的是**查询日那一根**（anchor）：它必须是已收盘的完整周。
+         查询日之后那几根是**故意照画**的（硬规矩 27 / C9），但必须①notes 里说出口、
+         ②不带任何选股/买卖信号。⚠ 别对末根断言「完整周」—— 最新交易日落在周中时
+         末根就是延伸根，会假红（2026-10-07 假期实测）。 */
+      var wLastD = wrows[wrows.length - 1].trade_date;
+      var dLastD = dailyRows[dailyRows.length - 1].trade_date;
+      var wClosed = (wAncD === dLastD);
+      ok('周K 的「查询日那一根」是最近的已收盘周，之后多画的根只走行情、不带任何信号',
+         !!wAncD && wAncD <= dLastD && wLastD >= wAncD &&
+         (wPost.length === 0 ||
+           ((wv.notes || []).some(function (s) { return s.indexOf('完整周') >= 0; }) &&
+            wPost.every(function (x) {
+              return !(x.entry || x.buy_trigger || x.sell_signal);
+            }))),
+         'anchor ' + wAncD + '(idx ' + wadi + ') / 末根 ' + wLastD + ' / 之后 ' +
+         wPost.length + ' 根 / 最新交易日 ' + dLastD + ' / notes=' + (wv.notes || []).length);
+      // 「这不是原策略」必须在界面上说出口。注意这里选中的是**原生周线**策略：
+      // 它本来就该只标「周K」，不能被顺手扣上「条件重算」。（反过来的那种 ——
+      // 日线策略看周K / 周线策略看日K —— 由下面切回日线那两条和接口段覆盖。）
+      var wtag = D.getElementById('st-view-tag');
+      ok('周线标签写明周期，且原生周线策略不会被误标成「条件重算」',
+         wtag.textContent === wv.tag && wtag.textContent.indexOf('周K') >= 0 &&
+         // 角标 ' y' 只在「有说明」时才挂，跟随 notes 走
+         (wtag.className.indexOf('y') > 0) === ((wv.notes || []).length > 0) &&
+         wv.native === true && wv.recomputed === false &&
+         wtag.textContent.indexOf('重算') < 0,
+         wtag.textContent + ' / class=' + wtag.className + ' / recomputed=' + wv.recomputed);
+      ok('悬停标签能看到完整原因（为什么最后一根是上周五、周K 只看已收盘的周）',
+         wtag.getAttribute('title') === (wv.notes || []).join('；') &&
+         (wClosed || (wv.notes || []).some(function (s) { return s.indexOf('完整周') >= 0; })),
+         (wtag.getAttribute('title') || '').slice(0, 120));
+      // ⚠ 2026-10-09 起第 2 张固定是「开盘形态概率」（跟周期无关）；原来那张跟着周期
+      //   改名的「最新收盘」读数现在在「股票」卡的 `#st-head-close` 里，改验它。
+      ok('「股票」卡里的收盘读数跟着周期走（周K 时是周线那根，不是日线遗留）',
+         !!D.querySelector('#st-head-close') &&
+         /^\d/.test(D.querySelector('#st-head-close').textContent.replace(/\s+/g, ' ').trim()),
+         (D.querySelector('#st-head-close') || {}).textContent);
+
+      // 周K 上画的信号 / 收益卡 / 图，必须跟周线那份数据同源
+      var wp = dbg.perf() || {};
+      // ⚠ 根数/区间终点按 anchor 算 —— 延伸根不进收益（见上面的 wNb / wAncD）
+      ok('策略收益卡标明是周K口径（满仓单票 · 周K N 根，max_hold_days 是周数）',
+         (wp.badge || '').indexOf('周K') >= 0 &&
+         (wp.range || {}).bars === wNb && (wp.badge || '').indexOf(String(wNb)) >= 0,
+         wp.badge + ' / ' + (wp.hero || {}).text + ' / anchor 起算 ' + wNb + ' 根');
+      ok('收益区间与图上窗口仍是同一段（换周期后卡片没沿用旧日线的区间）',
+         !!wp.range && wp.range.start === wrows[0].trade_date &&
+         wp.range.end === wAncD && wp.range.bars === wNb,
+         JSON.stringify(wp.range) + ' / anchor ' + wAncD);
+
+      var wo = inst.getOption();
+      var wdates = (wo.xAxis[0] || {}).data || [];
+      var wcand = wo.series.filter(function (s) { return s.type === 'candlestick'; })[0];
+      ok('图上的横轴 = 周K 的日期，蜡烛也正好这么多根',
+         wdates.length === wrows.length && wdates[0] === wrows[0].trade_date &&
+         (wcand.data || []).length === wrows.length,
+         wdates.length + ' 个刻度 / 蜡烛 ' + (wcand.data || []).length + ' 根 / 数据 ' + wrows.length + ' 根');
+      var wsig = dbg.signals() || [];
+      // ⚠ 同 sigSeries()：周线上也有「周K高开 / 周K低开」标记，只认清单里的名字
+      var wsc = wo.series.filter(function (s) {
+        return s.type === 'scatter' && wsig.some(function (x) { return x.name === s.name; });
+      });
+      var wscBad = wsc.filter(function (s) {
+        var sp = wsig.filter(function (x) { return x.name === s.name; })[0];
+        return !sp || sp.count !== (s.data || []).length;
+      }).map(function (s) { return s.name; });
+      ok('周K 上的信号标记条数 = 后端给的周线命中数（没有沿用日线的信号）',
+         wsc.length > 0 && wscBad.length === 0 && wsig.every(function (s) {
+           return s.draw === (s.count > 0);
+         }),
+         'scatter ' + wsc.map(function (s) { return s.name + '=' + (s.data || []).length; }).join(',') +
+         ' vs 清单 ' + wsig.map(function (s) { return s.key + '=' + s.count; }).join(','));
+      var wdrift = axisDrift(inst, wdates.slice(-12));
+      ok('换周期后下挂格依然与 K 线共用同一段横轴（拖动同步没被打断）',
+         wo.grid.length === 4 && wdrift < 1, '最大偏移 ' + wdrift + 'px / ' + wo.grid.length + ' 个 grid');
+
+      // 手动切回日线：这是「用户自己选周期」，优先级高于策略口径
+      selF.value = 'daily';
+      selF.dispatchEvent(new W.Event('change', { bubbles: true }));
+      try {
+        await waitFor(function () {
+          return (dbg.view() || {}).freq === 'daily' && dbg.rows().length === dailyRows.length ? 1 : null;
+        }, 40000, 200);
+      } catch (e) { /* 同上 */ }
+      var dv2 = dbg.view() || {};
+      ok('手动切回日线立刻重查（改周期要重新取数，不是只重画）',
+         dv2.freq === 'daily' && dbg.rows().length === dailyRows.length,
+         dbg.rows().length + ' 根 / tag=' + dv2.tag);
+      ok('周线策略看日线时标明「条件已按日K重算」（不能让人以为在看原策略）',
+         dv2.recomputed === true && (dv2.tag || '').indexOf('日K') >= 0 &&
+         (dv2.notes || []).some(function (s) { return s.indexOf('周线口径') >= 0; }),
+         dv2.tag + ' / ' + (dv2.notes || [])[0]);
+      /* ---------------- 11. 筹码与两融：股东户数 / 融资融券 / 股东增减持 ----------------
+         这三块的数据源跟前 4 张卡片不同（报告期 / 公告事件 / 外部资金，都不是 K 线字段），
+         要验的是"看见的数 = 后端给的那份 = 图上画的那份"：
+           1) 股东户数卡片的主数是**图上最后一根柱**，环比增长率/截止日期/发布时间在卡片上；
+           2) 两融图四条 series（融资余额/融券余额/融资净买入/收盘价）逐点等于后端，
+              净买入柱按正负着色（涨红跌绿）；价格折线 = **同日日线收盘价**（元，不缩放），
+              挂在第 3 根轴上（三样东西量级差太远，同轴等于没画）；
+           3) 增减持表逐行等于后端明细，方向徽标 增持红 / 减持绿；
+           4) 换 K 线周期（周K）不该改动这三块 —— 它们按**视角日期**截止，与 K 线周期无关。 */
+      var klineBox = D.getElementById('chart-stock');
+      var tradeTbl = D.getElementById('ch-trade-table');
+      var sigTbl = D.getElementById('st-table');
+      var need = ['ch-holder-hero','ch-holder-head','chart-holder',
+                  'ch-margin-hero','ch-margin-head','chart-margin','ch-trade-table'];
+      var miss = need.filter(function (id) { return !D.getElementById(id); });
+      // 4 = Node.DOCUMENT_POSITION_FOLLOWING
+      ok('筹码三块都在页面上、且排在 K 线卡片之后、策略信号明细之前',
+         miss.length === 0 && !!klineBox && !!sigTbl &&
+         !!(klineBox.compareDocumentPosition(tradeTbl) & 4) &&
+         !!(tradeTbl.compareDocumentPosition(sigTbl) & 4),
+         miss.length ? ('缺 ' + miss.join(',')) : '容器齐全且顺序正确');
+
+      var cp = dbg.chips() || {};
+      var hc = cp.holder || {}, mc = cp.margin || {}, tc = cp.trade || {};
+
+      var hHead = D.getElementById('ch-holder-head');
+      var hLabels = [].slice.call(hHead.querySelectorAll('.lb')).map(function (e) { return e.textContent; });
+      var hVals = [].slice.call(hHead.querySelectorAll('b')).map(function (e) { return e.textContent; });
+      var expHL = (hc.items || []).map(function (i) { return i.label; });
+      var expHV = (hc.items || []).map(function (i) { return i.text; });
+      var hHero = D.getElementById('ch-holder-hero');
+      ok('股东户数卡片：主数 = 户数，4 项（环比增长率/截止日期/发布时间/上期户数）逐字等于后端',
+         !!hc.available && hHero.textContent.indexOf(hc.hero.text) === 0 &&
+         JSON.stringify(hLabels) === JSON.stringify(expHL) &&
+         JSON.stringify(hVals) === JSON.stringify(expHV) &&
+         expHL.join('|').indexOf('环比增长率') >= 0 &&
+         expHL.join('|').indexOf('截止日期') >= 0 &&
+         expHL.join('|').indexOf('发布时间') >= 0,
+         (hc.hero || {}).text + ' · ' + hLabels.join(',') + ' → ' + hVals.join(','));
+
+      var hInst = W.echarts.getInstanceByDom(D.getElementById('chart-holder'));
+      var hOpt = hInst ? hInst.getOption() : null;
+      var hBar = hOpt ? hOpt.series.filter(function (s) { return s.type === 'bar'; })[0] : null;
+      var hLine = hOpt ? hOpt.series.filter(function (s) { return s.type === 'line'; })[0] : null;
+      var hSer = hc.series || [];
+      var hSet = hBar ? hBar.data.map(function (v) { return (v && v.value !== undefined) ? v.value : v; }) : [];
+      var badH = [];
+      hSer.forEach(function (x, i) {
+        if (hSet[i] !== x.holder_num) badH.push(x.end_date + ':' + hSet[i] + '≠' + x.holder_num);
+      });
+      ok('股东户数趋势图 = 后端给的那份序列（期数、逐期户数都对得上）',
+         !!hInst && hSet.length === hSer.length && badH.length === 0 && hSet.length > 0,
+         hSet.length + ' 根柱 vs ' + hSer.length + ' 期' +
+         (badH.length ? '；不符 ' + badH.slice(0, 3).join(',') : ''));
+
+      var gBad = 0;
+      hSer.forEach(function (x, i) {
+        var got = hLine ? hLine.data[i] : null;
+        var miss1 = (got === null || got === undefined);
+        if (x.growth === null ? !miss1 : (miss1 || Math.abs(got - x.growth) > 1e-6)) gBad++;
+      });
+      ok('户数增长率折线画在第二个 y 轴上（两轴量级差得远，同轴会把波动压成直线）',
+         !!hLine && hLine.yAxisIndex === 1 && gBad === 0,
+         hLine ? ('yAxisIndex=' + hLine.yAxisIndex + '，不符 ' + gBad + ' 点') : '没有折线');
+
+      var mHead = D.getElementById('ch-margin-head');
+      var mVals = [].slice.call(mHead.querySelectorAll('b')).map(function (e) { return e.textContent; });
+      var expMV = (mc.items || []).map(function (i) { return i.text; });
+      var mHero = D.getElementById('ch-margin-hero');
+      ok('融资融券卡片：主数 = 融资余额，4 项（融资净买入/融券余额/两融余额/占流通市值）逐字等于后端',
+         !!mc.available && mHero.textContent.indexOf(mc.hero.text) === 0 &&
+         JSON.stringify(mVals) === JSON.stringify(expMV),
+         (mc.hero || {}).text + ' · ' + mVals.join(' | '));
+
+      var mInst = W.echarts.getInstanceByDom(D.getElementById('chart-margin'));
+      var mOpt = mInst ? mInst.getOption() : null;
+      var byName = {};
+      (mOpt ? mOpt.series : []).forEach(function (s) { byName[s.name] = s; });
+      var yi = function (v) { return (v === null || v === undefined) ? null : +(v / 1e8).toFixed(4); };
+      var mSer = mc.series || [];
+      var rzBad = mSer.filter(function (x, i) {
+        var s = byName['融资余额'], got = s ? s.data[i] : null;
+        return !(got !== null && got !== undefined && Math.abs(got - yi(x.rzye)) < 1e-9);
+      }).length;
+      var barNet = byName['融资净买入'];
+      var netBad = mSer.filter(function (x, i) {
+        var v = barNet ? barNet.data[i] : null;
+        var val = (v && v.value !== undefined) ? v.value : v;
+        var col = (v && v.itemStyle) ? v.itemStyle.color : '';
+        var want = (x.rz_net >= 0) ? '#e5352b' : '#12a06a';
+        return !(Math.abs((val || 0) - (yi(x.rz_net) || 0)) < 1e-9 && col === want);
+      }).length;
+      ok('两融图画的是后端那份序列（融资余额逐点一致），净买入柱按正负着色（涨红跌绿）',
+         !!mInst && mOpt.series.length === 4 && rzBad === 0 && netBad === 0,
+         (mOpt ? mOpt.series.map(function (s) { return s.name; }).join(',') : '没有图') +
+         '；融资余额不符 ' + rzBad + ' 点 / 净买入不符 ' + netBad + ' 点');
+
+      // 价格折线：**元**原值（不除 1e8、不用 pct_chg），缺价处必须是 null 而不是 0
+      var priceLine = byName['收盘价'];
+      var pBad = mSer.filter(function (x, i) {
+        var got = priceLine ? priceLine.data[i] : null;
+        var miss3 = (got === null || got === undefined);
+        if (x.close === null || x.close === undefined) return !miss3;
+        return miss3 || Math.abs(got - x.close) > 1e-9;
+      }).length;
+      ok('价格折线 = 同日日线收盘价（逐点等于后端 close，元原值），挂在第 3 根轴上',
+         !!priceLine && priceLine.type === 'line' && priceLine.yAxisIndex === 2 &&
+         pBad === 0 && mOpt.yAxis.length === 3,
+         (priceLine ? ('yAxisIndex=' + priceLine.yAxisIndex + '，不符 ' + pBad + ' 点，轴数 ' +
+                       mOpt.yAxis.length) : '没有价格折线'));
+
+      var tRows = [].slice.call(D.querySelectorAll('#ch-trade-table tbody tr'));
+      var tItems = tc.items || [];
+      var tBad = [];
+      tRows.forEach(function (tr, i) {
+        var x = tItems[i];
+        if (!x) { tBad.push('第' + (i + 1) + '行没有对应数据'); return; }
+        var td = [].slice.call(tr.children).map(function (e) { return e.textContent.trim(); });
+        var tag = tr.querySelector('.tag');
+        var wantCls = (x.in_de === 'IN') ? 'r' : 'g';
+        if (td[0] !== x.ann_date || td[4] !== x.change_vol_text ||
+            td[5] !== x.change_ratio_text || td[7] !== x.avg_price_text ||
+            !tag || tag.textContent.trim() !== x.dir_text ||
+            tag.className.indexOf(wantCls) < 0) tBad.push(x.ann_date);
+      });
+      ok('增减持表逐行等于后端明细（数量/比例/均价文本一致），方向徽标 增持红 / 减持绿',
+         tRows.length === tItems.length && tBad.length === 0,
+         tRows.length + ' 行 vs ' + tItems.length + ' 条' +
+         (tBad.length ? '；不符 ' + tBad.slice(0, 3).join(',') : '') +
+         (tItems.length ? '' : '（该股本地暂无增减持记录，走空态）'));
+
+      ok('两块的口径写在界面上（数字怎么来的不用猜）',
+         (D.getElementById('ch-holder-note').textContent || '').indexOf('环比增长率') >= 0 &&
+         (D.getElementById('ch-margin-note').textContent || '').indexOf('融资净买入') >= 0,
+         (D.getElementById('ch-margin-note').textContent || '').slice(0, 60));
+
+      /* ---- K 线图顶边的「股东增减持」± 标记（2026-10-10 需求）------------------
+         需求原文：「股东增减持也画在 k 线上，用 + 和 - 代表增持和减持，在 k 线图的
+         顶边展示」。能确定的事实（不验像素颜色，只验结构 + 坐标）：
+           a) 后端 marks 里**每一条**都在图上有对应的点，x = 后端给的行号 idx；
+           b) 加/减号挂在 **K 线那一格**（grid 0）的**那根 0~1 隐形轴**上，
+              于是像素上贴着第 0 格的顶部内侧 —— 这就是"顶边"的实现；
+           c) 方向照 A 股习惯：增持红(+)、减持绿(−)，并进 K 线图例可单独开关。
+         ⚠ 别断言"一定有标记"：该股窗口内没有公告时这两条 series 本就不该存在
+           （降级），所以每一档都按「后端有没有」分别要求。 */
+      var kOpt = inst.getOption();
+      var tUp = kOpt.series.filter(function (s) { return s.name === '增持'; })[0];
+      var tDn = kOpt.series.filter(function (s) { return s.name === '减持'; })[0];
+      var tMarks = tc.marks || [];
+      var upWant = tMarks.filter(function (m) { return m.in_de === 'IN'; });
+      var dnWant = tMarks.filter(function (m) { return m.in_de === 'DE'; });
+      var tyIdx = kOpt.yAxis.length - 1;        // 隐形的 0~1 轴（约定：排在最后）
+      var tBad = [];
+      [[tUp, upWant, '+'], [tDn, dnWant, '-']].forEach(function (pair) {
+        var s = pair[0], want = pair[1], sym = pair[2];
+        if (!want.length) { if (s) tBad.push('后端没有 ' + sym + ' 却摆了 series'); return; }
+        if (!s) { tBad.push('后端有 ' + want.length + ' 个 ' + sym + ' 标记却没画'); return; }
+        if (s.type !== 'scatter') tBad.push(sym + ' 不是散点');
+        if (s.xAxisIndex !== 0 || s.yAxisIndex !== tyIdx) {
+          tBad.push(sym + ' 没画在 K 线那格的顶边轴上（x=' + s.xAxisIndex +
+                    '/y=' + s.yAxisIndex + '，期望 0/' + tyIdx + '）');
+        }
+        if ((s.data || []).length !== want.length) {
+          tBad.push(sym + ' 点数 ' + (s.data || []).length + ' ≠ 后端 ' + want.length);
+        }
+        want.forEach(function (m) {
+          var hit = (s.data || []).filter(function (d) {
+            return d.value && d.value[0] === m.idx;
+          })[0];
+          if (!hit) tBad.push(sym + ' 缺 idx=' + m.idx + '（' + m.date + '）的点');
+          else if (!(hit.value[1] > 0.5 && hit.value[1] <= 1)) {
+            tBad.push(sym + ' 的点没落在上半格（y=' + hit.value[1] + '）');
+          }
+        });
+      });
+      ok('股东增减持逐条对齐到 K 线行号（+ 增持 / − 减持），画在 K 线那格的顶边隐形轴上',
+         tBad.length === 0,
+         tBad.slice(0, 3).join('；') || (tMarks.length + ' 条标记（增持 ' + upWant.length +
+         ' / 减持 ' + dnWant.length + '），隐形轴 index=' + tyIdx));
+
+      ok('没有增减持的那一档就不摆 series（不画点却在图例里留一项）',
+         (upWant.length ? !!tUp : !tUp) && (dnWant.length ? !!tDn : !tDn),
+         '增持 ' + (tUp ? '有' : '无') + ' / 减持 ' + (tDn ? '有' : '无'));
+
+      var kLgd = ((kOpt.legend || [])[0] || {}).data || [];
+      var lgdNames = kLgd.map(function (x) { return (x && x.name) || x; });
+      ok('增减持进 K 线图例、可单独开关（不是藏在别人名下）',
+         (upWant.length ? lgdNames.indexOf('增持') >= 0 : true) &&
+         (dnWant.length ? lgdNames.indexOf('减持') >= 0 : true),
+         lgdNames.join(','));
+
+      if (tUp || tDn) {
+        var ts0 = tUp || tDn;
+        var td0 = (ts0.data || [])[0];
+        var tpx = null;
+        try {
+          tpx = inst.convertToPixel({ xAxisIndex: 0, yAxisIndex: tyIdx },
+                                    [td0.value[0], td0.value[1]]);
+        } catch (e) { tpx = null; }
+        var kg0 = kOpt.grid[0];
+        ok('± 标记像素上贴着 K 线格的**顶边内侧**（这就是"画在 k 线图顶边"）',
+           !!tpx && tpx[1] >= kg0.top - 1 && tpx[1] <= kg0.top + kg0.height * 0.25,
+           tpx ? ('标记 y=' + tpx[1].toFixed(1) + 'px / 第 0 格 ' + Math.round(kg0.top) +
+                  '~' + Math.round(kg0.top + kg0.height) + 'px') : '取不到像素');
+      }
+
+      /* tooltip：直接调 formatter（比合成 hover 稳 —— 不依赖像素命中与时序），
+         造一个「悬停在有标记的那根 K 线上」的 params 就行。 */
+      var kTipFmt = ((kOpt.tooltip || [])[0] || {}).formatter;
+      if (typeof kTipFmt === 'function' && tMarks.length) {
+        var tmW = tMarks[0];
+        var tmTxt = '';
+        try {
+          tmTxt = kTipFmt([{ dataIndex: tmW.idx, seriesName: 'K线', seriesType: 'candlestick',
+                             marker: '', value: [tmW.idx, 1, 1, 1, 1] }]) || '';
+        } catch (e) { tmTxt = ''; }
+        ok('悬停那一根时 tooltip 会用文字复述增减持（标记只有十几像素，容易看漏）',
+           tmTxt.indexOf('股东' + tmW.dir_text) >= 0 && tmTxt.indexOf(tmW.vol_text) >= 0,
+           (tmTxt.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim() || '（formatter 没给东西）')
+             .slice(0, 130));
+      } else {
+        ok('悬停那一根时 tooltip 会用文字复述增减持（标记只有十几像素，容易看漏）',
+           false, '取不到 tooltip.formatter');
+      }
+
+      // ---- 所属概念（东财 F10 核心题材）--------------------------------------
+      // 三个可确定的事实，都别拿像素说话：
+      //   a) 标签云逐字等于后端 items（名字 + pct_text），且涨跌色 class 与 pct_cls 一致
+      //      —— 前端不许自己判正负、不许自己拼百分号；
+      //   b) 默认展开第 1 个，点第 2 个标签会真的换（不是没反应）；
+      //   c) 展开区里必须有**入选理由原文**，且带板块代码。
+      var cc0 = dbg.concepts() || {};
+      var cItems = cc0.items || [];
+      var cBox = D.getElementById('cpt-list');
+      var cTags = cBox ? [].slice.call(cBox.querySelectorAll('.cpt')) : [];
+      var cBadge = D.getElementById('cpt-badge');
+      var tagBad = [];
+      cTags.forEach(function (el, i) {
+        var x = cItems[i];
+        if (!x) { tagBad.push('第' + (i + 1) + '个标签没有对应数据'); return; }
+        var s = el.querySelector('s');
+        var name = el.textContent.replace(s ? s.textContent : '', '').trim();
+        var cls = s ? s.className : '';
+        if (name !== x.name) tagBad.push(x.name + '≠' + name);
+        else if (!s || s.textContent.trim() !== x.pct_text ||
+                 cls.indexOf('pct') < 0 ||
+                 !(x.pct_cls ? cls.indexOf(x.pct_cls) >= 0 : true)) {
+          tagBad.push(x.name + ' 的涨跌幅 ' + (s ? s.textContent.trim() : '缺失') +
+                      '(期望 ' + x.pct_text + '/' + (x.pct_cls || 'flat') + ')');
+        }
+      });
+      var cWantBadge = cItems.length ? (cItems.length + ' 个') : '—';
+      ok('概念标签云逐字等于后端（名 + 涨跌幅文本 + 涨跌色 class），前端不自己判正负',
+         cTags.length === cItems.length && tagBad.length === 0 &&
+         cBadge.textContent.trim() === cWantBadge,
+         cTags.length + ' 个 vs ' + cItems.length + ' 个，徽标「' + cBadge.textContent.trim() +
+         '」' + (tagBad.length ? '；不符 ' + tagBad.slice(0, 3).join(',') : '') +
+         (cItems.length ? '' : '（该股本地暂无概念数据，走空态）'));
+
+      var pop0 = D.getElementById('cpt-pop');
+      var rsn0 = pop0.querySelector('.rsn');
+      var firstOn = cTags.filter(function (e) { return e.className.indexOf('on') >= 0; });
+      ok('展开区默认落在第 1 个概念，且显示后端给的入选理由原文 + 板块代码',
+         cItems.length ? (firstOn.length === 1 && firstOn[0] === cTags[0] &&
+                          pop0.style.display !== 'none' &&
+                          (rsn0 ? rsn0.textContent.trim() : '') === (cItems[0].reason || '').trim() &&
+                          pop0.textContent.indexOf(cItems[0].code) >= 0)
+                       : true,
+         cItems.length ? ('展开「' + (firstOn[0] ? firstOn[0].textContent.trim() : '无') +
+                          '」，理由 ' + (rsn0 ? rsn0.textContent.trim().length : 0) + ' 字，' +
+                          (pop0.textContent.indexOf(cItems[0].code) >= 0 ? '带' : '缺') + '代码')
+                       : '无数据');
+
+      if (cTags.length > 1) {
+        cTags[1].click();
+        var p1 = pop0.querySelector('.rsn');
+        var on1 = cTags.filter(function (e) { return e.className.indexOf('on') >= 0; });
+        ok('点第 2 个概念标签真的换展开内容（选中态跟着走、理由换成第 2 条）',
+           on1.length === 1 && on1[0] === cTags[1] &&
+           (p1 ? p1.textContent.trim() : '') === (cItems[1].reason || '').trim(),
+           '选中「' + (on1[0] ? on1[0].textContent.replace((on1[0].querySelector('s') || {}).textContent || '', '').trim() : '?') +
+           '」，理由 ' + (p1 ? p1.textContent.trim().length : 0) + ' 字');
+        cTags[0].click();   // 还原，别影响后面「切周K 不变」的比对
+      }
+
+      ok('概念卡的口径写在界面上（说清是哪一份口径的板块涨跌幅）',
+         (D.getElementById('cpt-note').textContent || '').indexOf('东方财富 F10') >= 0,
+         (D.getElementById('cpt-note').textContent || '').slice(0, 80));
+
+      // ---- 双击概念标签 → 成分股弹窗 ----------------------------------------
+      // 走的是与双击同一条路（探针用钩子触发，比合成 dblclick 稳）。可确定的事实：
+      //   a) 弹窗打开、标题带概念名；b) 表里逐行等于接口（代码/名称/收盘/涨跌幅文本，
+      //   涨跌色 class 与 pct_cls 一致）；c) 换排序是**回后端重排**（不是排已回的那几条）；
+      //   d) 总数超一屏时给「显示全部 N 只」，而不是悄悄只给前 100。
+      // 弹窗是页内 append 的（iframe 自己的 document），所以要在 D 里查，不是父页。
+      if (cItems.length) {
+        // 派发**真** dblclick 到第 1 个标签 —— 要走用户那条路（绑在标签上的 ondblclick），
+        // 别直接调内部函数：那样把绑定改坏了也照样绿。（`dbg.cptList` 钩子只留着手工调试。）
+        cTags[0].dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+        // ⚠ waitFor 回的是**回调里那个真值**（这里是 `s.data`），不是状态对象 ——
+        //   别把返回值当 cptState 用（第一版就这么写错了，读到的全是 undefined）。
+        await waitFor(function () {
+          var s = dbg.cptState();
+          return !!(s && s.data);
+        }, 30000, 200);
+        var cd0 = (dbg.cptState() || {}).data || {};
+        var cstk = cd0.stocks || [];
+        var cbg = [].slice.call(D.querySelectorAll('.modal-bg'));
+        var cboxMod = cbg.length ? cbg[cbg.length - 1] : null;
+        var ctrs = cboxMod ? [].slice.call(cboxMod.querySelectorAll('table.data tbody tr')) : [];
+        var cstkBad = [];
+        ctrs.forEach(function (tr, i) {
+          var td = [].slice.call(tr.children).map(function (e) { return e.textContent.trim(); });
+          var x = cstk[i];
+          if (!x) { cstkBad.push('第' + (i + 1) + '行没有对应数据'); return; }
+          if (td[0] !== x.code || td[1] !== x.name || td[2] !== x.close_text ||
+              td[3] !== x.pct_text ||
+              !(x.pct_cls ? tr.children[3].className.indexOf(x.pct_cls) >= 0 : true)) {
+            cstkBad.push(x.code + '≠' + td.slice(0, 4).join('/'));
+          }
+        });
+        var cTitle = cboxMod ? cboxMod.querySelector('.modal-head h3').textContent : '';
+        ok('双击概念标签弹出成分股：标题带概念名，表里逐行等于接口（收盘/涨跌幅文本 + 涨跌色）',
+           cbg.length === 1 && ctrs.length === cstk.length && cstkBad.length === 0 &&
+           cTitle.indexOf(cItems[0].name) >= 0,
+           ctrs.length + ' 行 vs ' + cstk.length + ' 只，标题「' + cTitle + '」' +
+           (cstkBad.length ? '；不符 ' + cstkBad.slice(0, 3).join(',') : ''));
+
+        var cMore = cboxMod ? cboxMod.querySelector('[data-more]') : null;
+        ok('成分股总数超过一屏时给「显示全部 N 只」（不悄悄只给前 100）',
+           (cd0.total > cstk.length) ? !!cMore : !cMore,
+           'total ' + cd0.total + ' / 本次回 ' + cstk.length + ' 行');
+
+        var cOrdBtn = cboxMod ? cboxMod.querySelector('[data-ord="code"]') : null;
+        if (cOrdBtn) {
+          cOrdBtn.click();
+          await waitFor(function () {
+            var s = dbg.cptState();
+            return !!(s && s.data && s.data.order === 'code');
+          }, 30000, 200);
+          var cd2 = (dbg.cptState() || {}).data || {};
+          var cCodes = (cd2.stocks || []).map(function (x) { return x.ts_code; });
+          ok('弹窗里换排序是回后端重排（不是排已回的那几条），顺序真的变了',
+             cCodes.length > 0 &&
+             JSON.stringify(cCodes) === JSON.stringify(cCodes.slice().sort()),
+             '前 3 个 ' + cCodes.slice(0, 3).join(',') + ' / 概念共 ' + cd2.total + ' 只');
+        }
+        if (cboxMod) cboxMod.querySelector('[data-close]').click();   // 收尾，别挡后面的检查
+      }
+
+      // 换 K 线周期不该动这三块：它们按「视角日期」截止，与图上画日K还是周K无关。
+      // 只比**卡片上真正显示的那几项**（available / 主数 / 小项）—— 趋势图的条数会随着
+      // 后台同步往里填数而变，拿整段 JSON 比会因外部数据变化产出假红。
+      // 整段（含序列）的等价性由 tools/verify_stock_ui.py 的接口段背靠背对拍覆盖。
+      function chipFace(c) {
+        var hh = c.holder || {}, mm = c.margin || {};
+        return JSON.stringify({
+          h: [hh.available, hh.hero, (hh.items || []).map(function (i) { return i.text; })],
+          m: [mm.available, mm.hero, (mm.items || []).map(function (i) { return i.text; })]
+        });
+      }
+      var faceD = chipFace(cp);
+      selF.value = 'weekly';
+      selF.dispatchEvent(new W.Event('change', { bubbles: true }));
+      try {
+        await waitFor(function () { return (dbg.view() || {}).freq === 'weekly' ? 1 : null; }, 40000, 200);
+      } catch (e) { /* 下面照常断言 */ }
+      var cpW = dbg.chips() || {};
+      ok('筹码三块只跟「视角日期」走，切到周K 都不变（数据源不是 K 线面板）',
+         (dbg.view() || {}).freq === 'weekly' && chipFace(cpW) === faceD,
+         (dbg.view() || {}).freq + ' / ' + (chipFace(cpW) === faceD ? '与日线一致' : '日线 ' + faceD + ' ≠ 周线 ' + chipFace(cpW)));
+
+      // 概念是**季度级静态名单**（与查询日无关），更不该跟着 K 线周期变。
+      var cW = dbg.concepts() || {};
+      ok('概念卡切到周K 也不变（名单是静态的，与 K 线周期无关）',
+         JSON.stringify(cW) === JSON.stringify(cc0),
+         (cW.items || []).length + ' 个 vs ' + cItems.length + ' 个' +
+         (JSON.stringify(cW) === JSON.stringify(cc0) ? '，内容一致' : '，内容变了'));
+
+      /* ------------- 回车 = 点「查询」（2026-10-10 需求） -------------------------
+         口径：「查询条件」卡（`#st-card-query`）里**任意控件**按回车都发一次查询，
+         焦点在别的卡上则不许劫持。
+         这里**数请求**而不是数 click：连按两下时 click 有两次、请求只该有一发
+         （`guardClick` 挡掉的正是请求那一层），数 click 看不出这道锁。
+         ⚠ 每次探针之间要留够 `guardClick` 的 600ms 静默期，否则下一发会被上一发挡掉
+           —— 那是「防连点生效」，不是「回车失灵」，很容易被误报成假红。 */
+      var reqs = [];
+      var ofetch = W.fetch;
+      W.fetch = function (u) { reqs.push(String(u)); return ofetch.apply(this, arguments); };
+      function detailCnt() {
+        return reqs.filter(function (x) { return x.indexOf('/api/stock/') >= 0; }).length;
+      }
+      var pump = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+      var enterOn = async function (id) {
+        var el = D.getElementById(id);
+        if (!el) return null;
+        el.focus();
+        var before = detailCnt();
+        el.dispatchEvent(new W.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+        try { await waitFor(function () { return detailCnt() > before; }, 25000, 100); } catch (e) { }
+        await pump(900);                      // 静默期：真发了两发，这里就看得到
+        return detailCnt() - before;
+      };
+      var rCode = await enterOn('st-code');
+      ok('代码框回车 = 点「查询」（发一次明细请求）', rCode === 1, '发了 ' + rCode + ' 次');
+      var rBars = await enterOn('st-bars');
+      ok('「K线根数」框回车也能查询（不只是代码框）', rBars === 1, '发了 ' + rBars + ' 次');
+      var rStrat = await enterOn('st-strategy');
+      ok('「策略」下拉回车也能查询', rStrat === 1, '发了 ' + rStrat + ' 次');
+      var rFreq = await enterOn('st-freq');
+      ok('「周期」下拉回车也能查询', rFreq === 1, '发了 ' + rFreq + ' 次');
+
+      await pump(800);                        // 让上一发的锁过期
+      var c0 = D.getElementById('st-code');
+      c0.focus();
+      var b0 = detailCnt();
+      var tap = function () {
+        c0.dispatchEvent(new W.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+      };
+      tap(); tap();
+      try { await waitFor(function () { return detailCnt() > b0; }, 25000, 100); } catch (e) { }
+      await pump(900);
+      ok('回车连按两下只发一发（与点按钮共用 guardClick 那道锁）',
+         detailCnt() - b0 === 1, '发了 ' + (detailCnt() - b0) + ' 次');
+
+      var opEl = D.getElementById('st-open-pct');
+      var b1 = detailCnt();
+      if (opEl) {
+        opEl.focus();
+        opEl.dispatchEvent(new W.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+      }
+      await pump(1500);
+      ok('焦点在 K 线卡控件（高开幅度）上时回车不劫持查询（只有「查询条件」卡管回车）',
+         detailCnt() - b1 === 0, '发了 ' + (detailCnt() - b1) + ' 次');
+
+      /* ---------------- 13. 查询框：输名称能查（候选下拉 + 后端认名称） ----------------
+         「输名称也能查」的**本体在后端**（market.resolve_stock），下拉只是消歧。
+         所以这里两条都要验：候选能出来、点了能查；以及**不靠下拉**也认名称
+         （最后一条直接改代码框的值再按查询，模拟"输完就回车"）。 */
+      // 只数明细请求：/api/stock/search 也带 /api/stock/ 前缀，混着数会互相干扰
+      var detailOnly = function () {
+        return reqs.filter(function (x) { return x.indexOf('/detail') >= 0; }).length;
+      };
+      var cEl = D.getElementById('st-code');
+      var sEl = D.getElementById('st-suggest');
+      var sugRows = function () { return sEl ? sEl.querySelectorAll('.stk-sug-row') : []; };
+      var kind = function (v) {          // 派一个真 input 事件（页面的下拉听的就是它）
+        cEl.value = v;
+        cEl.dispatchEvent(new W.Event('input', { bubbles: true }));
+      };
+
+      kind('平安');                       // 「平安」在库里不止一只 ⇒ 必须列出来让人挑
+      try { await waitFor(function () { return sugRows().length > 1; }, 15000, 120); } catch (e) { }
+      var got = [].slice.call(sugRows()).map(function (r) {
+        return (r.querySelector('.n') || {}).textContent + ' ' + r.getAttribute('data-code');
+      });
+      ok('输重名的那半截（「平安」）会列出候选，而不是闷头挑一只',
+         got.length > 1, got.join(' / '));
+      ok('候选里名称与代码都在（点之前就知道要选哪只）',
+         got.length > 0 && got.every(function (t) { return /\.(SH|SZ|BJ)$/.test(t); }),
+         got.join(' / '));
+
+      var pick = sugRows().length ? sugRows()[0].getAttribute('data-code') : '';
+      var bpk = detailOnly();
+      if (sugRows().length) sugRows()[0].click();
+      try { await waitFor(function () { return detailOnly() > bpk; }, 25000, 120); } catch (e) { }
+      await pump(900);
+      ok('点候选 = 填进代码框 + 立刻查询（不用再按一下「查询」）',
+         cEl.value === pick && detailOnly() - bpk === 1,
+         cEl.value + ' / 发了 ' + (detailOnly() - bpk) + ' 次');
+      ok('选完候选下拉自己收起（不挡着下面的按钮）',
+         sEl.style.display === 'none', 'display=' + sEl.style.display);
+
+      kind('贵州茅台');                    // 唯一命中 ⇒ 不用弹（回车就能查到）
+      await pump(1400);
+      ok('完整名称唯一命中时不弹候选（弹一条反而挡路）', sugRows().length === 0,
+         '条数 ' + sugRows().length);
+      kind('600519');                      // 已经输完了，更不该弹
+      await pump(1400);
+      ok('输完整代码不弹候选', sugRows().length === 0, '条数 ' + sugRows().length);
+      kind('600519.SH');
+      await pump(1400);
+      ok('带后缀的完整代码也不弹', sugRows().length === 0, '条数 ' + sugRows().length);
+
+      // **不靠下拉**：直接往框里写名称 → 点查询 → 后端认出来并回报规范代码
+      var bar = D.getElementById('st-bars');
+      if (bar) bar.value = '120';
+      kind('贵州茅台');
+      var bn = detailOnly();
+      D.getElementById('btn-load').click();
+      try { await waitFor(function () { return detailOnly() > bn; }, 25000, 120); } catch (e) { }
+      await pump(1200);
+      var meta = (W.__stDebug && W.__stDebug.meta) ? W.__stDebug.meta() : null;
+      var ttl = (D.querySelector('#st-title') || D.querySelector('.card-title') || {}).textContent || '';
+      ok('框里只写名称、直接点查询也能查到（后端唯一解析，不靠下拉）',
+         detailOnly() - bn === 1 && !!(meta && meta.ts_code && /\.(SH|SZ|BJ)$/.test(meta.ts_code)),
+         '发了 ' + (detailOnly() - bn) + ' 次 / ts_code=' + ((meta && meta.ts_code) || '—'));
+
+      /* ---------------- 14. 取数反馈：加载中 / 报错留痕（2026-10-10 需求） ------------
+         「点了没反应」= 请求在飞时页面上什么都不动、失败后除了一个 3 秒就飘走的
+         toast 之外什么都不留。三态由 `__stDebug.statusKind()` 判（读 `#st-status`
+         里那个块的 class）。
+         ⚠ loading 那一瞬**不能 await**：`stStatus('loading',…)` 在 `load()` 的第一个
+           await 之前同步执行，一旦 await 掉，读到的就已经是终态了。 */
+      var st = function () { return (dbg.statusKind && dbg.statusKind()) || ''; };
+      var stTxt = function () { return (dbg.statusText && dbg.statusText()) || ''; };
+
+      kind('600519.SH');
+      W.load();                             // 故意不 await：要抓 await 之前的那一瞬
+      var kLoad = st();
+      ok('查询一开始就摆「正在查询…」（请求在飞时页面上有东西在动，不再像点了没反应）',
+         kLoad === 'loading' && stTxt().indexOf('正在查询') >= 0,
+         'kind=' + kLoad + ' text=' + JSON.stringify(stTxt().slice(0, 26)));
+      try { await waitFor(function () { return st() === ''; }, 25000, 120); } catch (e) { }
+      ok('查成功后状态区自己收掉（不留着「正在查询」一直转）', st() === '', 'kind=' + st());
+
+      // 失败：不存在的票 → 后端原话要**留在页面上**，不是弹个 3 秒就飘走的 toast
+      kind('zzz不存在的票zzz');
+      var bf2 = detailOnly();
+      D.getElementById('btn-load').click();
+      try { await waitFor(function () { return st() === 'error' || detailOnly() > bf2; }, 25000, 120); } catch (e) { }
+      await pump(700);                      // 顺带等过 guardClick 的 600ms 连点窗
+      ok('查询失败时错误**留在页面上**（报错 + 提示，不是只弹一句就没）',
+         st() === 'error' && /没找到|本地无/.test(stTxt()),
+         'kind=' + st() + ' text=' + JSON.stringify(stTxt().slice(0, 46)));
+
+      // 报错后再查一次成功的 → 旧报错必须被清掉（否则一直挂着吓人）
+      kind('600519.SH');
+      var bg2 = detailOnly();
+      D.getElementById('btn-load').click();
+      try { await waitFor(function () { return detailOnly() > bg2 && st() === ''; }, 25000, 120); } catch (e) { }
+      await pump(700);
+      ok('报错后再查成功，旧的报错被清掉（换票不残留上一次的失败）', st() === '', 'kind=' + st());
+
+      ok('页面顶部有全局请求进度条（#busy-bar —— 任何 /api 请求都会点亮它）',
+         !!D.getElementById('busy-bar'));
+    } catch (e) {
+      ok('探针执行完成', false, (e && e.message) || String(e));
+    }
+    out.textContent = JSON.stringify({ done: true, checks: CHECKS }, null, 1);
+  })();
+})();
+</script>
+</body>
+</html>

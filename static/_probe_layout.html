@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>布局探针（模型设置页：表格有没有顶破容器）</title>
+<style>body{margin:0;background:#fff}#f{border:0;display:block;width:100%}#out{white-space:pre-wrap}</style>
+</head>
+<body>
+<pre id="out">running…</pre>
+<iframe id="f" src="/settings" style="height:1100px"></iframe>
+<script>
+/* 量「模型设置页里表格有没有超出父元素」。
+   同源 iframe，所以能直接读里面的布局；iframe 宽度跟随浏览器视口，
+   这样 --window-size 就是被测的页面宽度（近似真实用户窗口）。
+   断言口径：表格右边缘不能越过它的直接容器（否则就是压到隔壁表单上/被裁掉）。 */
+function dump(msg){
+  document.getElementById('out').textContent = msg;
+  document.title = 'done';
+}
+
+function run(){
+  const res = [];
+  const ok = (name, pass, extra) => res.push({name, ok: !!pass, extra: extra || ''});
+  const f = document.getElementById('f');
+  const d = f.contentDocument;
+  if (!d) { dump(JSON.stringify({error: '读不到 iframe 文档'})); return; }
+
+  const de = d.documentElement;
+  ok('整页没有横向滚动条（内容没撑破视口）',
+     de.scrollWidth <= de.clientWidth + 1,
+     'scrollWidth=' + de.scrollWidth + ' clientWidth=' + de.clientWidth);
+
+  for (const [sel, label] of [['#prof-list', '模型配置列表'], ['#tpl-list', '模板列表']]) {
+    const box = d.querySelector(sel);
+    if (!box) { ok(label + ' 存在', false); continue; }
+    const tb = box.querySelector('table');
+    // 这张表在当前宽度里要**放得下**（不需要横向拖）。容器本身带 overflow-x:auto 只是
+    // 兜底 —— 常见宽度下不该真用上它，否则「操作」列的按钮得拖出来才点得到。
+    ok(label + '：整表放得下（不用横向拖就能点到「操作」）',
+       box.scrollWidth <= box.clientWidth + 1,
+       '可视 ' + box.clientWidth + 'px / 内容 ' + box.scrollWidth + 'px' +
+       (box.scrollWidth > box.clientWidth + 1
+        ? '（要横滚 ' + (box.scrollWidth - box.clientWidth) + 'px）' : ''));
+    if (tb && label.indexOf('模型配置') >= 0) {
+      // 列宽清单：溢出时靠它定位是哪一列把表撑宽的
+      const cols = Array.from(tb.querySelectorAll('thead th')).map(th =>
+        th.textContent.trim() + '=' + Math.round(th.getBoundingClientRect().width));
+      ok('模型配置列表的列宽清单（诊断用）', true, cols.join(' '));
+    }
+    // 占整行（不是原来那种「塞在 .grid g2 左半幅」）—— 半幅时这里只有卡片宽的一半
+    const cb = box.closest('.card-body');
+    if (cb) {
+      ok(label + '：占整行（宽度≈卡片内容宽，不是左右半幅）',
+         box.clientWidth >= cb.clientWidth - 40,
+         '列表 ' + box.clientWidth + 'px / 卡片内容 ' + cb.clientWidth + 'px');
+    }
+  }
+
+  // 页面里所有「右边缘越过父元素」的元素（真正的溢出源清单）。
+  // ⚠ 父元素本身是横向滚动容器（overflow-x: auto/scroll）时不算 —— 那种超出是**设计内**的
+  //   （内容宽了就滚，不顶破卡片）。这里要抓的是「压根没兜底、直接压到隔壁元素上」那种。
+  const scrollParent = (el) => {
+    let p = el.parentElement;
+    while (p && p !== d.documentElement) {
+      const ox = d.defaultView.getComputedStyle(p).overflowX;
+      if (ox === 'auto' || ox === 'scroll') return p;
+      p = p.parentElement;
+    }
+    return null;
+  };
+  const bad = [];
+  d.querySelectorAll('*').forEach(el => {
+    const p = el.parentElement;
+    if (!p) return;
+    const r = el.getBoundingClientRect(), pr = p.getBoundingClientRect();
+    if (r.width > 0 && r.right > pr.right + 1 && !scrollParent(el)) {
+      bad.push(el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') +
+               (el.className && typeof el.className === 'string' ? '.' + el.className.split(' ')[0] : '') +
+               ' [' + Math.round(r.right - pr.right) + 'px]');
+    }
+  });
+  ok('没有元素压出父元素（滚动容器内不算）', bad.length === 0, bad.slice(0, 8).join(' · '));
+
+  // 掐长度那几列：长名字/长地址不该把表格顶宽
+  for (const [sel, cap] of [['.prof-url', 175], ['.prof-model', 175], ['.prof-name', 115],
+                            ['.tpl-vars', 265]]) {
+    const el = d.querySelector(sel);
+    const w = el ? el.getBoundingClientRect().width : -1;
+    ok('长内容列限定宽度：' + sel + ' ≤ ' + cap + 'px', el && w <= cap,
+       el ? ('实宽 ' + Math.round(w) + 'px') : '没找到 ' + sel);
+  }
+
+  // 行数也得对：列表渲染出几行
+  const rows0 = d.querySelectorAll('#prof-list tbody tr').length;
+  ok('配置列表渲染出行（脚本没在运行时报错）', rows0 >= 1, rows0 + ' 行');
+
+  const nav = d.querySelector('.nav-item.active');
+  ok('导航里的这页叫「模型设置」', !!nav && nav.textContent.indexOf('模型设置') >= 0,
+     nav ? ('实际「' + nav.textContent.trim() + '」') : '没有高亮的导航项');
+
+  dump(JSON.stringify({res}));
+}
+
+document.getElementById('f').addEventListener('load', () => setTimeout(run, 1800));
+</script>
+</body>
+</html>

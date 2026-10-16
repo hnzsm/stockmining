@@ -1,0 +1,231 @@
+{% extends "base.html" %}
+{% block title %}数据管理 · 短线选股{% endblock %}
+{% block pagetitle %}数据管理{% endblock %}
+{% block pagedesc %}从 tushare 同步行情到本地 MySQL · 支持断点续传与增量更新{% endblock %}
+
+{% block content %}
+<div class="grid g5">
+  <div class="stat accent"><div class="label">数据区间</div><div class="value" id="s-range" style="font-size:15px">—</div><div class="sub" id="s-codes">—</div></div>
+  <div class="stat"><div class="label">日线 / 周线行数</div><div class="value" id="s-rows">—</div><div class="sub" id="s-w">—</div></div>
+  <div class="stat"><div class="label">每日指标 / 资金流向</div><div class="value" id="s-basic" style="font-size:15px">—</div><div class="sub">换手率 / 市值 · 主力净额（按行数）</div></div>
+  <div class="stat"><div class="label">股东户数 / 融资融券 / 增减持</div><div class="value" id="s-chips" style="font-size:15px">—</div><div class="sub" id="s-chips2">均为按日整块拉全市场</div></div>
+  <div class="stat"><div class="label">交易日历</div><div class="value" id="s-cal" style="font-size:15px">—</div><div class="sub" id="s-cal2">—</div></div>
+</div>
+
+<div class="grid g2">
+  <div class="card">
+    <div class="card-head"><div class="card-title">同步日线行情 <span class="tag">核心</span></div></div>
+    <div class="card-body">
+      <div class="row">
+        <div class="field"><label class="lb">开始日期</label><input type="date" id="sy-start" value="2023-01-01"></div>
+        <div class="field"><label class="lb">结束日期</label><input type="date" id="sy-end"></div>
+      </div>
+      <div class="flex wrap" style="margin-bottom:12px">
+        <label class="chk"><input type="checkbox" id="sy-basic" checked> 同步每日指标（换手率/市值等）</label>
+        <label class="chk"><input type="checkbox" id="sy-money" checked> 同步个股资金流向（主力/大单净额）</label>
+        <label class="chk"><input type="checkbox" id="sy-holders" checked> 同步股东户数 / 融资融券 / 增减持</label>
+        <label class="chk"><input type="checkbox" id="sy-futures" checked> 同步期货（主连 / 合约 / 在市期权）</label>
+        <label class="chk"><input type="checkbox" id="sy-base" checked> 同步基础信息（股票列表/交易日历/指数成分）</label>
+        <label class="chk"><input type="checkbox" id="sy-force"> 强制重新拉取（忽略已同步日期）</label>
+      </div>
+      <div class="hintbox" style="margin-bottom:12px">
+        日线按<b>交易日</b>整块拉取（一次请求返回全市场约 5500 只），比按股票逐只拉取省几十倍额度。
+        默认<b>自动跳过已同步的交易日</b>，中断后再次点击即从断点继续。
+        资金流向也是按交易日整块拉取，落库为<b>万元/手</b>原始口径（金额与 K 线的千元差 10 倍，
+        派生字段会自己换算）。<b>股东户数与增减持按公告日（自然日，含周末）扫、融资融券按交易日扫</b>，
+        都是按日整块拉全市场 —— 每个交易日约 2 个请求，全量区间（2023 起）大约十几分钟。
+        周线由本地日线合成（<b>不消耗额度</b>），默认<b>只重算需要重算的那几周</b>
+        —— 最近一个完整周 + 本次日线真正变动到的周，不会把区间内 190 周全部重写一遍
+        （要整段重算就勾「强制重新拉取」）。
+        接口限流默认每秒 <b>4</b> 次，可在 <code>config.py</code> 调整 <code>TUSHARE_QPS</code>。
+      </div>
+      <div class="flex wrap">
+        <button class="btn primary" id="btn-sync">开始同步</button>
+        <button class="btn" id="btn-base">仅同步基础信息</button>
+        <button class="btn" id="btn-money">仅同步资金流向</button>
+        <button class="btn" id="btn-holders">仅同步股东/两融</button>
+        <button class="btn" id="btn-futures" title="主连拉全历史、具体合约拉近 1 年、期权只拉在市（约 12s）；「今日期货」页读的就是这份数据">仅同步期货</button>
+        <button class="btn" id="btn-concept" title="东方财富 F10「核心题材」——个股所属概念（多对多，含入选理由）。不走 tushare、不耗额度；全市场约 40 分钟（东财限频）">仅同步概念</button>
+        <button class="btn" id="btn-newconcept" title="东方财富「新概念速览」——新概念清单 + 概念板块成分变更（调入/调出 + 入选理由）。站外公开报表、不耗额度、秒级；**今天已经抓过就直接跳过**">仅同步新概念</button>
+        <button class="btn" id="btn-weekly" title="默认只重算需要重算的那几周（最近一个完整周 + 本次日线真正变动到的周）；要整段重算就勾上「强制重新拉取」">重新合成周线</button>
+        <button class="btn danger" id="btn-cancel" disabled>取消</button>
+      </div>
+      <div id="job-panel" style="display:none;margin-top:14px">
+        <div class="flex between" style="margin-bottom:6px">
+          <span class="small" id="job-msg">等待中…</span>
+          <span class="small mono" id="job-pct">0%</span>
+        </div>
+        <div class="progress"><i id="job-bar"></i></div>
+        <div class="logbox" id="job-log" style="margin-top:10px"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><div class="card-title">可用股票池</div><button class="btn sm" id="btn-reload-uni">刷新</button></div>
+    <div class="card-body tight"><div id="uni-list"></div></div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-head"><div class="card-title">同步历史</div></div>
+  <div class="card-body tight"><div id="log-list"><div class="empty">加载中…</div></div></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let jobId = null, stopWatch = null;
+
+function renderStats(st){
+  const approx = st.rows_exact === false ? ' ≈' : '';
+  $('#s-range').textContent = (st.daily_start||'—') + ' ~ ' + (st.daily_end||'—');
+  $('#s-codes').textContent = '覆盖 ' + fmt.int(st.daily_codes) + ' 只 · 基础信息 ' + fmt.int(st.stock_basic) + ' 条';
+  $('#s-rows').textContent = fmt.int(st.daily_rows) + approx + ' / ' + fmt.int(st.weekly_rows);
+  $('#s-w').textContent = st.rows_exact === false ? '数据写入中，行数为估算值' : '复权因子随日线一并入库';
+  $('#s-basic').textContent = fmt.int(st.basic_rows) + approx + ' / ' + fmt.int(st.mf_rows) + approx;
+  // 筹码与两融（股东户数 / 融资融券 / 股东增减持）—— 三张表各自的行数
+  $('#s-chips').textContent = fmt.int(st.holder_rows) + ' / ' + fmt.int(st.margin_rows) +
+    ' / ' + fmt.int(st.htrade_rows) + approx;
+  $('#s-chips2').textContent = st.holder_rows ? '股东户数 / 两融 / 增减持（按行数）'
+                                              : '尚未同步（点「仅同步股东/两融」）';
+  $('#s-cal').textContent = (st.trade_cal_end || '—');
+  $('#s-cal2').textContent = '日历记录 ' + fmt.int(st.trade_cal_rows) + ' 天';
+}
+
+/* 三块卡片都有「加载中 / 取失败」态。
+   ⚠ 以前这三行是 `loadStats(); loadLogs(); loadUniverse();` 裸调、里面也不接错，
+     接口一抖就是**静默失败** —— 卡片永远停在首屏那句「加载中…」，页面上没有任何
+     报错，用户只知道「点了没反应」。下面统一：加载中摆状态块，失败摆错误块 + 弹提示。 */
+async function loadStats(){
+  try { renderStats(await apiGet('/api/stats?force=1')); }
+  catch (e) { toast('统计信息没取到：' + e.message, 'err', 7000); }
+}
+
+async function loadUniverse(){
+  const box = $('#uni-list');
+  boxState(box, 'loading', '加载中…');
+  let us;
+  try { us = await apiGet('/api/universes'); }
+  catch (e) { boxState(box, 'error', '股票池列表没取到', e.message); return; }
+  box.innerHTML = `<table class="data"><thead><tr><th>股票池</th><th>代码</th><th class="num">数量</th></tr></thead><tbody>
+    ${us.map(u=>`<tr><td>${esc(u.name)}</td><td class="mono small">${esc(u.code)}</td>
+      <td class="num">${u.count===null?'实时':fmt.int(u.count)}</td></tr>`).join('')}
+  </tbody></table>`;
+}
+
+async function loadLogs(){
+  const box = $('#log-list');
+  boxState(box, 'loading', '加载中…');
+  let logs;
+  try { logs = await apiGet('/api/sync/logs'); }
+  catch (e) { boxState(box, 'error', '同步日志没取到', e.message); return; }
+  box.innerHTML = logs.length ? `<table class="data"><thead><tr>
+    <th>任务</th><th>区间</th><th class="num">行数</th><th>状态</th><th>开始</th><th>结束</th><th>说明</th>
+    </tr></thead><tbody>${logs.map(l=>`<tr>
+      <td>${esc(l.task)}</td>
+      <td class="mono small">${esc(l.date_from||'—')} ~ ${esc(l.date_to||'—')}</td>
+      <td class="num">${fmt.int(l.rows_cnt)}</td>
+      <td><span class="tag ${esc(l.status_cls||'')}" title="${esc(l.status||'')}">${esc(l.status_label||l.status||'')}</span></td>
+      <td class="mono small">${esc(l.started_at||'')}</td>
+      <td class="mono small">${esc(l.ended_at||'')}</td>
+      <td class="small muted">${esc((l.message||'').slice(0,70))}</td></tr>`).join('')}</tbody></table>`
+    : '<div class="empty">暂无记录</div>';
+}
+
+/* 同步任务是**长任务**（全量拉取几分钟起）—— 光防「连点」不够：
+   点一次 → 等 5 秒没动静 → 再点一次，照样开出第二个任务。
+   所以任务在跑期间把整组同步按钮锁住，跑完（成功/失败）再一起放开。
+   `#btn-cancel` 反过来：只在有任务时可用。 */
+const SYNC_BTNS = ['#btn-sync','#btn-base','#btn-money','#btn-holders','#btn-futures','#btn-concept','#btn-newconcept','#btn-weekly'];
+function lockSyncBtns(on){
+  SYNC_BTNS.forEach(id => { const b = $(id); if (b) b.disabled = !!on; });
+}
+
+function startWatch(id){
+  jobId = id;
+  $('#job-panel').style.display = '';
+  $('#btn-cancel').disabled = false;
+  lockSyncBtns(true);
+  stopWatch = watchJob(id, j => {
+    $('#job-msg').textContent = j.message || '';
+    $('#job-pct').textContent = Math.round((j.progress||0)*100) + '%';
+    $('#job-bar').style.width = ((j.progress||0)*100) + '%';
+    $('#job-log').textContent = (j.logs||[]).join('\n');
+    $('#job-log').scrollTop = $('#job-log').scrollHeight;
+  }, j => {
+    toast('同步完成：' + (j.message||''), 'ok', 5000);
+    $('#btn-cancel').disabled = true;
+    lockSyncBtns(false);
+    loadStats(); loadLogs(); loadUniverse(); refreshStatus();
+  }, e => {
+    toast('同步失败：' + e.message, 'err', 8000);
+    $('#btn-cancel').disabled = true;
+    lockSyncBtns(false);
+  });
+}
+
+$('#btn-sync').onclick = guardClick($('#btn-sync'), async () => {
+  const s = $('#sy-start').value, e = $('#sy-end').value;
+  if (!s || !e) return toast('请填写起止日期', 'warn');
+  const r = await apiPost('/api/sync/start', {
+    start: s, end: e, with_basic: $('#sy-basic').checked,
+    with_moneyflow: $('#sy-money').checked, with_holders: $('#sy-holders').checked,
+    with_futures: $('#sy-futures').checked,
+    include_base: $('#sy-base').checked, force: $('#sy-force').checked
+  });
+  toast('已启动同步任务', 'ok');
+  startWatch(r.job_id);
+});
+$('#btn-base').onclick = guardClick($('#btn-base'), async () => {
+  const r = await apiPost('/api/sync/base', {});
+  toast('已启动基础信息同步', 'ok'); startWatch(r.job_id);
+});
+$('#btn-money').onclick = guardClick($('#btn-money'), async () => {
+  const s = $('#sy-start').value, e = $('#sy-end').value;
+  if (!s || !e) return toast('请填写起止日期', 'warn');
+  const r = await apiPost('/api/sync/moneyflow', { start: s, end: e, force: $('#sy-force').checked });
+  toast('已启动资金流向同步', 'ok'); startWatch(r.job_id);
+});
+$('#btn-holders').onclick = guardClick($('#btn-holders'), async () => {
+  const s = $('#sy-start').value, e = $('#sy-end').value;
+  if (!s || !e) return toast('请填写起止日期', 'warn');
+  const r = await apiPost('/api/sync/holders', { start: s, end: e, force: $('#sy-force').checked });
+  toast('已启动股东/两融数据同步', 'ok'); startWatch(r.job_id);
+});
+$('#btn-futures').onclick = guardClick($('#btn-futures'), async () => {
+  const r = await apiPost('/api/sync/futures', { force: $('#sy-force').checked });
+  toast('已启动期货同步', 'ok'); startWatch(r.job_id);
+});
+$('#btn-concept').onclick = guardClick($('#btn-concept'), async () => {
+  const r = await apiPost('/api/sync/concept', {});
+  toast('已启动概念同步（全市场约 40 分钟）', 'ok'); startWatch(r.job_id);
+});
+/* 新概念是**秒级**的站外抓取，不走后台任务 —— 直接同步调用、把结果说出来。
+   ⚠ 已取消本地缓存：这里**每次都是真抓**，`#sy-force`（强制重新拉取）对它不再有任何作用。 */
+$('#btn-newconcept').onclick = guardClick($('#btn-newconcept'), async () => {
+  try {
+    const r = await apiPost('/api/newconcept/sync', { force: $('#sy-force').checked });
+    const s = r.sync;
+    toast(`新概念 ${s.new} 个 / 板块动态 ${s.events} 条（${s.event_date}）`, 'ok', 6000);
+    loadStats();
+  } catch (e) { toast('抓取失败：' + e.message, 'err', 7000); }
+});
+$('#btn-weekly').onclick = guardClick($('#btn-weekly'), async () => {
+  const r = await apiPost('/api/sync/weekly', { start: $('#sy-start').value,
+    end: $('#sy-end').value, force: $('#sy-force').checked });
+  toast('已启动周线合成', 'ok'); startWatch(r.job_id);
+});
+$('#btn-cancel').onclick = guardClick($('#btn-cancel'), async () => {
+  if (jobId) { await apiPost('/api/jobs/' + jobId + '/cancel', {}); toast('已请求取消', 'warn'); }
+});
+$('#btn-reload-uni').onclick = guardClick($('#btn-reload-uni'), loadUniverse);
+
+document.addEventListener('DOMContentLoaded', async () => {
+  const cfg = await apiGet('/api/config');
+  $('#sy-end').value = cfg.today;
+  loadStats(); loadLogs(); loadUniverse();
+  document.addEventListener('status-loaded', e => renderStats(e.detail.st));
+});
+</script>
+{% endblock %}

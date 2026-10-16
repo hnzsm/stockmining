@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="dark">
+<title>交易复盘图探针</title>
+<style>
+ body{margin:0;padding:10px;background:#0d1117;color:#dfe6f2;font:12px/1.6 monospace}
+ #box{width:1100px}
+ pre{white-space:pre-wrap;margin:8px 0 0}
+</style>
+</head>
+<body>
+<div class="chart" id="box"></div>
+<pre id="out">running…</pre>
+<script src="/static/js/echarts.min.js"></script>
+<script src="/static/js/app.js"></script>
+<script src="/static/js/tradechart.js"></script>
+<script>
+/* 交易复盘图探针（同源、真浏览器、只读事实，不做像素颜色断言）
+   验证三件事：
+     ① 「持有收益 / 天数」标注在 K 线格**上方** —— 与 K 线实际绘制像素比较（不是只看 option）；
+     ② 拖时间轴时下挂格同步 —— 两格同一像素 x 落在同一根 K 线（共用一条时间刻度）；
+     ③ 能切指标，且切了之后缩放窗口与 K 线格都不动。
+   用法：驱动脚本 %TEMP%\probe_tk_review.py（抠 <pre id="out">）。 */
+(async function () {
+  const out = [];
+  const put = (k, v) => out.push(k + '=' + v);
+  const flush = (err) => {
+    document.getElementById('out').textContent = out.join('\n') + (err ? '\nERR=' + err : '');
+  };
+  try {
+    const get = async (u) => (await (await fetch(u)).json()).data;
+    const runs = await get('/api/backtest/runs?limit=1');
+    if (!runs || !runs.length) throw new Error('没有回测记录');
+    const rid = runs[0].id;
+    // ⚠ 显式锁 asc：接口默认 buy_date DESC（页面要「最近的先看」），探针要一个稳定样本
+    const trades = await get('/api/backtest/runs/' + rid + '/trades?sort=buy_date&order=asc');
+    if (!trades || !trades.length) throw new Error('回测 #' + rid + ' 没有交易');
+    const tid = trades[0].id;
+    const res = await get('/api/backtest/runs/' + rid + '/trades/' + tid + '/kline');
+    put('run_id', rid);
+    put('trade_id', tid);
+    put('ts_code', res.ts_code);
+    put('bars', (res.bars || []).length);
+    put('catalog', (res.indicators || []).map(g => g.key + (g.empty ? '(空)' : '')).join(','));
+
+    const box = document.getElementById('box');
+    let chart = window.drawTradeReview(box, res, 'macd', null);
+    const opt = () => chart.getOption();
+    put('box_h_macd', box.style.height);
+    put('grids', opt().grid.length);
+    put('zoom_axes', JSON.stringify((opt().dataZoom[0] || {}).xAxisIndex));
+    put('ind_series', opt().series.filter(s => s.xAxisIndex === 1).map(s => s.name).join('/'));
+    /* ⚠ 标注位置要读**构造出来的 option**：`chart.getOption()` 里 graphic 被 ECharts
+       归一化过，读不到 left/top（第一次就是这么读到 undefined 的）。 */
+    const built = window.tradeReviewOption(res, 'macd', null);
+    const tagEl = (built.graphic || [])[0] || {};
+    const tagTop = tagEl.top || 0;
+    const tagH = (((tagEl.children || [])[0] || {}).shape || {}).height || 0;
+    put('graphic_count', (opt().graphic || []).length);
+    put('tag_top', tagTop);
+    put('tag_h', tagH);
+    put('grid0_top', opt().grid[0].top);
+
+    /* K 线到底画在哪：逐根取最高价的像素 y，最小的那个就是图上最高的一根。
+       标注必须整块落在它上面 —— 只比 option 的 grid.top 不够，这根是实证。 */
+    const bars = res.bars || [];
+    let topPx = Infinity;
+    bars.forEach((b, i) => {
+      const p = chart.convertToPixel({ gridIndex: 0 }, [i, b.high]);
+      if (p && isFinite(p[1])) topPx = Math.min(topPx, p[1]);
+    });
+    const tagBottom = tagTop + tagH;
+    put('kline_top_px', Math.round(topPx));
+    put('tag_bottom_px', tagBottom);
+    put('gap_px', Math.round(topPx - tagBottom));
+    put('kline_inside_grid', topPx >= opt().grid[0].top);
+    put('tag_above_kline', tagBottom <= opt().grid[0].top && topPx >= opt().grid[0].top);
+
+    /* 两格共用一条时间刻度：同一像素 x 在两格上必须落在同一根 */
+    const G = opt().grid;
+    const cy = (i) => G[i].top + G[i].height / 2;
+    const alignAt = (px) => [chart.convertFromPixel({ gridIndex: 0 }, [px, cy(0)])[0],
+                             chart.convertFromPixel({ gridIndex: 1 }, [px, cy(1)])[0]];
+    const before = alignAt(300);
+    put('align_before', JSON.stringify(before));
+    chart.dispatchAction({ type: 'dataZoom', start: 50, end: 100 });   // 真拖一把
+    const after = alignAt(300);
+    put('align_after', JSON.stringify(after));
+    put('zoom_moved', before[0] !== after[0]);
+    put('linked_align', before[0] === before[1] && after[0] === after[1]);
+    put('zoom_state', opt().dataZoom[0].start + '~' + opt().dataZoom[0].end);
+
+    /* 切指标：窗口要保住，K 线格不能动 */
+    const g0before = JSON.stringify(opt().grid[0]);
+    chart = window.drawTradeReview(box, res, 'kdj', [50, 100]);
+    put('ind2_series', opt().series.filter(s => s.xAxisIndex === 1).map(s => s.name).join('/'));
+    put('ind2_zoom_kept', opt().dataZoom[0].start + '~' + opt().dataZoom[0].end);
+    put('ind2_grid0_same', JSON.stringify(opt().grid[0]) === g0before);
+
+    /* 空数据的组（本地没同步资金流向时 mf 就是这种）：不留空格子。
+       ⚠ 包里不一定**恰好**有空数据的指标，所以喂一份**合成数据**给真函数 ——
+       断言不能押在「本机碰巧有」上。 */
+    const fake = Object.assign({}, res, {
+      indicators: (res.indicators || []).map(g => Object.assign({}, g, { empty: g.key === 'macd' }))
+    });
+    chart = window.drawTradeReview(box, fake, 'macd', null);
+    put('fake_empty_grids', opt().grid.length);
+    put('fake_empty_box_h', box.style.height);
+    put('fake_empty_kline_ok', opt().series.some(s => s.type === 'candlestick'));
+    put('real_empty_key', ((res.indicators || []).find(g => g.empty) || {}).key || '(本机没有)');
+    flush();
+  } catch (e) { flush(e && e.message); }
+})();
+</script>
+</body>
+</html>

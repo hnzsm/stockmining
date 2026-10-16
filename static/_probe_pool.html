@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>选股策略试跑探针</title>
+<style>
+  body{margin:0;background:#0d1117;color:#e6ebf4;font:13px/1.6 Consolas,monospace}
+  #out{white-space:pre-wrap;padding:12px;margin:0}
+  iframe{position:fixed;left:-99999px;top:0;width:1440px;height:1100px;border:0}
+</style>
+</head>
+<body>
+<pre id="out">未运行 —— 本页是自检探针，加 ?run=1 才开始（它只读 DOM、只在页面上点一次「看当日命中」，不写任何数据）。</pre>
+<script>
+/* ============================================================================
+   选股策略「看当日命中」探针
+   ----------------------------------------------------------------------------
+   目的：验命中列表的两件事，都读文本读不出来：
+     a) 代码 / 名称**真的**能进每只票的个股诊断页（链接拼错、一行串成另一行的代码、
+        点了 404，静态看模板都正常）；
+     b) 「K线」按钮**真的**在弹窗里嵌了诊断页的预览模式 —— 而不是又跳走一页，
+        也不是列表页自己另画一份 K 线（那就成了第二个口径）。
+
+   做法（沿用本项目探针的既有套路）：
+     · 把 /pools 塞进**同源 iframe**（src 必须用 JS 设，否则 load 监听挂不上）；
+     · 先验左侧列表的展示口径：**每项只留策略名**，名称下面不再有说明行（.nt），
+       基础池/条件数/过滤摘要只能出现在 hover 提示（title）里；
+     · 等页面把基础池下拉框填好，把基础池切到**最小的那个**（默认「全部A股」要跑
+       200 秒，探针等不起），填一条必然命中的条件 `close > 0`、样例 50，点
+       「看当日命中」；
+     · 等结果表出现，逐行抠 `<a href>`：必须都指向 /stock/<代码>、必须各不相同，
+       并真的请求几个看是不是 200；
+     · 真点第一行的「K线」：弹窗里必须是 iframe 指向 /stock/<代码>?…&embed=1，
+       内层 #st-result 显示、K 线画布有实际尺寸、非图表卡片与侧栏被隐藏，
+       且**外层仍停在 /pools**（没被跳走），关掉后弹窗被移除；
+     · 弹窗里**不能有「策略收益」卡、不能画买卖信号**：试跑只选了票、没绑定买卖
+       策略，带上 sel_only=1 后只有 3 张卡 + 蓝色的「选股命中」点；
+     · **真点表头**验排序：初始无箭头 → 点「收盘」降序（行序真换、只有这列带 ▼、
+       「#」重编号 1..n、收盘真非递增、行内 K线 按钮跟着换行）→ 再点反向（▲）→
+       点「#」回服务端原序（旧箭头清掉）；再喂**构造数据**调真 renderTest 验
+       「缺值沉底（升降两个方向都沉底）」「文本列默认升序」「评分列 == 式子的值」；
+     · 最后改一下条件，验「条件已改动 → 结果标为过期」的提示会出现。
+   结果 JSON 写进 <pre id="out">，由 tools/verify_pool_ui.py 解析。
+   ============================================================================ */
+(function () {
+  var params = new URLSearchParams(location.search);
+  var out = document.getElementById('out');
+  if (params.get('run') !== '1') return;      // 门禁：防用户误打开（它会真发一次试跑）
+
+  var CHECKS = [];
+  function ok(name, cond, extra) {
+    CHECKS.push({ name: name, ok: !!cond, extra: extra == null ? '' : String(extra) });
+    out.textContent = JSON.stringify({ done: false, checks: CHECKS }, null, 1);
+  }
+
+  /* 候选基础池：由小到大，全部A股(5904)是最后手段，绝不自动选它（要跑 200 秒） */
+  var BASES = ['399006.SZ', '000300.SH', '000905.SH'];
+
+  function waitFor(fn, limitMs, stepMs) {
+    return new Promise(function (resolve, reject) {
+      var t0 = Date.now();
+      (function tick() {
+        var v;
+        try { v = fn(); } catch (e) { v = null; }
+        if (v) return resolve(v);
+        if (Date.now() - t0 > limitMs) return reject(new Error('等待超时'));
+        setTimeout(tick, stepMs || 200);
+      })();
+    });
+  }
+
+  function loadPools() {
+    return new Promise(function (resolve) {
+      var f = document.createElement('iframe');
+      f.width = 1440; f.height = 1100;
+      f.addEventListener('load', function () { resolve(f); });
+      f.src = '/pools';                    // 必须先挂 load 监听再赋 src
+      document.body.appendChild(f);
+    });
+  }
+
+  (async function () {
+    try {
+      var f = await loadPools();
+      var W = f.contentWindow, D = f.contentDocument;
+
+      // ---- 等页面把「基础池」下拉框填上（DOMContentLoaded 里异步拉的 /api/universes）
+      var baseSel = await waitFor(function () {
+        var el = D.querySelector('#ed-base');
+        return el && el.options.length > 2 ? el : null;
+      }, 20000);
+      ok('试跑区渲染完成（#ed-date / #btn-test 都在）',
+         !!D.querySelector('#ed-date') && !!D.querySelector('#btn-test'));
+
+      // ---- 「新建」出来的默认勾选（2026-10-11：剔除科创板默认勾选）
+      D.querySelector('#btn-new').click();
+      await new Promise(function (r) { setTimeout(r, 150); });
+      var cbv = function (id) { var e = D.querySelector(id); return e ? e.checked : null; };
+      ok('新建表单：剔除科创板**默认勾选**',
+         cbv('#ed-kcb') === true, 'kcb=' + cbv('#ed-kcb'));
+      ok('新建表单：其余过滤项默认不变（剔ST / 剔北交勾选、剔创业不勾）',
+         cbv('#ed-st') === true && cbv('#ed-bj') === true && cbv('#ed-cyb') === false,
+         'st=' + cbv('#ed-st') + ' cyb=' + cbv('#ed-cyb') + ' bj=' + cbv('#ed-bj'));
+
+      // ---- 左侧列表口径：名称下面不该再有说明行（2026-09-20 改：只留名称）
+      var items = await waitFor(function () {
+        var l = D.querySelectorAll('#pool-list .strat-item');
+        return l.length ? l : null;
+      }, 20000).catch(function () { return null; });
+      ok('左侧列表出了策略项', !!items && items.length > 0,
+         '共 ' + ((items && items.length) || 0) + ' 项');
+      var withNt = [], noTitle = [];
+      [].slice.call(items || []).forEach(function (el) {
+        var nm = el.querySelector('.nm');
+        var label = nm ? nm.textContent.trim() : '(无名)';
+        if (el.querySelector('.nt')) withNt.push(label);
+        if (!el.getAttribute('title')) noTitle.push(label);
+      });
+      ok('列表项名称下面没有说明行（.nt 已移除）', withNt.length === 0, withNt.join(' / '));
+      ok('说明挪进 hover 提示（每项 title 非空）', noTitle.length === 0, noTitle.join(' / '));
+
+      var avail = [].slice.call(baseSel.options).map(function (o) { return o.value; });
+      var base = BASES.filter(function (b) { return avail.indexOf(b) >= 0; })[0];
+      if (!base) {
+        ok('找到一个小规模基础池可选', false, '下拉框里只有 ' + avail.join(','));
+        throw new Error('没有可用的小池子，中止（不拿全部A股跑 200 秒）');
+      }
+      baseSel.value = base;
+      var baseName = baseSel.options[baseSel.selectedIndex].text;
+      D.querySelector('#ed-conds').value = 'close > 0';
+      D.querySelector('#ed-sample').value = '50';
+
+      // ---- 点「看当日命中」
+      D.querySelector('#btn-test').click();
+      var rows = await waitFor(function () {
+        var t = D.querySelector('#test-result table tbody');
+        return t && t.querySelectorAll('tr').length ? t : null;
+      }, 180000, 300);
+
+      var stat = D.querySelector('#test-result .pool-stat');
+      ok('结果统计条渲染出来了', !!stat);
+      var statText = stat ? stat.textContent.replace(/\s+/g, ' ').trim() : '';
+      var mHit = statText.match(/当日入池 (\d+) 只/);
+      var hitCount = mHit ? Number(mHit[1]) : -1;
+      ok('当日入池只数是数字', hitCount >= 0, statText.slice(0, 110));
+      ok('入池只数 > 0（条件是 close > 0，不该是空）', hitCount > 0, 'hit=' + hitCount);
+
+      // ---- 逐行抠链接
+      var trs = [].slice.call(rows.querySelectorAll('tr'));
+      ok('结果表行数 == 样例数（命中多于样例时按样例截断）',
+         trs.length === Math.min(50, hitCount), '行 ' + trs.length + ' / 命中 ' + hitCount);
+
+      var hrefs = [], mismatch = [], bad = [], klineBtn = 0, btnIsLink = 0, cells = [];
+      trs.forEach(function (tr) {
+        var codeA = tr.querySelector('td.mono a');
+        var btn = tr.querySelector('button[data-kline]');
+        var code = codeA ? codeA.textContent.trim() : '';
+        if (btn) klineBtn++;
+        if (btn && btn.tagName === 'A') btnIsLink++;      // 还在跳页就说明没改干净
+        if (!codeA) { bad.push('无代码链接'); return; }
+        var h = codeA.getAttribute('href');
+        hrefs.push(h);
+        if (h !== '/stock/' + code) bad.push(code + '→' + h);
+        if (!/^\/stock\/\d{6}\.(SH|SZ|BJ)$/.test(h)) bad.push('href 形状不对 ' + h);
+        if (btn && btn.getAttribute('data-kline') !== code) mismatch.push(code);
+        cells.push(tr.querySelectorAll('td').length);
+      });
+      ok('每行代码都是指向 /stock/<代码> 的链接', bad.length === 0, bad.slice(0, 3).join(' | '));
+      ok('每行都有「K线」按钮，挂的就是本行代码',
+         klineBtn === trs.length && mismatch.length === 0,
+         '按钮 ' + klineBtn + '/' + trs.length + (mismatch.length ? ' 对不上 ' + mismatch.slice(0, 3) : ''));
+      ok('「K线」不再是链接（点它开弹窗，不跳页）',
+         btnIsLink === 0 && D.querySelectorAll('#test-result a.btn').length === 0,
+         '按钮里是 <a> 的有 ' + btnIsLink + ' 个 / 行内 <a class=btn> 有 '
+           + D.querySelectorAll('#test-result a.btn').length + ' 个');
+      ok('链接互不重复（没串行到同一只票）',
+         new Set(hrefs).size === hrefs.length, hrefs.length + ' 个 href，去重后 ' + new Set(hrefs).size);
+      ok('没有单元格数参差不齐的行', new Set(cells).size === 1, '出现 ' + [...new Set(cells)].join('/') + ' 列');
+
+      // ---- 表头与涨跌列
+      var ths = [].slice.call(rows.closest('table').querySelectorAll('thead th'))
+                    .map(function (t) { return t.textContent.trim(); });
+      ok('表头含「涨跌幅」列', ths.indexOf('涨跌幅') >= 0, ths.join(' / '));
+      /* ⚠ 列号按**表头名字**定位，别写死下标 —— 表头加一列（比如现在最前的「#」）
+         就会把后面所有写死的下标整体挪一格，而这种错位只会让断言假红/假绿。 */
+      var iPct = ths.indexOf('涨跌幅');
+      var clsHit = trs.filter(function (tr) {
+        var td = tr.querySelectorAll('td')[iPct];
+        return td && /up|down|flat/.test(td.className);
+      }).length;
+      ok('涨跌幅格带涨跌类名（涨红跌绿的着色入口）', clsHit === trs.length,
+         clsHit + '/' + trs.length);
+
+      // ---- 截断提示
+      // 注意选择器要收成直接子元素：表里的「行业」格也是 class="small muted"，
+      // 用 #test-result .small.muted 会先命中它，拿到的是"电气设备"。
+      var tails = D.querySelectorAll('#test-result > .small.muted');
+      var tail = tails.length ? tails[tails.length - 1] : null;
+      var tailText = tail ? tail.textContent.replace(/\s+/g, ' ').trim() : '';
+      var hidden = Math.max(0, hitCount - trs.length);
+      ok('截断时写明还剩多少只没列出 / 未截断时写明已列全',
+         hidden ? (tailText.indexOf('另有') >= 0 && tailText.indexOf(String(hidden)) >= 0)
+                : tailText.indexOf('已列出全部命中') >= 0,
+         tailText.slice(0, 130));
+      ok('结果表放在可滚动容器里（长列表不把页面拉长）',
+         !!D.querySelector('#test-result .tbl-wrap'));
+
+      // ---- 链接真的能打开（取前 3 个）
+      var probeUrls = hrefs.slice(0, 3), badPage = [];
+      for (var i = 0; i < probeUrls.length; i++) {
+        try {
+          var r = await W.fetch(probeUrls[i]);
+          var body = await r.text();
+          var codeWant = probeUrls[i].split('/').pop();
+          if (!r.ok || body.indexOf(codeWant) < 0) badPage.push(probeUrls[i] + ' ' + r.status);
+        } catch (e) { badPage.push(probeUrls[i] + ' ' + e.message); }
+      }
+      ok('点进去的 K线页真能打开（HTTP 200 且页面含该代码）',
+         probeUrls.length > 0 && badPage.length === 0,
+         probeUrls.length ? probeUrls.join(', ') + (badPage.length ? ' | 坏 ' + badPage.join(',') : '')
+                          : '没有可测的链接');
+
+      // ---- 「K线」按钮 → 弹窗预览（必须是嵌诊断页的预览模式，且不跳页）
+      var firstBtn = D.querySelector('#test-result button[data-kline]');
+      var firstCode = firstBtn ? firstBtn.getAttribute('data-kline') : '';
+      var hrefBefore = W.location.href;
+      if (firstBtn) firstBtn.click();
+      var modal = await waitFor(function () { return D.querySelector('.modal-bg') || null;
+      }, 10000, 100).catch(function () { return null; });
+      ok('点「K线」弹出预览弹窗（不是跳页）', !!modal, firstCode);
+
+      var frame = modal ? modal.querySelector('iframe.kl-frame') : null;
+      var src = frame ? (frame.getAttribute('src') || '') : '';
+      ok('弹窗里嵌的是诊断页预览模式（/stock/<代码> 且带 embed=1）',
+         !!frame && src.indexOf('/stock/' + firstCode) === 0 && /[?&]embed=1/.test(src),
+         src);
+      ok('预览带上「试跑当时」的条件快照（config=… 与列表同一份口径）',
+         /[?&]config=/.test(src), decodeURIComponent(src).slice(0, 190));
+      ok('预览标明「只看选股条件」（sel_only=1，不套默认买卖策略）',
+         /[?&]sel_only=1/.test(src), decodeURIComponent(src).slice(0, 190));
+      ok('外层页面没被跳走（还停在 /pools，试跑现场没丢）',
+         W.location.pathname === '/pools' && W.location.href === hrefBefore,
+         W.location.pathname);
+
+      /* ⚠ 别在弹窗刚出现时就把 contentDocument 存下来：那一刻 iframe 还是
+         about:blank，导航完 document 会换一个对象，存下来的引用永远看不到
+         #st-result（contentWindow 是同一个 window、不会换，所以 __stDebug 能读到，
+         只有 document 会踩这个坑 —— 本轮实测就是这么假红的）。所以每次现取。 */
+      var doc = function () { return frame ? frame.contentDocument : null; };
+      var win = function () { return frame ? frame.contentWindow : null; };
+      var shown = await waitFor(function () {
+        var dd = doc();
+        var el = dd && dd.getElementById('st-result');
+        return el && el.style.display !== 'none' ? el : null;
+      }, 90000, 250).catch(function () { return null; });
+      ok('弹窗内层真把图查出来渲染了（#st-result 已显示）', !!shown);
+
+      var canvas = doc() ? doc().querySelector('#chart-stock canvas') : null;
+      var rect = canvas ? canvas.getBoundingClientRect() : null;
+      ok('内层 K 线画布有实际尺寸（不是 0×0 空白）',
+         !!canvas && rect.width > 300 && rect.height > 200,
+         canvas ? Math.round(rect.width) + '×' + Math.round(rect.height) : '没有 canvas');
+
+      var opt = (win() && win().__stDebug) ? win().__stDebug.option() : null;
+      ok('预览里带下挂指标格（一个实例多 grid，至少 1 格指标）',
+         !!opt && (opt.grid || []).length >= 2,
+         opt ? (opt.grid || []).length + ' 格' : '拿不到 option');
+      ok('预览的指标字段来自后端目录（不写死字段名）',
+         !!opt && (opt.series || []).some(function (s) { return s.type === 'candlestick'; })
+         && (win().__stDebug.catalog() || []).length > 0,
+         opt ? '目录 ' + (win().__stDebug.catalog() || []).length + ' 组' : '');
+
+      /* ⚠ 试跑只选了票、**没有绑定买卖策略**：弹窗里不许出现「策略收益」卡，也不许
+         画买卖信号 —— 那些数是后端拿默认买卖参数跑出来的，跟这批票选得对不对无关，
+         却长得像这次试跑的结论（2026-09-20 用户点名）。 */
+      var sgKeys = (win() && win().__stDebug ? (win().__stDebug.signals() || []) : [])
+        .map(function (x) { return x.key; });
+      ok('预览只留「选股命中」一档（买卖信号不画）',
+         sgKeys.length === 1 && sgKeys[0] === 'entry', sgKeys.join(','));
+      ok('预览不算策略收益（后端 perf 为空）',
+         !!win() && !win().__stDebug.perf(),
+         'perf=' + JSON.stringify(win() && win().__stDebug.perf()));
+      var headCards = doc() ? [].slice.call(doc().querySelectorAll('#st-head > .stat')) : [];
+      var headLabels = headCards.map(function (c) {
+        var lb = c.querySelector('.label');
+        return lb ? (lb.textContent || '').trim() : '';
+      });
+      var headCls = doc() ? (doc().getElementById('st-head').className || '') : '';
+      ok('卡片行只有 3 张、没有「策略收益」，栅格同步收成三列',
+         headCards.length === 3 && headCls.indexOf('g3') >= 0
+         && !headLabels.some(function (t) { return t.indexOf('策略收益') === 0; }),
+         headCards.length + ' 张（' + headCls + '）：' + headLabels.join(' | '));
+
+      var hidden = ['st-card-query', 'st-card-chips', 'st-card-table'];
+      var hiddenOk = !!doc() && hidden.every(function (id) {
+        var el = doc().getElementById(id);
+        return el && win().getComputedStyle(el).display === 'none';
+      });
+      ok('预览模式只留图表与卡片（查询区/筹码/明细表被隐藏）', hiddenOk);
+      var side = doc() ? doc().querySelector('.sidebar') : null;
+      ok('预览模式里侧栏与顶栏不占地方',
+         !!side && win().getComputedStyle(side).display === 'none');
+
+      /* 「下一个」：右上角 ✕ 左边，按**这次试跑的命中列表**一只只往下看 */
+      var nx = modal.querySelector('.modal-head [data-next]');
+      var bx = modal.querySelector('.modal-head [data-close]');
+      ok('弹窗右上角有「下一个」按钮，且排在 ✕ 左边',
+         !!nx && nx.textContent.trim() === '下一个' && !!bx &&
+         (nx.compareDocumentPosition(bx) & 4) !== 0,
+         nx ? nx.textContent.trim() : '没找到');
+      /* ⚠ 命中数随数据变（可能是 1 只）：两支都验满 3 条，别让项数跟着数据飘
+         （只命中一只时「点了不动」本身也是要守的行为）。 */
+      var kbtns = D.querySelectorAll('#test-result button[data-kline]');
+      var secondCode = kbtns.length > 1 ? kbtns[1].getAttribute('data-kline') : '';
+      var src2 = '';
+      if (nx) { nx.click(); src2 = frame.getAttribute('src') || ''; }
+      if (secondCode) {
+        ok('点「下一个」换到试跑命中里的下一只', src2.indexOf('/stock/' + secondCode) === 0
+           && /[?&]embed=1/.test(src2), decodeURIComponent(src2).slice(0, 190));
+        ok('翻页后条件快照照旧带过去（config + sel_only，仍是这一批的口径）',
+           /[?&]config=/.test(src2) && /[?&]sel_only=1/.test(src2),
+           decodeURIComponent(src2).slice(0, 190));
+      } else {
+        ok('命中只有一只时点它不动（按钮已变灰，翻不到别处）',
+           !!nx && nx.disabled === true && src2.indexOf('/stock/' + firstCode) === 0,
+           'disabled=' + (nx ? nx.disabled : '-') + ' src=' + decodeURIComponent(src2).slice(0, 90));
+        ok('没有下一只时也不重建弹窗（点了不闪）',
+           D.querySelectorAll('.modal-bg').length === 1
+           && !!D.querySelector('.modal-head [data-next]'),
+           D.querySelectorAll('.modal-bg').length + ' 个弹窗');
+      }
+      ok('翻页只换 iframe（弹窗没被重建、试跑现场没丢）',
+         D.querySelectorAll('.modal-bg').length === 1
+         && !!D.querySelector('.modal-head [data-next]') && W.location.pathname === '/pools',
+         D.querySelectorAll('.modal-bg').length + ' 个弹窗 / ' + W.location.pathname);
+
+      modal.querySelector('.modal-foot [data-close]').click();
+      await waitFor(function () { return !D.querySelector('.modal-bg') ? 1 : null; }, 5000, 100)
+        .catch(function () { return null; });
+      ok('关掉弹窗后它被移除（不留多个叠加）', !D.querySelector('.modal-bg'));
+
+      /* ---- 真点表头排序 ----------------------------------------------------------
+         服务端那套顺序（按排序表达式降序）只是**默认**；点表头是「在这批里换个看法」。
+         ⚠ paintTest 会重建 tbody 的 innerHTML，先取的 th 引用当场失效 —— 所以下面
+         每次**重新查 DOM**，不缓存节点。 */
+      var box2 = function () { return D.querySelector('#test-table'); };
+      var thOf = function (key) { return box2().querySelector('th[data-sort="' + key + '"]'); };
+      var codesNow = function () {
+        return [].slice.call(box2().querySelectorAll('tbody tr')).map(function (tr) {
+          var a = tr.querySelector('td.mono a');
+          return a ? a.textContent.trim() : '';
+        });
+      };
+      var arrows = function () {
+        return box2().querySelectorAll('thead th.sort-asc, thead th.sort-desc').length;
+      };
+      var serverOrder = codesNow();
+      ok('初始状态：没有任何列带 ▲/▼（服务端那套顺序不算「你点出来的排序」）',
+         serverOrder.length > 1 && arrows() === 0,
+         serverOrder.length + ' 行 / ' + box2().querySelectorAll('thead th.sortable').length + ' 个可排序列');
+      ok('「#」列自己不显 ▲/▼（免得看着像「按行号排」）',
+         !!thOf('__orig') && !thOf('__orig').querySelector('.sarrow'));
+      ok('结果卡写明「按什么排的」',
+         (D.querySelector('#test-result .pool-stat').textContent || '').indexOf('按代码升序') >= 0,
+         '未填排序表达式时写「按代码升序」');
+
+      thOf('close').click();
+      var c1 = codesNow();
+      ok('点「收盘」→ 行序真的换了（数值列默认降序）',
+         c1.length > 1 && c1.join() !== serverOrder.join() && c1[0] !== serverOrder[0],
+         '首行 ' + serverOrder[0] + ' → ' + c1[0]);
+      ok('点「收盘」后只有这一列带 ▼（sort-desc）',
+         arrows() === 1 && thOf('close').className.indexOf('sort-desc') >= 0,
+         thOf('close').className);
+      ok('排序后「#」列重编号 1..n（跟屏幕顺序一致）',
+         (function () {
+           var rows2 = box2().querySelectorAll('tbody tr');
+           return rows2[0].querySelectorAll('td')[0].textContent.trim() === '1'
+             && rows2[1].querySelectorAll('td')[0].textContent.trim() === '2';
+         })(), box2().querySelectorAll('tbody tr').length + ' 行');
+      ok('收盘列自身真非递增（不是只换了个箭头）',
+         (function () {
+           var i = [].slice.call(box2().querySelectorAll('thead th'))
+                     .findIndex(function (t) { return t.dataset.sort === 'close'; });
+           var v = [].slice.call(box2().querySelectorAll('tbody tr')).map(function (tr) {
+             return parseFloat(tr.querySelectorAll('td')[i].textContent);
+           });
+           return v.length > 1 && v.every(function (x, k) {
+             return k === 0 || isNaN(x) || isNaN(v[k - 1]) || x <= v[k - 1] + 1e-9;
+           });
+         })());
+
+      thOf('close').click();
+      var c2 = codesNow();
+      /* ⚠ 别断言「升序 == 降序的严格逆序」：**并列值**（两只票同一个收盘价）在**稳定**排序下
+         两个方向都保持同样的相对次序，逆序只在「这批里没有并列」时才成立 —— 哪天这批票里
+         冒出一对同价（2026-10-10 实测 SMALL_BASE 里 7.9 有两只），老写法就**假红**，
+         报出来还是「反向失败」，看着像排序坏了。改成与数据无关的三件事：
+         箭头切到 ▲、收盘列**非递减**、首行落在最小值那一档。 */
+      var closeIdx = [].slice.call(box2().querySelectorAll('thead th'))
+                       .findIndex(function (t) { return t.dataset.sort === 'close'; });
+      var c2v = [].slice.call(box2().querySelectorAll('tbody tr')).map(function (tr) {
+        return parseFloat(tr.querySelectorAll('td')[closeIdx].textContent);
+      });
+      var okNum = c2v.filter(function (x) { return !isNaN(x); });
+      var minC = Math.min.apply(null, okNum);
+      ok('再点「收盘」→ 反向（升序），箭头变 ▲（sort-asc）',
+         arrows() === 1 && thOf('close').className.indexOf('sort-asc') >= 0
+         && okNum.length > 1 && c2v[0] <= minC + 1e-9
+         && c2v.every(function (x, k) {
+              return k === 0 || isNaN(x) || isNaN(c2v[k - 1]) || x >= c2v[k - 1] - 1e-9;
+            }),
+         '首行 ' + c1[0] + ' → ' + c2[0] + '（同价 ' + (okNum.length - new Set(okNum).size)
+         + ' 只 / 最小 ' + minC + '）');
+      ok('排序后行内「K线」按钮仍跟着本行代码（没串行）',
+         (function () {
+           var r = [].slice.call(box2().querySelectorAll('tbody tr')).map(function (tr) {
+             var a = tr.querySelector('td.mono a'), b = tr.querySelector('button[data-kline]');
+             return !!a && !!b && a.textContent.trim() === b.getAttribute('data-kline');
+           });
+           return r.length > 0 && r.every(Boolean);
+         })());
+
+      thOf('__orig').click();
+      ok('点「#」回到服务端原顺序（哪怕刚点过别的列）',
+         codesNow().join() === serverOrder.join(), codesNow().slice(0, 3).join(','));
+      ok('回原序后旧箭头清掉、也没有任何列带箭头',
+         arrows() === 0 && thOf('close').className.indexOf('sort-') < 0);
+
+      /* ---- 缺值沉底 / 文本列默认升序：喂**构造数据**调真 renderTest --------------
+         真数据里未必有缺值的票（创业板指当天换手率都有值），靠真数据验不出「缺值沉底」
+         —— 而它恰恰是「一点升序，一屏 — 全冒到最前」那个坑。 */
+      W.renderTest({
+        trade_date: '2026-09-21', base_size: 4, hit_count: 4, elapsed: 0.1,
+        preselected: false, sort_expr: 'turnover_rate', sort_note: '',
+        samples: [
+          { ts_code: '600003.SH', name: '丙', industry: 'C', close: 30, pct_chg: 3,
+            total_mv: 300, turnover_rate: 5, score: 5 },
+          { ts_code: '600001.SH', name: '甲', industry: 'A', close: 10, pct_chg: 1,
+            total_mv: 100, turnover_rate: null, score: null },
+          { ts_code: '600004.SH', name: '丁', industry: 'D', close: 40, pct_chg: 4,
+            total_mv: 400, turnover_rate: 9, score: 9 },
+          { ts_code: '600002.SH', name: '乙', industry: 'B', close: 20, pct_chg: 2,
+            total_mv: 200, turnover_rate: 1, score: 1 }
+        ]
+      });
+      ok('构造数据：服务端原序照搬 samples（不自己重排）',
+         codesNow().join() === '600003.SH,600001.SH,600004.SH,600002.SH', codesNow().join(','));
+      ok('结果卡写明「按 turnover_rate 降序」',
+         (D.querySelector('#test-result .pool-stat').textContent || '')
+           .indexOf('按 turnover_rate 降序') >= 0);
+      ok('「评分」列显示该式子的值（排序和评分是同一个式子）',
+         (function () {
+           var i = [].slice.call(box2().querySelectorAll('thead th'))
+                     .findIndex(function (t) { return t.dataset.sort === 'score'; });
+           var tds = box2().querySelectorAll('tbody tr')[0].querySelectorAll('td');
+           return i >= 0 && parseFloat(tds[i].textContent) === 5 && tds[i].textContent.indexOf('5.000') === 0;
+         })());
+
+      thOf('turnover_rate').click();          // 降序 9,5,1 + 缺值沉底
+      ok('缺值沉底（降序）：换手率缺的那只排最后，不当 0 冒到最前',
+         codesNow().join() === '600004.SH,600003.SH,600002.SH,600001.SH', codesNow().join(','));
+      thOf('turnover_rate').click();          // 升序 1,5,9 + 缺值仍沉底
+      ok('缺值沉底（升序）：反向之后缺值那只**还是**最后（不受方向影响）',
+         codesNow().join() === '600002.SH,600003.SH,600004.SH,600001.SH', codesNow().join(','));
+
+      thOf('ts_code').click();
+      ok('换到文本列默认升序（代码升序）',
+         codesNow().join() === '600001.SH,600002.SH,600003.SH,600004.SH', codesNow().join(','));
+      thOf('__orig').click();
+      ok('构造数据里「#」同样回服务端原序',
+         codesNow().join() === '600003.SH,600001.SH,600004.SH,600002.SH', codesNow().join(','));
+
+      /* ---- 额外列 = 入池条件引用到的字段（构造数据验渲染口径） ----------------------
+         上面那次真试跑的条件是 `close > 0`，一个额外字段都没引用，靠真数据验不出这些列；
+         而后端给的 `extra_cols`（`indicators.col_spec` 的 {key,label,dec,color,fmt}）
+         就是契约本身，所以直接喂一份构造数据调真 renderTest。 */
+      var colsOf = function () {
+        return [].slice.call(box2().querySelectorAll('thead th')).map(function (t) {
+          return t.textContent.trim();
+        });
+      };
+      var cellAt = function (r, label) {
+        var i = colsOf().indexOf(label);
+        if (i < 0) return null;
+        var tr = box2().querySelectorAll('tbody tr')[r];
+        return tr ? tr.querySelectorAll('td')[i] : null;
+      };
+      var textAt = function (r, label) {
+        var td = cellAt(r, label);
+        return td ? td.textContent.trim() : '(没有这列)';
+      };
+      var clsAt = function (r, label) {
+        var td = cellAt(r, label);
+        return td ? td.className : '';
+      };
+      W.renderTest({
+        trade_date: '2026-09-21', base_size: 4, hit_count: 4, elapsed: 0.1,
+        preselected: false, sort_expr: 'turnover_rate', sort_note: '',
+        extra_cols: [
+          { key: 'ma_bull', label: '均线多头', dec: 0, color: '', fmt: 'int' },
+          { key: 'circ_mv', label: '流通市值亿', dec: 2, color: '', fmt: 'mv' },
+          { key: 'mf_main_net', label: '主力净额万', dec: 2, color: 'updown', fmt: 'big' }
+        ],
+        samples: [
+          { ts_code: '600003.SH', name: '丙', industry: 'C', close: 30, pct_chg: 3,
+            total_mv: 300, turnover_rate: 5, score: 5,
+            ma_bull: 1, circ_mv: 935595, mf_main_net: 18081.47 },
+          { ts_code: '600001.SH', name: '甲', industry: 'A', close: 10, pct_chg: 1,
+            total_mv: 100, turnover_rate: null, score: null,
+            ma_bull: 0, circ_mv: null, mf_main_net: -3456.7 },
+          { ts_code: '600004.SH', name: '丁', industry: 'D', close: 40, pct_chg: 4,
+            total_mv: 400, turnover_rate: 9, score: 9,
+            ma_bull: 1, circ_mv: 412000, mf_main_net: 0 },
+          { ts_code: '600002.SH', name: '乙', industry: 'B', close: 20, pct_chg: 2,
+            total_mv: 200, turnover_rate: 1, score: 1,
+            ma_bull: 1, circ_mv: 300000, mf_main_net: 0.5 }
+        ]
+      });
+      var hs = colsOf();
+      ok('额外列按后端 extra_cols 出列、顺序一致',
+         hs.indexOf('均线多头') >= 0 && hs.indexOf('流通市值亿') === hs.indexOf('均线多头') + 1
+         && hs.indexOf('主力净额万') === hs.indexOf('均线多头') + 2,
+         hs.join(' / '));
+      ok('额外列插在「换手%」与「评分」之间（和今日选股页同一位置）',
+         hs.indexOf('换手%') < hs.indexOf('均线多头') && hs.indexOf('主力净额万') < hs.indexOf('评分'),
+         hs.join(' / '));
+      ok('额外列按后端 fmt 渲染（int / mv / big）',
+         textAt(0, '均线多头') === '1' && textAt(0, '流通市值亿') === '93.56亿'
+         && textAt(0, '主力净额万') === '1.81万',
+         [textAt(0, '均线多头'), textAt(0, '流通市值亿'), textAt(0, '主力净额万')].join(' | '));
+      ok('额外列的缺值给「—」，且 0 照常显示 0（不当成缺值）',
+         textAt(1, '流通市值亿') === '—' && textAt(1, '均线多头') === '0'
+         && textAt(2, '主力净额万') === '0.00',
+         [textAt(1, '流通市值亿'), textAt(1, '均线多头'), textAt(2, '主力净额万')].join(' | '));
+      ok('标了 updown 的额外列按正负染色（涨红跌绿），没标的列不染色',
+         clsAt(0, '主力净额万').indexOf('up') >= 0 && clsAt(1, '主力净额万').indexOf('down') >= 0
+         && clsAt(0, '均线多头').indexOf('up') < 0 && clsAt(0, '均线多头').indexOf('down') < 0,
+         clsAt(0, '主力净额万') + ' / ' + clsAt(1, '主力净额万') + ' / ' + clsAt(0, '均线多头'));
+      thOf('circ_mv').click();
+      ok('额外列也能点表头排序（数值列默认降序、缺值沉底）',
+         codesNow().join() === '600003.SH,600004.SH,600002.SH,600001.SH', codesNow().join(','));
+      W.renderTest({
+        trade_date: '2026-09-21', base_size: 1, hit_count: 1, elapsed: 0.1,
+        preselected: false, sort_expr: '', sort_note: '', extra_cols: [],
+        samples: [{ ts_code: '600003.SH', name: '丙', industry: 'C', close: 30, pct_chg: 3,
+                    total_mv: 300, turnover_rate: 5, score: null }]
+      });
+      ok('extra_cols 为空时不多画列（固定 10 列：含「#」与「K线」）',
+         colsOf().length === 10, colsOf().length + ' 列：' + colsOf().join(' / '));
+
+      // ---- 改条件 → 结果标记为过期（最后做：这一步会把表单弄脏）
+      var beforeStale = !!D.querySelector('#test-stale');
+      var conds = D.querySelector('#ed-conds');
+      conds.value = conds.value + '\nclose > 0';
+      conds.dispatchEvent(new W.Event('input', { bubbles: true }));
+      var staleEl = D.querySelector('#test-stale');
+      ok('改动条件后结果被标为过期（列表现场与条件不一致会被点错）',
+         !beforeStale && !!staleEl, staleEl ? staleEl.textContent.replace(/\s+/g, ' ').slice(0, 80) : '没出现提示');
+    } catch (e) {
+      ok('探针执行完成', false, (e && e.message) || String(e));
+    }
+    out.textContent = JSON.stringify({ done: true, checks: CHECKS }, null, 1);
+  })();
+})();
+</script>
+</body>
+</html>

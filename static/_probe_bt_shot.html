@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>回测页 · 截图探针</title>
+<!-- ⚠ iframe 跟着窗口走：截图只拍外层窗口那么大，iframe 比窗口高的话，
+     里面 fixed 定位的浮层会被拍到窗口外面去（实测「浮层看着只画了一半」就是这么来的）。 -->
+<style>html,body{margin:0;height:100%;overflow:hidden;background:#0d1117}
+iframe{display:block;border:0;width:100vw;height:100vh}</style>
+</head><body>
+<pre id="out" style="position:fixed;left:-9999px;top:0">PENDING</pre>
+<iframe id="fr"></iframe>
+<script>
+/* 截图探针：同源 iframe 里打开真实的 /backtest，把「真正在跑的那份页面」摆到位 ——
+   外层无头截图不用滚动就能拍到想要的局部。
+   ⚠ iframe.src 必须 JS 赋值、contentDocument 每次现取；**别用 scrollIntoView**（无头会挂）。
+   ⚠ 滚动容器可能不是 window：走到 BODY/HTML 时必须换成 document.scrollingElement，
+      否则标准模式下 body.scrollTop 被忽略、两张图会一模一样。
+
+   ?run=39&pos=head        交易明细：表头（排序箭头 + 前几行）
+   ?run=39&pos=tail        交易明细：页尾（分页条「第 1–100 条 · 共 6051 条 · 每页 100」）
+   ?view=top               页面顶部（含「回测配置」卡片 → 跑起来时进度条就在这）
+   ?view=runs[&hover=1]    历史回测记录表；hover=1 时把「回测配置」悬浮浮层撑开一起拍
+   ?view=runs&hover=pool   同上，但撑开的是「股票池」的选股条件浮层
+   ?view=trade&run=62      交易明细的复盘弹窗（真调一次 showTradeKline）：单实例两格 /
+                           指标下拉选项数 / 拖一把再切指标看窗口是否保住 */
+const out = document.getElementById('out');
+const log = [];
+const done = t => { out.textContent = 'DONE=' + t + '\n' + log.join('\n'); };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const fr = document.getElementById('fr');
+fr.onload = async () => {
+  try {
+    const doc = () => fr.contentDocument;              // 每次现取
+    await sleep(1500);
+    const q = location.search;
+    const view = (q.match(/[?&]view=(\w+)/) || [])[1];
+
+    if (view) {                                        // —— 记录列表 / 页面顶部
+      let tries = 0;
+      while (!doc().querySelector('#runs-list [data-view]') && tries++ < 40) await sleep(300);
+      const card = doc().querySelector('#runs-list').closest('.card');
+      let sc = card;
+      while (sc && sc !== doc().documentElement && !(sc.scrollHeight > sc.clientHeight + 20)) sc = sc.parentElement;
+      if (!sc || sc === doc().body || sc === doc().documentElement) sc = doc().scrollingElement;
+      const relTop = el => el.getBoundingClientRect().top - sc.getBoundingClientRect().top + sc.scrollTop;
+      sc.scrollTop = view === 'top' ? 0 : Math.max(0, relTop(card) - 8);
+      log.push('view=' + view + ' scroller=' + (sc.tagName || '?') + ' scrollTop=' + Math.round(sc.scrollTop));
+      if (view === 'runs') {
+        const hover = (q.match(/[?&]hover=(\w+)/) || [])[1];
+        // 「回测配置」走 .json-cell，「股票池」走 .pool-name —— 两者共用同一个浮层
+        const cell = hover === 'pool' ? doc().querySelector('#runs-list .pool-name')
+          : doc().querySelector('#runs-list .json-cell');
+        const panel = doc().querySelector('#bt-job');
+        log.push('rows=' + doc().querySelectorAll('#runs-list tbody tr').length);
+        log.push('job_panel=' + (panel ? getComputedStyle(panel).display : '?')
+                 + ' pct=' + doc().querySelector('#bt-pct').textContent
+                 + ' msg=' + doc().querySelector('#bt-msg').textContent);
+        const trs = Array.from(doc().querySelectorAll('#runs-list tbody tr'));
+        const r0 = trs.find(t => /running/.test(t.textContent));
+        if (r0) {
+          const tds = r0.querySelectorAll('td');
+          log.push('running_status=' + tds[tds.length - 2].textContent.replace(/\s+/g, ' ').trim());
+        }
+        if (cell && hover) {                          // 合成事件把浮层撑开（真鼠标在无头里没有）
+          cell.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+          await sleep(200);
+          const pop = doc().querySelector('.json-pop');
+          const r = pop ? pop.getBoundingClientRect() : null;
+          // ⚠ 坐标是 iframe 视口内的，就得拿 **iframe 的** innerHeight 比 ——
+          //   拿外层的 innerHeight 比是两套坐标系混用，永远得出 false
+          const vh = doc().defaultView.innerHeight, vw = doc().defaultView.innerWidth;
+          log.push('popover=' + (pop ? getComputedStyle(pop).display : '?')
+                   + ' 视口内=' + (r ? (r.top >= 0 && r.bottom <= vh && r.left >= 0 && r.right <= vw) : '?')
+                   + ' rect=' + (r ? [r.top, r.bottom, r.left, r.right].map(Math.round).join(',') : '')
+                   + ' vh=' + vh + ' vw=' + vw);
+        }
+      }
+      if (view === 'trade') {
+        /* 交易明细的复盘弹窗：走**用户真点的那条路**（模板里的 showTradeKline）——
+           只验图表本身不够，弹窗这段（下拉填充、切指标保窗口、提示文案）也得真跑一遍。 */
+        const rid = (q.match(/[?&]run=(\d+)/) || [])[1];
+        const tj = await (await fr.contentWindow.fetch(
+          '/api/backtest/runs/' + rid + '/trades?sort=buy_date&order=asc')).json();
+        const tid = ((tj.data || [])[0] || {}).id;
+        log.push('run=' + rid + ' trade=' + tid);
+        // ⚠ 得先「打开这条回测」把 curRun 立起来（showTradeKline 第一行就是 if(!curRun) return）——
+        //    直接调的话会静默什么都不做，探针只能超时。
+        const btn = doc().querySelector('[data-view="' + rid + '"]');
+        if (btn) { btn.click(); await sleep(3500); }
+        fr.contentWindow.showTradeKline(tid);          // 模板里的真函数（async，自己会 fetch）
+        let k = 0;
+        const boxEl = () => doc().querySelector('.modal .chart');
+        while (!(boxEl() && fr.contentWindow.echarts.getInstanceByDom(boxEl())) && k++ < 80) await sleep(300);
+        const chart = fr.contentWindow.echarts.getInstanceByDom(boxEl());
+        const sel = doc().querySelector('.modal select');
+        const o = chart.getOption();
+        log.push('grids=' + o.grid.length + ' zoom_axes=' + JSON.stringify(o.dataZoom[0].xAxisIndex));
+        log.push('ind_options=' + sel.options.length + ' default=' + sel.value);
+        log.push('ind_series=' + o.series.filter(s => s.xAxisIndex === 1).map(s => s.name).join('/'));
+        chart.dispatchAction({ type: 'dataZoom', start: 40, end: 100 });   // 先拖一把
+        await sleep(200);
+        sel.value = 'kdj';                             // 再切指标：窗口必须保住
+        sel.dispatchEvent(new fr.contentWindow.Event('change'));
+        await sleep(700);
+        const o2 = chart.getOption();
+        log.push('after_switch=' + o2.series.filter(s => s.xAxisIndex === 1).map(s => s.name).join('/'));
+        log.push('zoom_kept=' + o2.dataZoom[0].start + '~' + o2.dataZoom[0].end);
+        log.push('note=[' + (doc().querySelector('.modal .flex span:last-child') || {}).textContent + ']');
+        log.push('hint_has_tag=' + /K 线格上方/.test(doc().querySelector('.modal .hintbox').textContent));
+        await sleep(400);
+        return done(1);
+      }
+
+      await sleep(400);
+      return done(1);
+    }
+
+    const runId = (q.match(/[?&]run=(\d+)/) || [])[1];   // —— 交易明细
+    const pos = (q.match(/[?&]pos=(\w+)/) || [])[1] || 'head';
+    const btn = runId ? doc().querySelector('[data-view="' + runId + '"]')
+                      : doc().querySelector('[data-view]');
+    if (!btn) { log.push('找不到「查看」按钮'); return done(0); }
+    btn.click();
+    await sleep(4000);
+    const list = doc().querySelector('#trades-list');
+    const pager = list.querySelector('.pager');
+    log.push('run=' + btn.dataset.view);
+    log.push('rows=' + list.querySelectorAll('tbody tr').length);
+    log.push('tag=' + doc().querySelector('#trade-tag').textContent);
+    log.push('pager=' + (pager ? pager.textContent.replace(/\s+/g, ' ').trim() : '(无)'));
+    let sc = list.parentElement;
+    while (sc && sc !== doc().documentElement && !(sc.scrollHeight > sc.clientHeight + 20)) sc = sc.parentElement;
+    if (!sc || sc === doc().body || sc === doc().documentElement) sc = doc().scrollingElement;
+    const relTop = el => el.getBoundingClientRect().top - sc.getBoundingClientRect().top + sc.scrollTop;
+    if (pos === 'tail') {
+      sc.scrollTop = Math.max(0, relTop(pager) - sc.clientHeight + 110);
+    } else {
+      sc.scrollTop = Math.max(0, relTop(list.closest('.card')) - 10);
+    }
+    await sleep(700);
+    const r = pager.getBoundingClientRect();
+    if (r.top > 0 && r.top < 2380) log.push('分页条在视口内 y=' + Math.round(r.top));
+    log.push('scrollTop=' + Math.round(sc.scrollTop));
+    done(1);
+  } catch (e) { log.push('ERR ' + e.message); done(0); }
+};
+fr.src = '/backtest';
+</script>
+</body></html>

@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>回测配置本地草稿 · 探针</title>
+<style>
+  body{margin:0;background:#0f1319;color:#c9d4e3;font:12px/1.65 ui-monospace,Consolas,monospace}
+  pre{padding:10px;white-space:pre-wrap}
+  iframe{position:absolute;left:-9999px;top:0;width:1400px;height:900px;border:0}
+</style>
+</head>
+<body>
+<pre id="out">running…</pre>
+<iframe id="fr"></iframe>
+<script>
+/* 回测配置本地草稿（sm_bt_form）探针 —— 只读事实 + 真事件，不做像素断言。
+ *
+ * 要回答的问题：在**真浏览器**里改一遍配置、真触发 input/change，把页面**真重新加载**，
+ * 表单会不会自己回来？另外三条边界也一并验：URL 上的 ?strategy_id= 该压过草稿、
+ * 「清除」按钮要真清干净（且不能被离开页面那记兜底保存复活）、
+ * 「恢复默认参数」要连草稿一起清。
+ *
+ * 两个踩过的坑记在这儿：
+ *   ① 固定 sleep 采样太早 → 会读到 HTML 里的原值（假红）。这里改成轮询 iframe 内的
+ *      `draftReady`（页面自己声明的「初始化走完了」），比拍时间稳。
+ *   ② 只在 iframe 壳外面看现象不够 —— 给 localStorage.setItem/removeItem 装个 spy，
+ *      「清除之后又被写回来」才看得到是谁写的。
+ *
+ * ⚠ 这个页面会动 localStorage['sm_bt_form']，跑前**备份**、finally 里还回去。
+ *   无头 Chrome 用的是临时 profile，本来也碰不到你自己的浏览器，但万一呢。
+ */
+(async () => {
+  const out = [];
+  const ok = (k, v) => { out.push(k + '=' + v); dump(); };
+  const dump = () => { document.getElementById('out').textContent = out.join('\n'); };
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const KEY = 'sm_bt_form';
+  const backup = localStorage.getItem(KEY);
+  const f = document.getElementById('fr');
+
+  function load(url) {
+    return new Promise(res => {
+      const h = () => { f.removeEventListener('load', h); res(); };
+      f.addEventListener('load', h);
+      f.src = url;
+    });
+  }
+  /* 等 iframe 里初始化真的走完：页面把 `draftReady = true` 放在 DOMContentLoaded 末尾，
+     读到它就说明默认值 / 草稿 / hint / 草稿开关那几条都执行过了。
+     ⚠ 别用「时间」做超时：无头是 `--virtual-time-budget`，`Date.now()` 走的是虚拟时间，
+       拍时间会在真实网络还没回来时就判超时（探针自己踩过 —— 于是采样读到 HTML 原值，假红）。
+       这里的上限只是防死循环，正常一轮就出来了。 */
+  async function waitReady() {
+    // 上限 300×150ms：只防死循环。⚠ 这个循环会吃 `--virtual-time-budget`（sleep 走虚拟时间），
+    //   所以驱动脚本给的预算要够大（probe_bt_draft.py 用 600000）。
+    for (let i = 0; i < 300; i++) {
+      try { if (f.contentWindow.eval('draftReady === true')) return true; }
+      catch (e) { lastEvalErr = 'eval: ' + e.message; }
+      await sleep(150);
+    }
+    return false;
+  }
+  let lastEvalErr = '';
+  async function open(url, tag) {
+    await load(url);
+    lastEvalErr = '';
+    const r = await waitReady();
+    ok('ready_' + tag, r);
+    if (!r) {                        // 没就绪就把现场摊开：是页面没跑完、还是 eval 都读不到
+      const dd = f.contentDocument;
+      // 逐个把初始化里那些「有草稿才会走到」的调用单独叫一遍 —— 谁抛错就现形
+      const callIt = (expr) => {
+        try {
+          return String(f.contentWindow.eval(
+            '(function(){try{' + expr + '}catch(e){return "ERR:" + (e && e.message);}})()'));
+        } catch (e) { return 'EVALERR:' + (e && e.message); }
+      };
+      ok('diag_' + tag, [lastEvalErr || 'no-eval-err',
+        'readyState=' + (dd ? dd.readyState : '?'),
+        'rows=' + (dd ? dd.querySelectorAll('#runs-list tr').length : '?'),
+        'draftReadyType=' + (() => { try { return f.contentWindow.eval('typeof draftReady'); } catch (e) { return 'ERR'; } })(),
+      ].join(' | '));
+      ok('diag_' + tag + '_call', [
+        'slip=' + callIt('return applyDraftSlip(loadBtForm());'),
+        'syncSlip=' + callIt('syncSlipFromStrategy(); return 1;'),
+        'bindTips=' + callIt('bindCellTips(); return 1;'),
+        'bindDraft=' + callIt('bindBtFormDraft(); return 1;'),
+      ].join(' | '));
+    }
+    await sleep(100);
+    return f.contentDocument;
+  }
+  // 真事件：只赋值不派发事件的话，页面根本不知道你改了（那测不出防抖那条路）
+  function setVal(w, d, sel, v) {
+    const el = d.querySelector(sel);
+    el.value = v;
+    el.dispatchEvent(new w.Event('input', { bubbles: true }));
+    el.dispatchEvent(new w.Event('change', { bubbles: true }));
+    return el.value;
+  }
+
+  try {
+    localStorage.removeItem(KEY);
+    let d = await open('/backtest?_t=' + Date.now(), 'boot');
+    let w = f.contentWindow;
+    const opts = Array.from(d.querySelectorAll('#bt-strategy option'));
+    ok('strategy_option_count', opts.length);
+    ok('no_draft_cash_is_html_default', d.querySelector('#bt-cash').value);
+    ok('no_draft_end_from_api', d.querySelector('#bt-end').value);
+    ok('no_draft_tip_hidden', d.querySelector('#bt-draft-tip').style.display === 'none');
+
+    /* ---- ① 改一遍配置（真事件） ---- */
+    const sid = (opts[0] || {}).value || '';
+    setVal(w, d, '#bt-strategy', sid);
+    setVal(w, d, '#bt-start', '2024-03-04');
+    setVal(w, d, '#bt-end', '2025-07-18');
+    setVal(w, d, '#bt-cash', '660000');
+    setVal(w, d, '#bt-maxpos', '4');
+    setVal(w, d, '#bt-pospct', '0');
+    setVal(w, d, '#bt-comm', '0.0003');
+    setVal(w, d, '#bt-tax', '0.001');
+    setVal(w, d, '#bt-universe', '000300.SH');
+    await sleep(900);                                  // 等 300ms 防抖落盘
+    const raw = localStorage.getItem(KEY);
+    ok('draft_written', raw ? 'yes' : 'no');
+    let j = {};
+    try { j = JSON.parse(raw || '{}'); } catch (e) { /* ignore */ }
+    ok('draft_strategy_id', j.strategy_id);
+    ok('draft_start', j.start);
+    ok('draft_end', j.end);
+    ok('draft_cash', j.cash);
+    ok('draft_universe', JSON.stringify(j.universe));
+    ok('draft_tip_shown', d.querySelector('#bt-draft-tip').style.display !== 'none');
+    ok('draft_clear_btn_shown', d.querySelector('#btn-draft-clear').style.display !== 'none');
+
+    /* ---- ② 真刷新一次 ---- */
+    d = await open('/backtest?_t=' + Date.now(), 'reload');
+    w = f.contentWindow;
+    const R = (sel) => d.querySelector(sel).value;
+    ok('reloaded_strategy', R('#bt-strategy'));
+    ok('reloaded_start', R('#bt-start'));
+    ok('reloaded_end', R('#bt-end'));
+    ok('reloaded_cash', R('#bt-cash'));
+    ok('reloaded_maxpos', R('#bt-maxpos'));
+    ok('reloaded_pospct', R('#bt-pospct'));
+    ok('reloaded_comm', R('#bt-comm'));
+    ok('reloaded_tax', R('#bt-tax'));
+    ok('reloaded_universe', R('#bt-universe'));
+    ok('reloaded_hint', d.querySelector('#bt-hint').textContent);
+    ok('RELOAD_KEEPS_ALL',
+       R('#bt-strategy') === sid && R('#bt-start') === '2024-03-04' && R('#bt-end') === '2025-07-18'
+       && Number(R('#bt-cash')) === 660000 && Number(R('#bt-maxpos')) === 4
+       && Number(R('#bt-pospct')) === 0 && Number(R('#bt-comm')) === 0.0003
+       && Number(R('#bt-tax')) === 0.001 && R('#bt-universe') === '000300.SH');
+
+    /* ---- ③ URL 上的 strategy_id 该压过草稿，其余仍吃草稿 ---- */
+    const other = (opts[1] || {}).value || sid;
+    d = await open('/backtest?strategy_id=' + encodeURIComponent(other) + '&_t=' + Date.now(), 'url');
+    w = f.contentWindow;
+    ok('url_strategy', d.querySelector('#bt-strategy').value);
+    ok('URL_STRATEGY_WINS', d.querySelector('#bt-strategy').value === String(other));
+    ok('url_keeps_draft_cash', d.querySelector('#bt-cash').value);
+
+    /* ---- ④ 卡片头上的「清除」---- */
+    // 装写盘 spy：清除之后要是还有人往 localStorage 写，这里能看见、也能看见写的是谁
+    const spy = [];
+    const realLS = w.localStorage;
+    const realSet = realLS.setItem.bind(realLS), realDel = realLS.removeItem.bind(realLS);
+    try {
+      realLS.setItem = function (k, v) { spy.push('set:' + k); return realSet(k, v); };
+      realLS.removeItem = function (k) { spy.push('del:' + k); return realDel(k); };
+    } catch (e) { ok('spy_install', 'FAILED ' + e.message); }
+    d.querySelector('#btn-draft-clear').click();
+    ok('after_clear_now', String(localStorage.getItem(KEY)));
+    await sleep(700);
+    ok('after_clear_storage',
+       localStorage.getItem(KEY) === null ? 'removed'
+         : 'STILL THERE: ' + String(localStorage.getItem(KEY)).slice(0, 50));
+    ok('after_clear_spy', JSON.stringify(spy));
+    ok('after_clear_tip_hidden', d.querySelector('#bt-draft-tip').style.display === 'none');
+    d = await open('/backtest?_t=' + Date.now(), 'afterclear');
+    ok('after_clear_reload_cash', d.querySelector('#bt-cash').value);
+
+    /* ---- ⑤ 「恢复默认参数」要连草稿一起清 ---- */
+    w = f.contentWindow;
+    setVal(w, d, '#bt-cash', '888000');
+    await sleep(900);
+    ok('step5_draft_written', localStorage.getItem(KEY) ? 'yes' : 'no');
+    d.querySelector('#btn-reset').click();
+    await sleep(400);
+    ok('RESET_CLEARS_DRAFT', localStorage.getItem(KEY) === null);
+    d = await open('/backtest?_t=' + Date.now(), 'afterreset');
+    ok('after_reset_reload_cash', d.querySelector('#bt-cash').value);
+  } catch (e) {
+    ok('ERR', e && e.message);
+  } finally {
+    // 把探针动过的草稿还回去（备份为 null 就删掉，保持「跑之前什么样、跑完还什么样」）
+    try {
+      if (backup === null) localStorage.removeItem(KEY);
+      else localStorage.setItem(KEY, backup);
+    } catch (e) { /* ignore */ }
+    ok('user_draft_restored', String(localStorage.getItem(KEY)) === String(backup));
+    ok('done', '1');
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>提醒表单探针</title>
+<style>
+  body { margin: 0; font: 12px/1.6 monospace; }
+  #out { white-space: pre-wrap; margin: 0; padding: 8px; background: #111; color: #ddd; }
+  iframe { width: 1280px; height: 900px; border: 0; display: block; }
+</style>
+</head>
+<body>
+<pre id="out">running…</pre>
+<iframe id="fr"></iframe>
+<script>
+/* 我的关注页「提醒」弹窗的探针（`tools/verify_watch.py` 第【6】段用）。
+   目的有两个：
+   ①**看清弹窗打开时默认落在哪儿** —— 用户 2026-10-08 反馈「我要的是上穿 MA10
+     那种提醒，不是填价格的提醒」，当时默认停在「绝对价位」上，一开弹窗迎面就是个价格框。
+   ②**周K 那条路真跑一遍** —— 同一天的新需求「提醒也可以添加周线指标提醒」：周K 判的是
+     周线那一根（不是把均线贴到日线上），所以「一键按钮建出来的到底是日K 还是周K」这件事，
+     静态断言看不出（代码里两行按钮长得几乎一样），必须真点一次、再回查接口里的 freq。
+   这里真去点一下「提醒」，把 <select> 的结构 / 默认选中项 / 常用规则按钮抄出来，
+   再**真点一次「上穿 MA10」与「周K 上穿 MA10」**，确认两条路都通且落到不同周期上。
+
+   ⚠ 输出必须能过 `json.loads`：`<pre>` 的 textContent 被序列化时会把 `<` 转成 `&lt;`，
+   所以所有文案都先过 `safe()`。别往里塞原始 HTML。
+
+   不动用户的数据：所有操作都在临时分组「ZZ·提醒探针组」里做，跑完删掉整组。 */
+const API = async (p, body) => {
+  const r = await fetch(p, body === undefined ? {} : {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return r.json();
+};
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+/* 尖括号 / & 换成近形字符：JSON 里的 `<` 一旦被 DOM 序列化成 `&lt;`，外面 json.loads 就炸了 */
+const safe = s => String(s).split('&').join('＆').split('<').join('‹').split('>').join('›');
+const checks = [], debug = [];
+const log = (ok, name, extra) => checks.push({ name, ok: !!ok, extra: safe(extra || '') });
+const dbg = s => debug.push(safe(s));
+function dump() {
+  document.getElementById('out').textContent =
+    JSON.stringify({ checks, debug }, null, 1);
+}
+const bad = (name, extra) => { log(false, name, extra); dbg(extra); dump(); };
+
+const GNAME = 'ZZ·提醒探针组';
+const CODE = '000028';
+let GID = null;
+const cleanup = async () => { if (GID) await API('/api/watch/group/delete', { id: GID }); };
+
+(async function main() {
+  const q = new URLSearchParams(location.search);
+  if (!q.get('run')) { dump(); return; }
+  /* `?shot=1`：截图用 —— 把结果面板藏掉、iframe 拉高，只留弹窗本身 */
+  if (q.get('shot')) {
+    document.getElementById('out').style.display = 'none';
+    document.getElementById('fr').style.height = '820px';
+  }
+
+  // 1) 干净地造一个临时组（先删同名残留，避免上次跑崩留下的）
+  const gs = (await API('/api/watch/groups')).data.groups || [];
+  const old = gs.find(g => g.name === GNAME);
+  if (old) await API('/api/watch/group/delete', { id: old.id });
+  GID = (await API('/api/watch/group/save', { name: GNAME })).data.id;
+  await API('/api/watch/stocks/add', { group_id: GID, codes: [CODE] });
+
+  // 2) 建完组再把 iframe 指过去，页面才会看到这个新分组
+  const fr = document.getElementById('fr');
+  const loaded = new Promise(r => { fr.onload = r; });
+  fr.src = '/watch';
+  await loaded;
+  await sleep(2500);
+  const d = fr.contentDocument, $$ = s => d.querySelectorAll(s);
+
+  // 3) 切到探针组，点「提醒」
+  const gEl = [...$$('#grp-list .grp')].find(el =>
+    el.querySelector('.nm').textContent.trim() === GNAME);
+  if (!gEl) return bad('提醒探针：分组列表里能找到探针组', '分组没渲染出来');
+  gEl.click();
+  await sleep(1500);
+  const abtn = $$('#stk-list [data-alert]')[0];
+  if (!abtn) return bad('提醒探针：自选股行里有「提醒」按钮', '探针组里的票没渲染出来');
+  abtn.click();
+  await sleep(600);
+
+  // 4) 抄弹窗
+  const line = d.querySelector('#al-line');
+  const op = d.querySelector('#al-op');
+  const quick = d.querySelector('#al-quick');
+  const valWrap = d.querySelector('#al-val-wrap');
+  if (!line || !op || !quick) return bad('提醒探针：弹窗打开且三个控件都在', '弹窗没打开？');
+
+  const groups = [...line.querySelectorAll('optgroup')].map(g => g.label);
+  const opts = [...line.querySelectorAll('option')]
+    .map(o => ({ v: o.value, t: o.textContent.trim(), sel: o.selected }));
+  const sel = opts.find(o => o.sel) || {};
+  const qbtns = [...quick.querySelectorAll('[data-q]')].map(b => b.textContent.trim());
+  /* 周期下拉 + 一键按钮的**分组行**（日K 一行 / 周K 一行）—— 混在一起摆点错一个周期就变了 */
+  const freqSel = d.querySelector('#al-freq');
+  const freqPairs = freqSel ? [...freqSel.options].map(o =>
+    o.value + ':' + o.textContent.trim() + (o.selected ? '★' : '')) : null;
+  const quickGroups = [...quick.children].map(r => {
+    const lb = r.querySelector('span');
+    return (lb ? lb.textContent.trim() : '?') + '=' + r.querySelectorAll('[data-q]').length;
+  });
+
+  dbg('optgroup 顺序 = ' + JSON.stringify(groups));
+  dbg('option 一览  = ' + JSON.stringify(opts.map(o => o.v + ':' + o.t + (o.sel ? '★' : ''))));
+  dbg('默认选中     = ' + JSON.stringify(sel));
+  dbg('默认动作     = ' + JSON.stringify({ v: op.value,
+        t: (op.options[op.selectedIndex] || {}).textContent || '', n: op.options.length }));
+  dbg('常用规则按钮 = ' + JSON.stringify(qbtns));
+  dbg('价位框 display = ' + (valWrap ? JSON.stringify(valWrap.style.display) : 'null'));
+  dbg('周期下拉     = ' + JSON.stringify(freqPairs));
+  dbg('一键按钮分组 = ' + JSON.stringify(quickGroups));
+
+  log(groups.join('→') === '均线→布林→其他',
+      '提醒弹窗：下拉按「均线 → 布林 → 其他」分组', groups.join('→'));
+  log(sel.v === 'ma10', '提醒弹窗：一打开默认选中 MA10（不是「绝对价位」）', JSON.stringify(sel));
+  log(op.value === 'cross_up', '提醒弹窗：默认动作是「上穿」', op.value);
+  /* ⚠ 这条是盯 Flask `tojson` 把 dict 键**按字典序**输出那个坑的：
+     用 `Object.keys(LINES)` 排会把 MA5 甩到 MA10/MA20 后面（实测踩过）。 */
+  const maOrder = opts.filter(o => o.v.indexOf('ma') === 0).map(o => o.v).join(',');
+  log(maOrder === 'ma5,ma10,ma20,ma60', '提醒弹窗：均线顺序 MA5→MA10→MA20→MA60 没被打乱', maOrder);
+  log(qbtns.indexOf('上穿 MA10') >= 0, '提醒弹窗：常用规则里有一键「上穿 MA10」',
+      JSON.stringify(qbtns));
+  log(qbtns.length >= 5, '提醒弹窗：常用规则至少 5 个一键按钮', '实 ' + qbtns.length + ' 个');
+  log(opts.some(o => o.v === ''), '提醒弹窗：「绝对价位」还在（价格提醒保留，只是挪到最后）');
+  log(opts.length >= 8, '提醒弹窗：线清单没被改窄（均线4+布林3+价位1）', '实 ' + opts.length + ' 项');
+  log(freqPairs && freqPairs.join('|') === 'daily:日K★|weekly:周K',
+      '提醒弹窗：周期下拉是「日K / 周K」两项，默认停在日K', JSON.stringify(freqPairs));
+  log(quickGroups.length === 2 && quickGroups[0].indexOf('日K=') === 0
+      && quickGroups[1].indexOf('周K=') === 0,
+      '提醒弹窗：一键规则按「日K / 周K」分成两行', JSON.stringify(quickGroups));
+  const wkBtns = [...quick.querySelectorAll('[data-q]')]
+    .filter(b => b.textContent.trim().indexOf('周K') === 0).map(b => b.textContent.trim());
+  log(wkBtns.length >= 3, '提醒弹窗：周K 的一键按钮都在（文案带「周K」前缀，和日K 分得开）',
+      JSON.stringify(wkBtns));
+  dump();
+
+  // 5) 真点一下「上穿 MA10」—— 这是用户说的「那种提醒」，一键建规则这条路必须真通
+  const qbtn = [...quick.querySelectorAll('[data-q]')]
+    .find(b => b.textContent.trim() === '上穿 MA10');
+  if (!qbtn) return bad('提醒弹窗：找得到「上穿 MA10」按钮', '按钮不在');
+  qbtn.click();
+  await sleep(1500);
+  const listTxt = (d.querySelector('#al-list') || { textContent: '' }).textContent || '';
+  const al = (await API('/api/watch/alerts?ts_code=' + CODE + '.SZ')).data || {};
+  const got = (al.alerts || []).some(a => a.line === 'ma10' && a.op === 'cross_up');
+  log(got, '提醒弹窗：点「上穿 MA10」⇒ 真建出一条「上穿MA10」规则',
+      got ? '' : '弹窗列表：' + listTxt.replace(/\s+/g, ' ').slice(0, 90));
+  log(/上穿\s*MA10/.test(listTxt), '提醒弹窗：建完在弹窗的规则列表里看得到',
+      listTxt.replace(/\s+/g, ' ').slice(0, 60));
+
+  dbg('弹窗列表文案 = ' + JSON.stringify(listTxt.replace(/\s+/g, ' ').slice(0, 120)));
+  dump();
+
+  // 6) 周K：把周期切到 weekly ⇒ 提示必须写明「要等这周走完」；
+  //    再真点一次「周K 上穿 MA10」⇒ 回查接口确认建出来的是 **weekly**（不是静默存成日K）。
+  if (!freqSel) return bad('提醒弹窗：有周期下拉（#al-freq）', '没找到 #al-freq');
+  freqSel.value = 'weekly';
+  freqSel.dispatchEvent(new Event('change'));
+  await sleep(300);
+  const hintTxt = (d.querySelector('#al-hint') || { textContent: '' }).textContent || '';
+  log(/周K/.test(hintTxt) && /走完/.test(hintTxt),
+      '提醒弹窗：选到周K 后提示里写明「要等这周走完」，不会让人以为今天就能响',
+      hintTxt.replace(/\s+/g, ' ').slice(0, 60));
+
+  const wbtn = [...quick.querySelectorAll('[data-q]')]
+    .find(b => b.textContent.trim() === '周K 上穿 MA10');
+  if (!wbtn) return bad('提醒弹窗：找得到「周K 上穿 MA10」按钮', '按钮不在');
+  wbtn.click();
+  await sleep(1500);
+  const al2 = (await API('/api/watch/alerts?ts_code=' + CODE + '.SZ')).data || {};
+  const all2 = al2.alerts || [];
+  const wk2 = all2.filter(a => a.freq === 'weekly' && a.line === 'ma10' && a.op === 'cross_up');
+  log(wk2.length === 1, '提醒弹窗：点「周K 上穿 MA10」⇒ 真建出一条**周K**规则（不是日K）',
+      '周K ' + wk2.length + ' 条 / 全部 = ' + JSON.stringify(all2.map(a => a.freq + ':' + a.text)));
+  log(wk2.length === 1 && wk2[0].text.indexOf('周K') === 0,
+      '提醒弹窗：周K 规则在列表文案里带「周K·」前缀（和日K 分得开）',
+      wk2.length ? wk2[0].text : '');
+  const listTxt2 = (d.querySelector('#al-list') || { textContent: '' }).textContent || '';
+  log(/周K/.test(listTxt2), '提醒弹窗：弹窗规则列表里也标出了「周K」（周期那一列）',
+      listTxt2.replace(/\s+/g, ' ').slice(0, 70));
+  dbg('弹窗列表文案（含周K）= ' + JSON.stringify(listTxt2.replace(/\s+/g, ' ').slice(0, 140)));
+  dump();
+
+  /* 7) 【2026-10-10】「选股命中」这一类提醒 —— 需求原话
+     「我的关注里面的提醒，希望可以通过绑定选股策略规则，如果选股命中则提醒」。
+     能静默出错的地方：①类型切换只换了显示、没换提交口径（切到「选股命中」点添加，
+     存进去的却是 price 档的一条空规则）；②策略下拉从哪儿来（写死一份 vs 真读接口）；
+     ③预览接口算的跟检测算的不是同一套（预览说命中、检测不响）。所以这里**真切、真选、
+     真预览、真添加**，最后回查接口。
+     ⚠ 自己造一条「必然命中」的临时池（close > 0），跑完连同临时组一起清掉。 */
+  const PB = 'ZZ·弹窗探针必中池';
+  const pSave = await API('/api/pools', { name: PB, base: 'all', conds: ['close > 0'], note: '回归临时' });
+  const pid = (pSave.data || {}).id;
+  if (!pid) return bad('选股命中：临时池建得起来', JSON.stringify(pSave).slice(0, 120));
+
+  const kindBox = d.querySelector('#al-kind');
+  const pbox = d.querySelector('#al-pool-box');
+  const priceBox = d.querySelector('#al-price-box');
+  log(!!kindBox && !!pbox && !!priceBox,
+      '提醒弹窗：有「类型」分段控件，两档各有一块面板（指标/价位 · 选股命中）',
+      [!!kindBox, !!priceBox, !!pbox].join('/'));
+  const kindBtns = kindBox ? [...kindBox.querySelectorAll('[data-kind]')] : [];
+  log(kindBtns.map(b => b.dataset.kind).join(',') === 'price,pool'
+      && kindBtns.length === 2 && kindBtns[0].classList.contains('on'),
+      '提醒弹窗：类型两档来自后端（price,pool），默认停在「指标 / 价位」',
+      kindBtns.map(b => b.dataset.kind + (b.classList.contains('on') ? '★' : '')).join(','));
+  log(priceBox && priceBox.style.display !== 'none' && pbox && pbox.style.display === 'none',
+      '提醒弹窗：默认这一档下，价格表单露着、选股策略那块收着（不乱摆）',
+      'price=' + (priceBox && priceBox.style.display) + ' pool=' + (pbox && pbox.style.display));
+
+  // 真切到「选股命中」
+  kindBtns[1].click();
+  await sleep(400);
+  log(priceBox.style.display === 'none' && pbox.style.display !== 'none',
+      '提醒弹窗：切到「选股命中」⇒ 价格表单收起、策略块露出来（不会两套控件同时在场）',
+      'price=' + priceBox.style.display + ' pool=' + pbox.style.display);
+  const psel = d.querySelector('#al-pool');
+  for (let i = 0; i < 40 && psel && psel.options.length < 2; i++) await sleep(300);
+  const popts = psel ? psel.options.length : 0;
+  log(popts >= 2, '提醒弹窗：选股策略下拉真读了 /api/watch/pools（占位 + 至少一条策略）',
+      'option ' + popts + ' 个');
+  const hitBtn = d.querySelector('#al-pool-check');
+  log(!!hitBtn, '提醒弹窗：有「看这只票现在命中吗」预览按钮（算这一次、不写库）');
+
+  psel.value = String(pid);
+  psel.dispatchEvent(new Event('change'));
+  await sleep(200);
+  const ph = (d.querySelector('#al-pool-hint') || { textContent: '' }).textContent || '';
+  log(ph.indexOf(PB) >= 0, '提醒弹窗：选中策略后提示里写明「命中判据 = …（选股页怎么判这里就怎么判）」',
+      ph.replace(/\s+/g, ' ').slice(0, 80));
+
+  // 真点预览：这只票今天在不在池里
+  hitBtn.click();
+  for (let i = 0; i < 60; i++) {
+    const t = (d.querySelector('#al-pool-now') || { textContent: '' }).textContent || '';
+    if (t && t.indexOf('计算中') < 0) break;
+    await sleep(500);
+  }
+  const nowTxt = (d.querySelector('#al-pool-now') || { textContent: '' }).textContent || '';
+  log(/命中/.test(nowTxt) && nowTxt.indexOf('未命中') < 0,
+      '提醒弹窗：预览真的算了 —— 这只票在「必然命中」的临时池里 ⇒ 报命中',
+      nowTxt.replace(/\s+/g, ' ').slice(0, 90));
+
+  // 真点「添加选股命中提醒」
+  const addBtn = d.querySelector('#al-add');
+  log((addBtn.textContent || '').indexOf('选股') >= 0,
+      '提醒弹窗：切到选股命中后，底部按钮文案跟着变（不是还写着「添加」）',
+      addBtn.textContent.trim());
+  addBtn.click();
+  await sleep(2000);
+  const al3 = ((await API('/api/watch/alerts?ts_code=' + CODE + '.SZ')).data || {}).alerts || [];
+  const poolRule = al3.filter(a => a.kind === 'pool' && a.pool_id === pid);
+  log(poolRule.length === 1,
+      '提醒弹窗：点「添加」⇒ 真存出一条 **kind=pool** 的规则（不是一条空的指标规则）',
+      JSON.stringify(al3.map(a => a.kind + ':' + a.text)));
+  log(poolRule.length === 1 && poolRule[0].pool_name === PB
+      && poolRule[0].text.indexOf('选股命中') === 0
+      && poolRule[0].op === '' && poolRule[0].value === null && poolRule[0].line === '',
+      '提醒弹窗：这条规则的四个 price 字段都是空的（口径不混：pool 档不用 freq/line/op/value）',
+      poolRule.length ? JSON.stringify({ line: poolRule[0].line, op: poolRule[0].op,
+        value: poolRule[0].value, freq: poolRule[0].freq, text: poolRule[0].text }) : '没存上');
+  const listTxt3 = (d.querySelector('#al-list') || { textContent: '' }).textContent || '';
+  log(/选股命中/.test(listTxt3) && listTxt3.indexOf(PB) >= 0,
+      '提醒弹窗：规则列表里这条带「选股命中」类型标记 + 策略名',
+      listTxt3.replace(/\s+/g, ' ').slice(0, 100));
+  dbg('弹窗列表文案（含选股命中）= ' + JSON.stringify(listTxt3.replace(/\s+/g, ' ').slice(0, 160)));
+  dump();
+
+  /* 7b) 选股命中的**周期**（2026-10-10 需求「绑定选股策略也应该要有日k周期和周k周期的选择」）。
+     周K 的 pool 提醒只判「这周走完后那一天」的收盘状态 —— 这件事静态断言看不出来
+     （两个周期在代码里就差一个 end），所以真切到周K、真点预览、真添加，回查落库的 freq
+     与胶囊文案（「周K·」前缀）。 */
+  const fsel = d.querySelector('#al-pool-freq');
+  const fopts = fsel ? [...fsel.options].map(o => o.value) : [];
+  log(!!fsel && fopts.join(',') === 'daily,weekly' && fsel.value === 'daily',
+      '提醒弹窗：选股命中这块有「周期」下拉（日K / 周K），默认日K',
+      (fsel ? fsel.value : '没这个下拉') + ' / ' + fopts.join(','));
+  const checkBtn = d.querySelector('#al-pool-check');
+  fsel.value = 'weekly';
+  fsel.dispatchEvent(new Event('change'));
+  await sleep(200);
+  const wkHint = (d.querySelector('#al-pool-week') || { textContent: '' }).textContent || '';
+  log(/周K/.test(wkHint) && /一周最多一条/.test(wkHint) && checkBtn.textContent.indexOf('这周') >= 0,
+      '提醒弹窗：切到周K ⇒ 写明「只判这周走完后那天 / 一周最多一条」，预览按钮文案跟着变',
+      wkHint.replace(/\s+/g, ' ').slice(0, 60) + ' ‖ ' + checkBtn.textContent.trim());
+  log((d.querySelector('#al-pool-now') || { textContent: '' }).textContent === '',
+      '提醒弹窗：换周期 ⇒ 上一次那条预览作废（不拿日K 的结论冒充周K）', '(预览已清空)');
+
+  // 周K 真预览一次（池子是「必然命中」，走完那周也该命中）+ 真添加
+  checkBtn.click();
+  for (let i = 0; i < 60; i++) {
+    const t = (d.querySelector('#al-pool-now') || { textContent: '' }).textContent || '';
+    if (t && t.indexOf('计算中') < 0) break;
+    await sleep(500);
+  }
+  const wkNow = (d.querySelector('#al-pool-now') || { textContent: '' }).textContent || '';
+  log(/命中/.test(wkNow) && wkNow.indexOf('未命中') < 0 && /这周走完那天/.test(wkNow),
+      '提醒弹窗：周K 预览真的按「这周走完那天」算（不是拿今天那根冒充）',
+      wkNow.replace(/\s+/g, ' ').slice(0, 100));
+  d.querySelector('#al-add').click();
+  await sleep(2000);
+  const al4 = ((await API('/api/watch/alerts?ts_code=' + CODE + '.SZ')).data || {}).alerts || [];
+  const wkRule = al4.filter(a => a.kind === 'pool' && a.pool_id === pid && a.freq === 'weekly');
+  log(wkRule.length === 1 && wkRule[0].text.indexOf('周K·选股命中') === 0,
+      '提醒弹窗：周K 的选股命中能存，且胶囊带「周K·」前缀（与日K 那条分得开）',
+      JSON.stringify(al4.map(a => a.kind + ':' + a.freq + ':' + a.text)).slice(0, 170));
+  const listTxt4 = (d.querySelector('#al-list') || { textContent: '' }).textContent || '';
+  log(/周K/.test(listTxt4) && listTxt4.indexOf(PB) >= 0,
+      '提醒弹窗：规则列表里这条选股命中在「周期」列标出周K',
+      listTxt4.replace(/\s+/g, ' ').slice(0, 120));
+  dbg('弹窗列表文案（含选股命中·周K）= ' + JSON.stringify(listTxt4.replace(/\s+/g, ' ').slice(0, 200)));
+  dump();
+
+  /* ⚠ 把这一档新增的两条 pool 规则**显式删掉**：别指望「删组顺带清孤儿」——
+     这只票要是也在别的分组里，孤儿收尾就不会清它，规则会留在库里。 */
+  for (const a of al4.filter(x => x.kind === 'pool' && x.pool_id === pid)) {
+    await API('/api/watch/alert/delete', { id: a.id });
+  }
+
+  await cleanup();
+  const del = await fetch('/api/pools/' + pid, { method: 'DELETE' });
+  const delJ = await del.json();
+  log(delJ.ok, '选股命中：临时池删掉了（不留在选股策略列表里）', JSON.stringify(delJ).slice(0, 80));
+  dump();
+})();
+</script>
+</body>
+</html>

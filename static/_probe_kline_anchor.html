@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>K线「查询日」探针</title>
+<style>
+  body{margin:0;background:#0d1117;color:#e6ebf4;font:13px/1.6 Consolas,monospace}
+  #out{white-space:pre-wrap;padding:12px;margin:0}
+  iframe{position:fixed;left:-99999px;top:0;width:1440px;height:1400px;border:0}
+</style>
+</head>
+<body>
+<pre id="out">未运行 —— 本页是自检探针，加 ?run=1 才开始（只读 DOM / option，不写任何数据）。</pre>
+<script>
+/* ============================================================================
+   K线「查询日」探针
+   ----------------------------------------------------------------------------
+   需求：按 9/15 选股，点「K线」时 K 线不该止步于 9/15 —— 要能看到选出来之后怎么走，
+   并在 9/15 那根上画一条竖虚线标出「查询日」。
+
+   光读模板文本验不出来的几件事（都在浏览器里才算数）：
+     1) 默认显示窗口（dataZoom）到底落在哪一段：是不是 60 根、查询日在不在窗口里；
+     2) 查询日竖虚线是不是真进了 option（series + markLine），位置对不对，
+        且**不进图例、不进 tooltip**（挂 K 线 series 上就会被图例开关带走）；
+     3) 查询日**之后**那几根上没有任何信号标记点（未来函数）；
+     4) 不带 trade_date 时（看最新那天）不该冒出这条线和徽标。
+
+   做法：同源 iframe 嵌诊断页的预览模式，`window.__stDebug` 拿 rows/anchor/view，
+   `buildOption()` 拿**未归一化**的原始 option（ECharts 的 getOption() 会把 markLine
+   重新整理，读起来容易误判）。结果 JSON 写进 <pre id="out">。
+   ============================================================================ */
+(function () {
+  var P = new URLSearchParams(location.search);
+  var out = document.getElementById('out');
+  if (P.get('run') !== '1') return;      // 门禁：防用户误开
+
+  var CHECKS = [];
+  function ok(name, cond, extra) {
+    CHECKS.push({ name: name, ok: !!cond, extra: extra == null ? '' : String(extra) });
+    out.textContent = JSON.stringify({ done: false, checks: CHECKS }, null, 1);
+  }
+  function done() { out.textContent = JSON.stringify({ done: true, checks: CHECKS }, null, 1); }
+
+  function waitFor(fn, limitMs, stepMs) {
+    return new Promise(function (resolve) {
+      var t0 = Date.now();
+      (function loop() {
+        var v = null;
+        try { v = fn(); } catch (e) { v = null; }
+        if (v) return resolve(v);
+        if (Date.now() - t0 > limitMs) return resolve(null);
+        setTimeout(loop, stepMs || 250);
+      })();
+    });
+  }
+
+  /* 载入诊断页预览模式并等它把图画出来 */
+  function loadCtx(qs, tag) {
+    var f = document.createElement('iframe');
+    f.setAttribute('data-tag', tag);
+    f.src = '/stock/000001.SZ?' + qs + '&embed=1';
+    document.body.appendChild(f);
+    return waitFor(function () {
+      var W = f.contentWindow, D = f.contentDocument;
+      if (!W || !D) return null;
+      var box = D.getElementById('chart-stock');
+      if (!box) return null;
+      var c = W.echarts && W.echarts.getInstanceByDom(box);
+      if (!c) return null;
+      var dbg = W.__stDebug;
+      if (!dbg || !dbg.anchor || !dbg.span || !dbg.rows) return null;
+      var rows = dbg.rows();
+      if (!rows || rows.length < 10) return null;
+      if (!(c.getOption().series || []).length) return null;
+      return { W: W, D: D, c: c, dbg: dbg };
+    }, 60000, 300);
+  }
+
+  /* 可见窗口的**下标区间**：dataZoom 给的是百分比，换算回 rows 的下标。 */
+  function visIdx(span, n) {
+    return [Math.round(span[0] / 100 * n), Math.round(span[1] / 100 * n)];
+  }
+
+  loadCtx('trade_date=2026-09-15&sel_only=1&bars=260', 'anchored').then(function (ctx) {
+    if (!ctx) { ok('诊断页预览模式加载成功', false, '60s 内没画出图'); done(); return; }
+    var dbg = ctx.dbg, D = ctx.D;
+    var rows = dbg.rows(), anchor = dbg.anchor(), view = dbg.view();
+    var raw = dbg.option();                       // 未归一化的原始 option
+    var n = rows.length;
+    var ai = anchor.index, last = rows[n - 1].trade_date;
+
+    ok('后端给了查询日锚点（date/index/requested）',
+       anchor && anchor.date === '2026-09-15' && anchor.requested === '2026-09-15' &&
+       ai >= 0 && ai < n,
+       JSON.stringify({ date: anchor.date, index: ai, extended: anchor.extended }));
+
+    ok('rows[anchor.index] 就是查询日那一根',
+       rows[ai].trade_date === '2026-09-15', rows[ai].trade_date);
+
+    ok('K线多加载到了查询日之后（能看见「选出来之后怎么走」）',
+       last > '2026-09-15' && anchor.extended === true,
+       '查询日 2026-09-15 → 末根 ' + last);
+
+    // 未来函数：查询日之后一根信号都不许有
+    var badEntry = 0, badBuy = 0, badSell = 0, badScore = 0;
+    rows.slice(ai + 1).forEach(function (x) {
+      if (x.entry) badEntry++;
+      if (x.buy_trigger) badBuy++;
+      if (x.sell_signal) badSell++;
+      if (x.score !== null && x.score !== undefined) badScore++;
+    });
+    ok('查询日之后的行里，选股命中/买入/卖出/评分全部为空（未来函数）',
+       badEntry + badBuy + badSell + badScore === 0,
+       '命中' + badEntry + ' 买入' + badBuy + ' 卖出' + badSell + ' 评分' + badScore +
+       '（查询日之后 ' + (n - 1 - ai) + ' 根）');
+
+    // 默认窗口：60 根、含查询日、右端贴到最后一根
+    var span = dbg.span(n), v = visIdx(span, n);
+    ok('默认窗口 = 60 根（DEF_SPAN）', (v[1] - v[0]) === Math.min(60, n),
+       '可见 ' + (v[1] - v[0]) + ' / 共 ' + n + ' 根');
+    ok('查询日落在默认窗口内', v[0] <= ai && ai < v[1],
+       '窗口下标 ' + v[0] + '~' + v[1] + '，查询日下标 ' + ai);
+    ok('默认窗口右端贴到最后一根（查询日之后有多少显示多少）', v[1] === n,
+       'v1=' + v[1] + ' n=' + n);
+    ok('默认窗口右端就是末根日期', rows[Math.min(v[1], n - 1)].trade_date === last, last);
+
+    // 竖虚线：进 option、位置对、不进图例/tooltip
+    var anchors = (raw.series || []).filter(function (s) { return s.name === '__anchor__'; });
+    ok('查询日竖虚线在 option 里（且只有一条）', anchors.length === 1, anchors.length + ' 条');
+    var a = anchors[0] || {};
+    var ml = (a.markLine && a.markLine.data) || [];
+    ok('竖虚线画在查询日那一根上（category 轴取 xAxis=日期）',
+       ml.length === 1 && ml[0].xAxis === '2026-09-15', JSON.stringify(ml));
+    ok('是**虚线**、且带「查询日」文案（文案来自后端 view.anchor_label）',
+       a.markLine && a.markLine.lineStyle && a.markLine.lineStyle.type === 'dashed' &&
+       a.markLine.label && a.markLine.label.formatter === view.anchor_label,
+       'type=' + ((a.markLine || {}).lineStyle || {}).type +
+       ' label=' + ((a.markLine || {}).label || {}).formatter);
+    ok('竖虚线不进图例、不进 tooltip（空数据 series，与下挂参考线同一做法）',
+       (a.data || []).length === 0 && a.tooltip && a.tooltip.show === false &&
+       (raw.legend || []).every(function (lg) {
+         return !(lg.data || []).some(function (x) { return x === '__anchor__'; });
+       }),
+       'data=' + (a.data || []).length + ' 图例条目=' +
+       ((raw.legend || [])[0] || { data: [] }).data.length);
+
+    // 竖虚线跟着主轴缩放（xAxisIndex 指到 K 线格）
+    ok('竖虚线挂在 K 线格（xAxisIndex=0）', a.xAxisIndex === 0, String(a.xAxisIndex));
+
+    // 查询日之后没有信号点（图上也不该有）
+    var sigFar = (raw.series || []).filter(function (s) {
+      return s.type === 'scatter' && (s.data || []).some(function (pt) {
+        return Array.isArray(pt) && pt[0] > ai;
+      });
+    });
+    ok('图上查询日之后没有任何信号标记点', sigFar.length === 0,
+       sigFar.map(function (s) { return s.name; }).join(',') || '无');
+
+    // 徽标（只在有「之后」的时候才摆）
+    var tag = D.getElementById('st-anchor-tag');
+    ok('卡片头有「查询日」徽标、文案 = 后端 anchor_label',
+       !!tag && tag.style.display !== 'none' && tag.textContent === view.anchor_label,
+       (tag ? '「' + tag.textContent + '」display=' + (tag.style.display || 'block') : '缺元素'));
+
+    // 缩放 / 十字光标覆盖全部 x 轴 —— 顺带护住「拖主轴下挂格同步」这条
+    var dz = raw.dataZoom || [];
+    var nAxis = (raw.xAxis || []).length;
+    ok('dataZoom 覆盖全部 x 轴（拖 K 线时下挂格一起走）',
+       dz.length >= 1 && (dz[0].xAxisIndex || []).length === nAxis && nAxis > 1,
+       'xAxis ' + nAxis + ' 条 / dataZoom.xAxisIndex=' + JSON.stringify(dz[0] && dz[0].xAxisIndex));
+
+    // ---------- 反向：不带 trade_date（看最新那天）时不该有竖虚线/徽标 ----------
+    loadCtx('sel_only=1&bars=260', 'plain').then(function (ctx2) {
+      if (!ctx2) { ok('（不带 trade_date 的那次也加载成功）', false, '超时'); done(); return; }
+      var dbg2 = ctx2.dbg, rows2 = dbg2.rows();
+      var a2 = dbg2.anchor(), raw2 = dbg2.option(), n2 = rows2.length;
+      var tag2 = ctx2.D.getElementById('st-anchor-tag');
+      ok('不带 trade_date：锚点就是最新那根、extended=false',
+         a2 && a2.index === n2 - 1 && a2.extended === false,
+         'index=' + (a2 && a2.index) + '/' + (n2 - 1) + ' extended=' + (a2 && a2.extended));
+      ok('不带 trade_date：没有「查询日」徽标（不摆无意义的标记）',
+         !tag2 || tag2.style.display === 'none',
+         tag2 ? 'display=' + (tag2.style.display || 'block') : '缺元素');
+      var v2 = visIdx(dbg2.span(n2), n2);
+      ok('不带 trade_date：默认窗口也是 60 根、贴最右',
+         (v2[1] - v2[0]) === Math.min(60, n2) && v2[1] === n2,
+         '可见 ' + (v2[1] - v2[0]) + ' 根，v1=' + v2[1] + '/' + n2);
+      // 查询日正好是最后一根（没有「之后」）时不该画线 —— 贴着右边框的线只会添乱
+      var anchors2 = (raw2.series || []).filter(function (s) { return s.name === '__anchor__'; });
+      ok('不带 trade_date：不画查询日竖虚线（右边没有「之后」，标记没意义）',
+         anchors2.length === 0, anchors2.length + ' 条');
+      done();
+    });
+  });
+})();
+</script>
+</body>
+</html>

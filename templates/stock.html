@@ -1,0 +1,1595 @@
+{% extends "base.html" %}
+{% block title %}个股诊断 · 短线选股{% endblock %}
+{% block pagetitle %}个股诊断{% endblock %}
+{% block pagedesc %}K线 + 指标 + 策略逐条命中明细{% endblock %}
+
+{% block content %}
+{# 预览模式（?embed=1）：被「K线预览弹窗」嵌进去时只藏这几块，图表本身原样保留。
+   用 id 隐藏、不改 DOM 结构 —— 页面里的取数与渲染路径与正常打开完全一致。
+   ⚠ 新增卡片（例如 #st-card-ai）要一起加进来，否则预览弹窗里会多出一块没有意义的区。
+   ⚠ `#st-head`（股票 / **开盘形态概率** / 基本面 / 策略收益 那一排）**故意不在名单里**：
+     2026-10-10 用户要求「K线预览页面也要有开盘形态概率卡片」，所以它跟着图一起露出来
+     （预览里的信息层级 = 图 + 那一排 4 张卡，其余整块查询条件/概念/筹码/明细表仍然藏）。 #}
+{% if embed %}
+<style>
+  #st-card-query, #st-card-ai, #st-card-concept, #st-card-chips, #st-card-trade, #st-card-table{display:none}
+</style>
+{% endif %}
+
+<div class="card" id="st-card-query">
+  <div class="card-head"><div class="card-title">查询条件</div></div>
+  <div class="card-body">
+    <div class="row">
+      <div class="field" style="flex:1.4"><label class="lb">股票代码 / 名称</label><input type="text" id="st-code" value="{{ code }}" placeholder="000001.SZ 或 000001 或 平安银行"></div>
+      <div class="field" style="flex:1.4"><label class="lb">策略</label><select id="st-strategy"></select></div>
+      <div class="field" style="flex:0 0 104px"><label class="lb">周期</label><select id="st-freq">
+        <option value="daily">日线</option><option value="weekly">周线</option></select></div>
+      <div class="field"><label class="lb">K线根数</label><input type="number" id="st-bars" value="260" step="40"></div>
+      <div class="field" style="flex:0 0 auto;align-self:flex-end"><button class="btn primary" id="btn-load">查询</button></div>
+      <div class="field" style="flex:0 0 auto;align-self:flex-end"><button class="btn" id="btn-ai"
+           title="用「默认语句模板 + 当前模型」直接分析这只股票；结果显示在下面的卡片里">AI 分析</button></div>
+    </div>
+    <div id="st-suggest"></div>
+  </div>
+</div>
+
+{# 查询状态区（**结果区之外**，所以查询前/失败时都看得见）：
+     查询中 → 「正在查询 …」；查不到 → 红色错误块（带上后端给的原话）；
+     查到了但区间内没数据 → 空态提示。
+   ⚠ 为什么不像以前那样只弹个 toast：toast 3 秒飘走、页面上不留痕，
+     用户看到的是「点了没反应」；更糟的是**上一只票的图还留着**，像是查成功了。
+     状态块的渲染走 app.js 的 boxHTML()（全站同一套），这里只负责摆在哪儿。 #}
+<div id="st-status"></div>
+
+{# AI 分析卡片：在「查询条件」正下方（结果区之外，所以查询前也看得见）。
+   点上面那个按钮**不弹窗** —— 直接用默认语句模板 + 当前生效的模型配置开跑，
+   回答以**流式**方式一段段写进 #ai-card-out（服务端 SSE，见 core/ai.py）。
+   右下角「历史回复」把这只票以前的分析列出来（没有历史时按钮是灰的）；
+   进页面 / 换票时会自动把**最近一条**历史回复摆出来，就是「AI 的最新回复」。
+   ⚠ **这只票没分析过（没有任何历史记录）时整张卡片不摆出来** ——
+     一张「还没有分析过」的空卡白占一大块。显隐由 static/js/ai.js 控制
+     （进页面先藏，cardRefresh 查到有记录才显示）；点「AI 分析」开跑时会立刻显示。
+   ⚠ 嵌入模式（K线预览弹窗）里这张卡整张隐藏，见上面的 embed 样式。 #}
+<div class="card" id="st-card-ai">
+  <div class="card-head">
+    <div class="card-title">AI 分析 <span class="tag" id="ai-card-tag" style="display:none"></span></div>
+    <div class="spacer"></div>
+    <span class="small muted" id="ai-card-meta"></span>
+  </div>
+  <div class="card-body">
+    <div class="ai-out" id="ai-card-out"><div class="empty">还没有分析过 —— 点右上角「AI 分析」</div></div>
+    <div class="ai-foot">
+      <span class="small muted" id="ai-card-note"></span>
+      <button class="btn sm" id="ai-card-hist" disabled title="这只票还没有历史回复">历史回复</button>
+    </div>
+  </div>
+</div>
+
+{# 开盘形态概率（次日「高开/低开」的历史频率）—— **顶替了原来「最新收盘」那一栏**
+   （2026-10-09 需求），原来最新收盘的读数（收盘价 / 涨跌幅 / 日期）已并进「股票」卡。
+   卡片本身在 `#st-head` 里现搭（见 render()），这里不留静态块 —— 免得两处结构打架。
+   ⚠ 它属于**结果区**（`#st-result` 里的 `#st-head`，第 2 栏），查了才有。
+   ⚠ **`?embed=1`（K线预览弹窗）里也照常渲染**（2026-10-10 用户要求）——
+     只有「没数据」才撤掉整栏卡片。 #}
+
+<div id="st-result" style="display:none">
+  <div class="grid g4" id="st-head"></div>
+
+  {# K线 + 下挂指标画在**同一个 ECharts 实例**里（多个 grid 共用一条时间轴）。
+     拆成多个实例的话，拖时间轴只能各管各的，同步得自己写事件转发，容易错位。
+     下挂格的内容来自 core/indicators.chart_catalog()，前端只负责上色。 #}
+  <div class="card">
+    <div class="card-head">
+      <div class="card-title">K线 / 均线 / BOLL <span class="tag" id="st-view-tag">日K</span><span class="tag y" id="st-anchor-tag" style="display:none"></span><span class="tag" id="st-ind-tag">下挂指标与主轴同步</span><span class="tag y" id="st-sig-tag" style="display:none"></span></div>
+      <div class="ind-picks">
+        {# 周期切换：与「查询条件」卡里那个下拉**是同一个状态源**（`#st-freq`），
+           这里只是它的第二个入口 —— 分段按钮看得见当前是日线还是周线，点一下就换。
+           必须放在 K 线卡片上的原因：弹窗预览（?embed=1）会把整张「查询条件」卡隐藏，
+           没有这个入口，从列表里点开的 K 线就永远只能看日K。
+           按钮文案（日K / 周K）是**选项名**，跟图上那个由后端 view 给的标签不是一回事。 #}
+        <span class="lb">周期</span>
+        <span class="seg" id="st-freq-seg" role="group" aria-label="K线周期">
+          <button type="button" data-f="daily" class="on" aria-pressed="true">日K</button>
+          <button type="button" data-f="weekly" aria-pressed="false">周K</button>
+        </span>
+        {# 高开/低开幅度（%）：改它 = 换一个开盘形态概率的口径。
+           首屏按这个值请求（接口参数 `open_pct`）；在页面上继续微调时**即时重算**
+           （拿回传的 `openstat.adjust.bars` 原料 + eps 判据，见 renderOpenStat）——
+           不重新打接口，所以拖一下/敲一下数字四格与图上标记立刻跟着变。
+           控件本身放在 K 线卡（不是查询卡）上：弹窗预览 `?embed=1` 会隐藏查询卡，
+           放这儿弹窗里也能调。上下限 / 步长由后端下发（`adjust.min/max/step`）。 #}
+        <span class="lb">幅度</span>
+        <span class="open-thr">
+          <input type="number" id="st-open-pct" step="0.1" aria-label="高开/低开幅度阈值（%）">
+          <span class="unit">%</span>
+        </span>
+        <span class="seg" id="st-open-seg" role="group" aria-label="常见幅度">
+          <button type="button" data-t="1" aria-pressed="false">1%</button>
+          <button type="button" data-t="3" class="on" aria-pressed="true">3%</button>
+          <button type="button" data-t="5" aria-pressed="false">5%</button>
+        </span>
+        <span class="lb">下挂指标</span>
+        <select id="st-ind-a" title="K线下方第 1 格"></select>
+        <select id="st-ind-b" title="K线下方第 2 格"></select>
+      </div>
+    </div>
+    <div class="card-body"><div class="chart stk" id="chart-stock"></div></div>
+  </div>
+
+  {# 所属概念（东财 F10 核心题材）。
+     只列出**真概念**（东财给了入选理由的那批）—— 一只票的 F10 里另有 20 来条
+     「非概念标记」（行业/地域/指数成分/风格：银行Ⅱ、上海板块、HS300_、大盘股），
+     全铺出来会把重点淹掉，所以后端只回个数，这里写一句「另有 N 条…未列出」。
+     点标签在下方展开那块看**入选理由原文**（东财自己写的，带日期），不弹浮层；
+     **双击标签**（或展开区里的「查看成分股」按钮）弹窗列这条概念在本库的成分股。
+     概念是季度级变化的静态名单，与查询日无关；但板块涨跌幅是同步时点快照。 #}
+  <div class="card" id="st-card-concept">
+    <div class="card-head">
+      <div class="card-title">所属概念 <span class="tag b" id="cpt-badge">—</span></div>
+      <span class="small muted" id="cpt-note"></span>
+    </div>
+    <div class="card-body">
+      <div class="cpt-wrap" id="cpt-list"></div>
+      <div class="cpt-pop" id="cpt-pop" style="display:none"></div>
+    </div>
+  </div>
+
+{# 筹码与两融：股东户数 / 融资融券 / 股东增减持。
+     这三块都**不是日频 K 线字段**，所以不做成下挂指标格（那会牵扯日线/周线面板与
+     策略条件口径），而是独立的小卡片 + 自己的趋势图。文本、单位、涨跌色全部由后端
+     core/chips.py 算好，这里只铺格子。 #}
+  <div class="grid g2" id="st-card-chips">
+    <div class="card">
+      <div class="card-head">
+        <div class="card-title">股东户数 <span class="tag" id="ch-holder-badge">—</span></div>
+        <span class="small muted" id="ch-holder-note"></span>
+      </div>
+      <div class="card-body">
+        <div class="chip-hero" id="ch-holder-hero"></div>
+        <div class="chip-head" id="ch-holder-head"></div>
+        <div class="chart sm" id="chart-holder"></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <div class="card-title">融资融券 <span class="tag" id="ch-margin-badge">—</span></div>
+        <span class="small muted" id="ch-margin-note"></span>
+      </div>
+      <div class="card-body">
+        <div class="chip-hero" id="ch-margin-hero"></div>
+        <div class="chip-head" id="ch-margin-head"></div>
+        <div class="chart sm" id="chart-margin"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" id="st-card-trade">
+    <div class="card-head">
+      <div class="card-title">股东增减持 <span class="tag" id="ch-trade-badge">—</span></div>
+      <span class="small muted" id="ch-trade-note"></span>
+    </div>
+    <div class="card-body tight">
+      <div class="chip-head" id="ch-trade-sum" style="margin:8px 4px 10px"></div>
+      <div id="ch-trade-table"></div>
+    </div>
+  </div>
+
+  <div class="card" id="st-card-table">
+    <div class="card-head"><div class="card-title">策略信号明细 <span class="tag">最近 60 根</span></div>
+      <span class="small muted">✔ = 条件成立</span></div>
+    <div class="card-body tight"><div id="st-table"></div></div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let curRows = [];          // 当前股票的逐根明细（已含全部指标列）
+let curCatalog = [];       // 后端给的下挂指标目录
+let catByKey = {};         // key -> 目录项
+let seriesMeta = {};       // seriesName -> {f, fmt}，tooltip 按它取单位
+let curZoom = null;        // 记住缩放窗口：切指标时 setOption 会重置 dataZoom
+let curFund = null;        // 后端给的基本面卡片数据（标签/数值/单位都算好了）
+let curPerf = null;        // 后端给的策略收益统计（文本与涨跌色也算好了）
+let curSignals = [];       // 后端给的「策略信号怎么画」清单（含每档几根、为什么不画）
+let curView = null;        // 后端给的「这个视图是什么周期」说明（日K/周K、条件有没有被搬过）
+let curChips = null;       // 后端给的筹码与两融数据（股东户数/融资融券/增减持，文本都算好了）
+let curConcepts = null;    // 后端给的东财概念（只含真概念；文本与涨跌色都算好了）
+let curOpenstat = null;    // 后端给的开盘形态概率（四项频率、分母、文本都算好了）
+/* 高开/低开阈值（%）：**这是「开盘形态」这一块唯一的状态源**。
+   首屏 / 换票 / 切周期时按它请求（`open_pct` 参数）；页面上的输入框与 1%/3%/5%
+   快捷按钮都只是它的第二个入口（改它 → 即时重算，见 applyOpenThr）。
+   初值取后端下发的 `adjust`（= openstat.OPEN_PCT，唯一来源），别在模板里写死 3。 */
+let openThr = null;
+let openAdj = null;        // 后端给的阈值可调范围 + 判据常量 + 逐根原料
+let curAnchor = null;      // 后端给的「查询日」在 rows 里的下标（画竖虚线、定默认窗口）
+let curMeta = null;        // 「AI 分析」要带过去的这一只（代码/名称/行业/查询日/收盘/涨跌幅）
+let strategies = [];       // 策略列表（含 timeframe，用来让周期默认跟随策略口径）
+let freqTouched = false;   // 用户手动选过周期之后，就不再自动跟随策略
+
+/* 涨跌色是业务约定（A 股习惯），与蜡烛/回测/报告同源，换主题也不许动 */
+const UP = '#e5352b', DOWN = '#12a06a', NEUTRAL = '#8b95a9';
+
+/* 每组的线色 / 数值格式 token：**唯一来源在 app.js**（`window.CHART_PAL` /
+   `window.CHART_FMT`）—— 交易明细的复盘图也要画同一套下挂格子，两页各写一份
+   必然漏改一边（同一个 KDJ 在两页颜色不一样）。这里只起个短名。 */
+const PAL = window.CHART_PAL;
+const FMT_TOKEN = window.CHART_FMT;
+
+const LEGEND_STYLE = window.CHART_LEGEND;   // 唯一来源在 app.js（复盘图共用）
+const BASE_ITEMS = ['K线', 'MA5', 'MA10', 'MA20', 'MA60', 'BOLL上轨', 'BOLL中轨', 'BOLL下轨'];
+const GUIDE_PREFIX = '__guide__';   // 参考线专用（空数据）series，不进图例/tooltip
+const ANCHOR_NAME  = '__anchor__';  // 查询日竖虚线专用（空数据）series，同上
+/* 默认显示多少根 K 线。表单里的「K线根数」是**加载量**（查询日之前加载多少根），
+   这个是**显示量** —— 两个数不是一回事，别混。 */
+const DEF_SPAN = 60;
+
+/* 成交量（后端目录里的 `vol` 组）**固定**摆在 K 线正下方、下挂指标上方
+   （2026-09-25 需求：「在股票K线预览的下面，macd指标图的上面，加上成交量指标」）。
+   它就是目录里那一组（量柱按**当日阴阳**着色 + VMA5/VMA10 量均线，单位「手/万手」），
+   所以这里**不新造口径**，只是把它从「下拉里可选的指标」改成「固定格」：
+   · 下拉里不再出现它（`fillIndicatorPicks` 过滤）—— 否则能选第二次、同一格出现两遍；
+   · `buildOption` 把它前置到 groups 的最前面，像素/图例/tooltip 全部走**同一段**代码。
+   `VH` 比下挂格矮一档：量柱是辅助格，不需要 MACD 那么高。
+   ⚠ 两个高度是**成对**的（VH : IH = 96 : 118 ≈ 4 : 5）；2026-09-25 一起收到 64 : 78
+   （用户要求「指标的高度收窄 1/3 左右」），改一个记得改另一个，别只动一半。 */
+const VOL_KEY = 'vol';
+const VH = 64;
+
+/* 策略信号标记：位置（上/下）与形状照后端 signals 的 side/shape 来，别自己编；
+   颜色是前端的事（涨红跌绿的约定，换主题要连这里一起改）。
+   选股命中 = 小圆点贴在 K 线下沿；买入触发 = 红三角在下；卖出信号 = 绿三角在上。 */
+const SIG_COLOR = { entry: '#4b83ff', buy_trigger: UP, sell_signal: DOWN };
+const SIG_SHAPE = { dot: 'circle', arrow: 'triangle' };
+const SIG_PX    = { dot: 7, arrow: 11 };
+/* 贴价偏移（像素，正数=往下）。「选股命中」比「买入触发」再往外让 9px ——
+   两档都在下侧，不错开的话同一天既命中又触发买入时红三角会把蓝点整个盖住
+   （600519 + 内置策略1 实测 99 天命中里有 40 天同时触发买入）。 */
+const SIG_OFF = {
+  below: { entry: 15, buy_trigger: 6,  sell_signal: 6  },
+  above: { entry: -15, buy_trigger: -6, sell_signal: -6 },
+};
+
+/* 合并坐标轴配置：实现与理由都在 app.js（`window.withBaseAxis`）——
+   交易复盘图也是「一个实例、多个 grid」，两处只能用同一份。 */
+const withBase = window.withBaseAxis;
+
+/* 预览模式（?embed=1）：查询条件卡被隐藏，参数**全部来自 URL**（由 app.js 的
+   klinePreview 拼好）。走的还是同一个接口、同一段 render —— 弹窗里看到的与正常
+   打开这一页是同一份实现，只是没有表单。 */
+const EMBED = new URLSearchParams(location.search).get('embed') === '1';
+const EMBED_CODE = {{ code | tojson }};
+const EMBED_KEYS = ['strategy_id', 'config', 'pool_id', 'bars', 'freq', 'trade_date', 'sel_only'];
+/* `sel_only`（只看选股条件，见 app.py 的同名参数）：选股策略试跑 / 今日选股这些入口
+   **只选了票、没有绑定买卖策略**，后端在这一档不算策略收益（`perf` 为 null）——
+   下面 renderHead 就据此不摆第 4 张卡片，图上只剩「选股命中」的蓝点。 */
+
+function detailUrl(){
+  // 阈值随请求带上：首屏 / 换票 / 切周期时，后端按这个值算四格概率与标记原料。
+  // 之后在页面上微调走即时重算（applyOpenThr），不再经过这里。
+  const thr = (openThr === null || openThr === undefined) ? '' : '&open_pct=' + openThr;
+  if (EMBED) {
+    const src = new URLSearchParams(location.search), q = new URLSearchParams();
+    EMBED_KEYS.forEach(k => { if (src.get(k)) q.set(k, src.get(k)); });
+    // 周期以**控件**为准：弹窗里分段按钮切的就是它，URL 上那份只是进来时的初值。
+    // 其余参数照旧原样透传 —— 弹窗的参数是外面拼好的，这里不替它做主。
+    q.set('freq', $('#st-freq').value);
+    return '/api/stock/' + encodeURIComponent(EMBED_CODE) + '/detail?' + q.toString() + thr;
+  }
+  // 整页诊断：URL 上带了 trade_date 就照样传下去 —— 弹窗里「在诊断页打开」的链接
+  // 带的就是这些参数，丢掉 trade_date 会让整页变成「看最新那天」，跟弹窗不是一个视图。
+  const td = new URLSearchParams(location.search).get('trade_date');
+  return '/api/stock/' + encodeURIComponent($('#st-code').value.trim()) + '/detail?strategy_id=' +
+    $('#st-strategy').value + '&bars=' + $('#st-bars').value +
+    '&freq=' + $('#st-freq').value +
+    (td ? '&trade_date=' + encodeURIComponent(td) : '') + thr;
+}
+
+/* 查询状态区（`#st-status`，在结果区**之外**）：'loading' / 'error' / 'empty'，空串清掉。
+   ⚠ 全站只有这一个写入口 —— 成功路径的收尾也走它（见 render 开头），
+     别在别处再往 `#st-status` 里塞 HTML，否则「旧报错没清掉」这种会到处冒。
+   ⚠ 渲染用 app.js 的 boxHTML()（同一套样式与文案结构），这里只负责摆位。 */
+function stStatus(kind, title, desc){
+  const el = $('#st-status');
+  if (el) el.innerHTML = boxHTML(kind, title, desc);
+}
+
+async function load(){
+  if (!EMBED && !$('#st-code').value.trim()) return toast('请输入股票代码或名称', 'warn');
+  sugHide();
+  /* 先摆「正在查询」：库里翻 300 根 K 线 + 筹码/概念/开盘概率要几百毫秒，
+     这期间页面上必须有个东西说明「在动」，否则就是「点了没反应」。
+     ⚠ 不清 `#st-result`：换票时留着旧图比闪成空白舒服，用户也知道自己在等哪一次。 */
+  stStatus('loading', '正在查询 ' + (EMBED ? EMBED_CODE : $('#st-code').value.trim()) + ' …');
+  try {
+    const r = await apiGet(detailUrl());
+    render(r);                 // 成功：render 内部负责清状态 / 摆空态
+  } catch (e) {
+    // 后端给的原话（「本地无 XXX 的行情数据」「没找到「XX」…」）直接摊在页面上
+    stStatus('error', '查询失败', e.message);
+    toast(e.message, 'err', 7000);
+  }
+}
+
+/* 周期默认跟随策略自己的口径：周线策略拿到日K上求值，条件是「日线布林下轨」——
+   图看着完全正常，数却跟选股/回测不是一件事。用户一旦自己选过周期就不再跟随。 */
+function strategiesById(){
+  const m = {};
+  strategies.forEach(s => { m[String(s.id)] = s; });
+  return m;
+}
+function syncFreqFromStrategy(){
+  const s = strategiesById()[$('#st-strategy').value];
+  if (s && (s.timeframe === 'weekly' || s.timeframe === 'daily')) $('#st-freq').value = s.timeframe;
+  paintFreqSeg();
+}
+
+/* 「周期」分段按钮 = `#st-freq` 那个下拉的第二个入口（**同一个状态源**，不另存一份）。
+   选中态一律从 `#st-freq` 现画；凡是改到它的地方（点按钮 / 换策略 / 后端 view 回写）
+   都要跟着调一次，免得按钮亮着的和真正在查的周期分岔。 */
+function paintFreqSeg(){
+  const seg = $('#st-freq-seg');
+  if (!seg) return;
+  const v = $('#st-freq').value;
+  $$('button', seg).forEach(b => {
+    const on = b.dataset.f === v;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+}
+
+/* 切周期：写回 `#st-freq` → 重新取数。
+   周K 是**另一份面板**（另一次请求，见后端 screener.screen_detail 的 freq），
+   所以这里必须 load()，不是把日K重画一遍（画稀一点不是周K）。
+   再给外面捎一句话：弹窗预览里「在诊断页打开」那个链接要跟着换周期，
+   否则弹窗里切到周K、点过去却是日K，两个视图对不上。 */
+function setFreq(f){
+  if (f !== 'daily' && f !== 'weekly') return;
+  const changed = $('#st-freq').value !== f;
+  $('#st-freq').value = f;
+  freqTouched = true;
+  paintFreqSeg();
+  if (EMBED && window.parent !== window) {
+    try { window.parent.postMessage({ type: 'st-freq', freq: f }, location.origin); }
+    catch (e) { /* 父页不在同源就算了，只是少更新一个链接 */ }
+  }
+  if (changed) load();
+}
+
+function render(r){
+  curRows = r.rows || [];
+  /* 查得到这只票、但所选区间里一根 K 线都没有（退市 / 新股 / 查询日太早）：
+     这也是「查不到」，得在页面上说清楚，不能只在控制台或 toast 里飘一下。
+     ⚠ 保留旧图不动：上面那张图标着票名，留着自己能对照，比闪成空白好。 */
+  if (!curRows.length) {
+    stStatus('empty', '该股票在所选区间内无数据',
+             '把「K线根数」调大一点，或换一个查询日再试');
+    return;
+  }
+  stStatus('');            // 成功拿到数据 → 清掉「正在查询」或上一次的报错
+  curCatalog = r.catalog || [];
+  catByKey = {};
+  curCatalog.forEach(g => { catByKey[g.key] = g; });
+  curSignals = r.signals || [];
+  curChips = r.chips || {};
+  curConcepts = r.concepts || {};
+  curOpenstat = r.openstat || null;
+  curAnchor = r.anchor || null;
+  // 阈值可调范围 + 判据常量 + 逐根原料（后端下发，见 core/openstat.snapshot）。
+  // 首屏 / 换票时把 `openThr` 对齐到后端实际用的那个阈值 —— 换票后如果不带参数，
+  // 后端回到默认值，控件要跟着回默认，否则控件显示 5% 而算的是 3%。
+  const adj = (curOpenstat && curOpenstat.adjust) || null;
+  openAdj = adj;
+  if (adj) {
+    const inp = $('#st-open-pct');
+    inp.min = adj.min; inp.max = adj.max; inp.step = adj.step || 0.1;
+    openThr = (curOpenstat.threshold === null || curOpenstat.threshold === undefined)
+      ? adj.min : curOpenstat.threshold;
+    inp.value = openThr;
+    paintOpenSeg();
+  }
+  curZoom = null;
+  // 视图口径（日K / 周K；周线视图下条件是被搬到周K上重算的）—— 标签文字由后端给，
+  // 「为什么这几个数是周线的」由后端给原因，前端只负责摆出来。
+  const view = r.view || { freq:'daily', bar_label:'日K', last_label:'最新收盘', tag:'日K',
+                           recomputed:false, notes:[] };
+  curView = view;
+  const vt = $('#st-view-tag');
+  vt.textContent = view.tag || view.bar_label || '日K';
+  vt.className = 'tag' + ((view.notes||[]).length ? ' y' : '');
+  vt.title = (view.notes || []).join('；');
+  // 「查询日」只在**图上有查询日之后行情**时才标出来（那时候才需要说明右边是什么）。
+  // 文案由后端给（view.anchor_label），前端不自己拼「查询日 2026-09-15」。
+  const at = $('#st-anchor-tag');
+  const anchored = !!(curAnchor && curAnchor.extended && view.anchor_label);
+  at.style.display = anchored ? '' : 'none';
+  at.textContent = anchored ? view.anchor_label : '';
+  at.title = anchored ? '选股/查询是按这一天做的；虚线右边是之后才发生的行情，不算信号' : '';
+  if (view.freq !== $('#st-freq').value) $('#st-freq').value = view.freq;
+  paintFreqSeg();      // 后端可能把周期拨回策略自己的口径，分段按钮要跟着走
+
+  $('#st-result').style.display = '';
+  const last = curRows[curRows.length-1];
+  // 「AI 分析」要用的这一只（提示词里显示的收盘/涨跌幅就该是这页算出来的那一份）
+  curMeta = { ts_code: r.ts_code, name: r.name, industry: r.industry,
+              trade_date: (curAnchor && curAnchor.date) || last.trade_date,
+              close: last.close, pct_chg: last.pct_chg };
+  // 换了票 → 下面那张 AI 卡片跟着换：清空后把**这只票最近一条**历史回复摆出来；
+  // 没有任何历史记录时 aiInline 会把整张卡片收起来（不留空卡）。嵌入模式没这张卡，自己会跳过。
+  if (window.aiInline) window.aiInline.refresh(aiPayload());
+  const hits = curRows.filter(x=>x.entry).length;
+  const buys = curRows.filter(x=>x.buy_trigger).length;
+  const sells = curRows.filter(x=>x.sell_signal).length;
+  // 基本面卡片：标签/数值/单位全部由后端给（indicators.fundamental_snapshot 里换算一次），
+  // 前端只负责铺进格子 —— 免得市值「万元→亿」这种口径在 JS 里再算一遍。
+  const fund = r.fundamental || { as_of:'', items: [] };
+  curFund = fund;
+  const fundHtml = (fund.items || []).map(i =>
+    `<span>${esc(i.label)}</span><b>${esc(i.text)}</b>`).join('') || '<span>暂无数据</span>';
+  // 策略收益卡片：主数（收益%）、4 个小项、区间提示、三档信号数。
+  // 文本、正负号、"几笔"、涨跌色全部由后端 backtest.perf_snapshot 给 —— 前端只铺格子，
+  // 不自己拼百分号或判断哪个数是主数（与基本面卡片同一套做法）。
+  // 策略收益卡片：主数（收益%）、4 个小项、区间提示、三档信号数。
+  // 文本、正负号、"几笔"、涨跌色全部由后端 backtest.perf_snapshot 给 —— 前端只铺格子，
+  // 不自己拼百分号或判断哪个数是主数（与基本面卡片同一套做法）。
+  // `perf` 为 null = 这一档**没有绑定买卖策略**（后端 `sel_only`：试跑 / 今日选股的预览）
+  // → 干脆不摆这张卡：拿默认买卖参数跑一遍单票回测，收益跟「这批票选得对不对」毫无关系，
+  //   摆着只会让人以为试跑是带着买卖策略跑的、照着这个数做决策。
+  const perf = r.perf || null;
+  curPerf = perf;
+  let perfCard = '';
+  if (perf) {
+    const hero = perf.hero || { text: '—', cls: 'flat' };
+    const rangeTip = (perf.range && perf.range.start)
+      ? `区间 ${perf.range.start} ~ ${perf.range.end}（${perf.range.bars} 根）`
+      : '';
+    const perfTip = [perf.badge, rangeTip, perf.note,
+                     (view.notes || []).join('；')].filter(Boolean).join(' · ');
+    const perfHtml = (perf.items || []).map(i =>
+      `<span>${esc(i.label)}</span><b class="${esc(i.cls || '')}">${esc(i.text)}</b>`).join('')
+      || '<span>收益不可用</span>';
+    perfCard = `
+    <div class="stat" title="${esc(perfTip)}"><div class="label">策略收益 <span>${esc(perf.badge || '')}</span></div>
+      <div class="value ${esc(hero.cls || 'flat')}">${esc(hero.text)}</div>
+      <div class="fund">${perfHtml}</div>
+      <div class="sub">命中 ${hits} · 买入 ${buys} · 卖出 ${sells}</div></div>`;
+  }
+  // 没有收益卡就 3 张，栅格列数跟着变 —— 否则第 4 列留个空槽、卡片被挤窄
+  $('#st-head').className = 'grid ' + (perf ? 'g4' : 'g3');
+  // ⚠ 第 2 栏不再是「最新收盘」，而是**开盘形态概率**（原最新收盘的读数并进「股票」卡）。
+  //   第 2 栏的卡片由 renderOpenStat() 在渲染时**现搭**（有数据才摆，没数据就整栏空着，
+  //   栅格少一格也难看，所以给一个固定的 `.stat` 壳、里面填内容）。
+  $('#st-head').innerHTML = `
+    <div class="stat accent"><div class="label">股票</div>
+      <div class="value" style="font-size:16px">${esc(r.ts_code)}</div>
+      <div class="sub">${esc(r.name)} · ${esc(r.industry||'')}</div>
+      <div class="sub" id="st-head-close"><b class="${fmt.cls(last.pct_chg)}">${fmt.price(last.close)}</b> ${fmt.pct(last.pct_chg)} · ${esc(last.trade_date)}</div></div>
+    <div class="stat" id="st-head-open"><div class="label">开盘形态概率 <span class="tag" id="open-badge">—</span></div>
+      <div class="open-grid" id="open-list"></div>
+      <div class="sub" id="open-foot"></div></div>
+    <div class="stat"><div class="label">基本面 <span>${esc(fund.as_of)}</span></div><div class="fund">${fundHtml}</div></div>${perfCard}`;
+
+  fillIndicatorPicks();
+  drawChart();
+  renderConcepts();
+  renderOpenStat();
+  renderChips();
+  renderTable();
+}
+
+/* ---------- 开盘形态概率（core/openstat.py） --------------------------------
+   四项历史频率：高开 / 低开 / 低开红柱 / 高开绿柱（阈值为页面上那个「幅度」）。
+   这块**顶替了原来「最新收盘」那一栏**（2026-10-09），原来最新收盘的读数
+   （收盘价 / 涨跌幅 / 日期）已经并进第 1 栏「股票」卡的 `.sub` 里。
+   ⚠ 卡内宽度只有 `.g4` 一栏（≈292px）⇒ 四格排不下，改成 **2 列 × 2 行**，
+     每格三行小字（标签 / 概率 / n-N 次数），次数由后端给的 count_text 拼。
+
+   **改幅度 = 即时重算**（2026-10-09 需求）：页面上的「幅度」输入框 / 1%、3%、5%
+   快捷按钮改的都是 `openThr` 这一个状态源，改完立刻按**后端下发的原料**
+   （`openstat.adjust.bars`：逐根 {gap, yang, yin}）+ 后端下发的 `eps` 重算，
+   不重新打接口。
+
+   ⚠ **口径只有一处**：`gap`（开盘涨跌幅）怎么算、「收阳」是什么、**哪些根是一字板**，
+     都由后端在 `stats_from_frame` 里算好、以原料形式下发；前端**只做阈值比较 +
+     按 `yz_up` / `yz_dn` 剔除**（`gap >= thr - eps` / `gap <= -thr + eps`）。
+     判据与后端 `is_high_open` / `is_low_open` 逐字一致 —— 回归里拿后端的
+     `recalc_from_bars` 对拍前端算的数（分岔了就是前端偷偷改了算法）。
+
+   ⚠ **一字板不算跳空形态**（2026-10-10 用户要求）：全天只有一个价（`high == low`）的
+     一字涨停不计入「高开」、一字跌停不计入「低开」（分母 `days` 照旧）。后端把
+     `yz_up` / `yz_dn` 两个布尔标记逐根下发，前端**不自己判** —— 判据只留在
+     后端 `one_word_mask` 一处（里面还有个「别用当前股名判 ST」的坑，见那段注释）。 */
+
+/* 高开/低开判定：从**后端下发的 eps** 取容差，与 core/openstat 同一条式子。
+   ⚠ 别把 1e-9 写死在这儿 —— 后端改了 EPS 而这里没改，边界那几根就会两边不一致。 */
+function isHighOpen(gap, thr){
+  const eps = (openAdj && openAdj.eps) || 0;
+  return gap !== null && gap !== undefined && (gap >= thr - eps);
+}
+function isLowOpen(gap, thr){
+  const eps = (openAdj && openAdj.eps) || 0;
+  return gap !== null && gap !== undefined && (gap <= -thr + eps);
+}
+
+/* 用后端下发的逐根原料按**当前阈值**重算四格频次。
+   返回值与后端 `stats_from_frame` 的对应字段同构（days / n_* / p_*）。 */
+function calcOpenStat(thr){
+  const bars = ((openAdj || {}).bars) || [];
+  let days = 0, nH = 0, nL = 0, nHG = 0, nLR = 0;
+  bars.forEach(b => {
+    days += 1;
+    // ⚠ 一字板不算跳空形态（2026-10-10）：标记是**后端判好的**（`stats_from_frame`），
+    //   前端不重判 high==low —— 一字涨停从高开里剔、一字跌停从低开里剔。
+    //   ⚠ 分母 `days` 照旧（那一天仍是有效交易日，只是不作跳空事件计数）。
+    const hi = !b.yz_up && isHighOpen(b.gap, thr);
+    const lo = !b.yz_dn && isLowOpen(b.gap, thr);
+    if (hi) { nH += 1; if (b.yin) nHG += 1; }
+    if (lo) { nL += 1; if (b.yang) nLR += 1; }
+  });
+  const rate = (n, d) => d ? (n / d * 100) : null;
+  return { days, n_high:nH, n_low:nL, n_high_green:nHG, n_low_red:nLR,
+           p_high:rate(nH, days), p_low:rate(nL, days),
+           p_high_green:rate(nHG, nH), p_low_red:rate(nLR, nL) };
+}
+
+/* 后端给的 `items` 是「默认阈值」那一次的结果；重算后要用同一套 key/标签/色
+   重新拼 items（标签里的百分比要换成当前阈值：后端 `ITEMS` 里的文案是固定
+   "高开3%" 那种，页面上必须跟着阈值走，否则「显示 5% 却写着高开3%」）。 */
+function openItemsFor(thr, calc){
+  const src = ((curOpenstat || {}).items) || [];
+  const pctTxt = (v) => (v === null || v === undefined) ? '—' : v.toFixed(1) + '%';
+  const it = (key, label, cnt, val, denom) => ({
+    key, label, text: pctTxt(val), cls: src.find(x => x.key === key) ? src.find(x => x.key === key).cls : '',
+    count: cnt, count_text: String(cnt), denom_text: String(denom),
+  });
+  const thrLab = fmtThr(thr);
+  return [
+    it('high_open',     '高开' + thrLab, calc.n_high,       calc.p_high,       calc.days),
+    it('low_open',      '低开' + thrLab, calc.n_low,        calc.p_low,        calc.days),
+    it('low_open_red',  '低开红柱',      calc.n_low_red,    calc.p_low_red,    calc.n_low),
+    it('high_open_green','高开绿柱',     calc.n_high_green, calc.p_high_green, calc.n_high),
+  ];
+}
+
+/* 阈值文案：3 → "3%"、2.5 → "2.5%"（去掉无意义的 .0，与后端 `%g` 一致） */
+function fmtThr(t){
+  const v = Number(t);
+  if (!isFinite(v)) return '';
+  return (Math.abs(v - Math.round(v)) < 1e-9 ? String(Math.round(v)) : String(v)) + '%';
+}
+
+/* 改阈值的**唯一入口**：写状态 → 重画四格 → 重画图上标记 → 重画快捷按钮选中态。
+   传 clamp=true 时把值收进后端给的 [min,max]（用户手输越界时用）。 */
+function applyOpenThr(v, clamp){
+  const adj = openAdj || { min:0.1, max:20, step:0.1 };
+  let t = Number(v);
+  if (!isFinite(t)) t = (curOpenstat && curOpenstat.threshold) || adj.min;
+  if (clamp) t = Math.max(adj.min, Math.min(adj.max, t));
+  t = Math.round(t * 10) / 10;              // 与后端一致：留 1 位小数
+  openThr = t;
+  const inp = $('#st-open-pct');
+  if (inp && Number(inp.value) !== t) inp.value = t;
+  paintOpenSeg();
+  // 阈值只影响「开盘形态」这一块：四格概率 + 图上标记。其余卡片/表格不跟着动。
+  paintOpenCells();
+  // 标记挂在 K 线图上 —— 阈值一变要重画图（setOption 会重置 dataZoom，
+  // drawChart 里已经处理了续窗，见 curZoom）。
+  if (curRows && curRows.length) drawChart();
+}
+
+/* 快捷按钮（1%/3%/5%）的选中态：跟着 `openThr` 现画，值不匹配就都不亮 */
+function paintOpenSeg(){
+  const seg = $('#st-open-seg');
+  if (!seg) return;
+  $$('button', seg).forEach(b => {
+    const on = Math.abs(Number(b.dataset.t) - Number(openThr)) < 1e-9;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+}
+
+/* 卡片脚注那句「一字板剔除了几天」——**文本由后端拼**（`openstat.yizi.text`，
+   与后端 `_yizi_text` 同一句话），前端只负责摆。
+   ⚠ 与阈值无关（一字板是 K 线事实），所以改阈值不用重算这一句。
+   `applied=false`（面板缺 high/low 列，压根没剔）时后端给空串 ⇒ 这里什么都不写。 */
+function openYiziText(){
+  const y = (curOpenstat || {}).yizi || {};
+  return y.applied ? (y.text || '') : '';
+}
+
+/* 只重画四格（不碰卡片壳）—— 即时重算时走这里，避免整卡重建把绑定打掉 */
+function paintOpenCells(){
+  const s = curOpenstat || {};
+  const box = $('#open-list');
+  const badge = $('#open-badge'), foot = $('#open-foot');
+  if (!box) return;
+  if (!(s.items || []).length) return;
+  const items = openItemsFor(openThr, calcOpenStat(openThr));
+  const range = s.range || {};
+  badge.textContent = (s.days_text || '0') + ' 个交易日';
+  badge.title = ((range.start && range.end) ? `${range.start} ~ ${range.end}\n` : '') +
+                openNoteText(openThr);
+  const yz = openYiziText();
+  foot.textContent = `历史频率 · 完整口径见悬停（${fmtThr(openThr)}）` + (yz ? ` · ${yz}` : '');
+  foot.title = openNoteText(openThr);
+  box.innerHTML = items.map(x => `<div class="open-cell ${esc(x.cls || '')}">
+      <div class="open-lab">${esc(x.label)}</div>
+      <div class="open-val">${esc(x.text)}</div>
+      <div class="open-sub">${esc(x.count_text)} / ${esc(x.denom_text)} 次</div>
+    </div>`).join('');
+}
+
+/* 口径说明：与后端 `snapshot().note` 同一句话，只把阈值换成当前值。
+   ⚠ 后端那句是**默认阈值**时写的现成话；改阈值后若不重拼，卡片上会
+   「显示 5% 的口径说明却写着 3%」。句式与后端逐字一致（改一处要改两处）。 */
+function openNoteText(thr){
+  const t = fmtThr(thr).replace('%', '');
+  return '按 (今开/昨收−1) 算开盘涨跌（达到阈值即计，含恰好 ±' + t +
+         '%）；红柱/绿柱按当日收阳/收阴。高开绿柱、低开红柱为条件概率（分母是各自形态的天数）。' +
+         '一字板（全天一个价）不算跳空：一字涨停不计入高开、一字跌停不计入低开。';
+}
+
+function renderOpenStat(){
+  const s = curOpenstat || {};
+  const card = $('#st-head-open');
+  const box = $('#open-list');
+  if (!card || !box) return;
+  const items = s.items || [];
+  // ⚠ `?embed=1`（K线预览弹窗）里**也要摆这张卡**（2026-10-10 用户要求）。
+  //   原来这里在 embed 下整块撤掉，理由是「列表页预览只要图」；现在预览弹窗里
+  //   同样要看开盘形态，于是只剩「没数据才撤」这一条。
+  if (!items.length){
+    card.style.display = 'none';
+    return;
+  }
+  card.style.display = '';
+  // 四格（含即时重算后的结果）由 paintOpenCells 铺 —— 它同时服务首屏与改阈值两条路
+  paintOpenCells();
+}
+
+/* ---------- 图上「高开/低开」标记 ------------------------------------------
+   给每个满足当前阈值的交易日打一个点：**高开=红、低开=绿**（A 股习惯），
+   落在**开盘价**那一档（标记讲的就是「集合竞价那一跳」，标在开盘价上最直观）。
+   高开点稍微上挪、低开点稍微下挪，同日既高开又… 不可能同时成立，不冲突。
+
+   ⚠ 位置用 `openAdj.bars[i].idx`（**该根在原 rows 里的行号**）—— 有效交易日会
+     跳过停牌/缺数据那几根，不能用连续序号，否则整条标记会整体错位。
+   ⚠ 阈值变了标记跟着变：这条 series 在 buildOption 里按当前 `openThr` 现算。 */
+function openMarkSeries(){
+  const bars = ((openAdj || {}).bars) || [];
+  const rows = curRows || [];
+  const hi = [], lo = [];
+  bars.forEach(b => {
+    const r = rows[b.idx];
+    if (!r) return;
+    const y = r.open;                       // 标在开盘价上
+    if (y === null || y === undefined || !isFinite(Number(y))) return;
+    // 一字板不算跳空形态（与四格同一份判据）：一字涨停/一字跌停那一根也不打标记
+    if (!b.yz_up && isHighOpen(b.gap, openThr)) hi.push([b.idx, Number(y)]);
+    else if (!b.yz_dn && isLowOpen(b.gap, openThr)) lo.push([b.idx, Number(y)]);
+  });
+  return { hi, lo };
+}
+
+/* ---------- 图上「股东增减持」标记（K 线图的顶边） --------------------------
+   需求（2026-10-10）：「股东增减持也画在 k 线上，用 + 和 - 代表增持和减持，
+   在 k 线图的顶边展示」。
+
+   位置：在 K 线那一格里**另加一根 0~1 的隐形 y 轴**（`gridIndex:0`），标记固定画在
+   `TRADE_Y` 那一档 —— 于是它永远贴着 K 线图**顶边**，不随价格涨跌跑。
+   ⚠ **不新增 grid**：新增 grid 要把 K 线、各下挂格的 gridIndex / xAxisIndex 全体挪号，
+     一不留神就把「拖主轴、下挂格跟着走」弄断（dataZoom 的 xAxisIndex、探针里的
+     `convertToPixel` 全靠这套下标）。同 grid 加一根 y 轴就能达到同样的效果。
+
+   口径：`idx` 是**后端算好的行号**（公告日 → 当天或之后的第一根 K 线，见
+   `chips.trade_marks`）—— 前端不拿日期去 rows 里 indexOf，那天不是交易日就没得对。
+   颜色照 A 股习惯：增持 = 红(+)、减持 = 绿(−)。 */
+const TRADE_UP = '增持', TRADE_DN = '减持';
+/* 标记的 y（只对上面那根隐形轴有意义，0~1）：贴顶边内侧。
+   同一天**增持与减持都有**时，减持往下让一档 —— 同 x 的两个符号否则会在同一像素上叠住。 */
+const TRADE_Y = 0.95, TRADE_Y2 = 0.86;
+
+/* 图上要摆的增减持标记（前端只按后端给的 idx 摆点，不重新判断方向/日期） */
+function tradeMarksAll(){
+  return (((curChips || {}).trade) || {}).marks || [];
+}
+function tradeMarkSeries(){
+  const ms = tradeMarksAll();
+  const dirs = {};
+  ms.forEach(m => { dirs[m.idx] = (dirs[m.idx] || '') + m.in_de; });
+  const up = [], dn = [];
+  ms.forEach(m => {
+    const isIn = m.in_de === 'IN';
+    const twin = (dirs[m.idx] || '').indexOf('IN') >= 0 && (dirs[m.idx] || '').indexOf('DE') >= 0;
+    const y = (twin && !isIn) ? TRADE_Y2 : TRADE_Y;
+    (isIn ? up : dn).push({ value: [m.idx, y], _m: m });
+  });
+  return { up, dn };
+}
+
+/* ---------- 所属概念（东财 F10 核心题材） ------------------------------------
+   与筹码卡片同一套做法：后端只回真概念 + 算好文本/涨跌色，前端只铺标签。
+   点标签在下方展开区看**入选理由原文**——不弹浮层，免得长文本把卡片撑破。 */
+function renderConcepts(){
+  const c = curConcepts || {};
+  const items = c.items || [];
+  const badge = $('#cpt-badge'), note = $('#cpt-note');
+  const box = $('#cpt-list'), pop = $('#cpt-pop');
+  if (EMBED || !box) return;             // 预览弹窗里没有这张卡（也被 CSS 藏了）
+  note.textContent = c.note || '';
+  note.title = c.note || '';
+  if (!items.length){
+    badge.textContent = '—';
+    box.innerHTML = '<span class="muted" style="font-size:13px">' +
+                    esc(c.note || '暂无概念数据') + '</span>';
+    pop.style.display = 'none';
+    return;
+  }
+  badge.textContent = items.length + ' 个';
+  box.innerHTML = items.map((x, i) =>
+    `<span class="cpt${i === 0 ? ' on' : ''}" data-i="${i}" title="双击看这条概念在本库的成分股">` +
+    `${esc(x.name)}<s class="pct ${esc(x.pct_cls || '')}">${esc(x.pct_text)}</s></span>`).join('');
+  showConcept(0);
+  box.querySelectorAll('.cpt').forEach(el => {
+    el.onclick = () => {
+      box.querySelectorAll('.cpt').forEach(e => e.classList.remove('on'));
+      el.classList.add('on');
+      showConcept(+el.dataset.i);
+    };
+    // 双击 = 成分股列表。单击那次会先跑一遍上面（把这条选中、理由展开），
+    // 是**幂等**的，所以不用为双击去延迟单击（延迟会让单击显得卡）。
+    el.ondblclick = () => openConceptStocks(+el.dataset.i);
+  });
+}
+
+function showConcept(i){
+  const items = (curConcepts || {}).items || [];
+  const x = items[i];
+  if (!x) return;
+  // 小字那一行：涨跌家数 / 领涨股 / 本库覆盖只数。全是**后端给的数字**，这里只拼串。
+  const meta = [];
+  if (x.up_cnt !== null && x.up_cnt !== undefined) meta.push(`板块 ${x.up_cnt} 涨 / ${x.down_cnt} 跌`);
+  if (x.lead) meta.push(`领涨 ${x.lead}`);
+  if (x.members) meta.push(`本库 ${x.members} 只`);
+  const rsn = x.reason
+    ? esc(x.reason)
+    : '<span class="muted">东财没给这个概念写入选理由</span>';
+  $('#cpt-pop').style.display = '';
+  $('#cpt-pop').innerHTML =
+    `<b>${esc(x.name)}</b><span class="tag" style="margin-left:6px">${esc(x.code)}</span>` +
+    (meta.length ? `<span class="muted" style="margin-left:8px;font-size:11.5px">${esc(meta.join(' · '))}</span>` : '') +
+    `<div class="rsn">${rsn}</div>` +
+    `<div class="cpt-more"><button class="btn sm" data-stk="${i}">查看成分股</button>` +
+    `<span class="muted" style="font-size:11.5px">（双击标签同样可以）</span></div>`;
+  $('#cpt-pop [data-stk]').onclick = () => openConceptStocks(i);
+}
+
+/* ---------- 概念成分股（双击概念标签） ---------------------------------------
+   方向与上面那张卡**相反**：那边是「这只票属于哪些概念」，这里是「这条概念有
+   哪些票」。列表读的是本地库（`core/concept.concept_members`），所以收盘/涨跌幅
+   与本页其他数字同源，不是东财的实时盘口 —— 页面上写着哪一天就是哪一天。
+
+   文本与涨跌色依旧由后端算好（前端不判正负、不拼百分号）。 */
+let cptModal = null;      // 同一时刻只留一个成分股弹窗
+let cptState = null;      // { code, name, order, limit, data }
+
+/* 弹窗里点「K线」用的参数：与整页当前视图**保持同一套口径**（同一个策略、同一个
+   周期、同一个查询日），否则弹窗里看到的图和页面上那张不是一件事。
+   页面没选策略时退成 `sel_only=1`（只看选股命中，不算策略收益）—— 与 /screen 的
+   入口同一条规矩（硬规矩 21）。 */
+function cptKlineParams(){
+  const p = {};
+  const sid = $('#st-strategy') ? $('#st-strategy').value : '';
+  if (sid) p.strategy_id = sid; else p.sel_only = '1';
+  const f = $('#st-freq') ? $('#st-freq').value : '';
+  if (f) p.freq = f;
+  const d = (curAnchor && curAnchor.date) || '';
+  if (d) p.trade_date = d;
+  return p;
+}
+
+function openConceptStocks(i, limit){
+  const items = (curConcepts || {}).items || [];
+  const x = items[i];
+  if (!x || !x.code) return;
+  if (!window.mkModal) return;
+  if (cptModal) { cptModal.close(); cptModal = null; }
+  cptState = { code: x.code, name: x.name, order: 'pct', limit: limit || 100, data: null };
+  const pad = 'padding:16px 2px;font-size:12.5px';
+  cptModal = window.mkModal(x.name + ' · 成分股',
+    `<div class="muted" style="${pad}">正在读本地库…</div>`,
+    '', () => { cptModal = null; }, true);
+  cptLoadStocks();
+}
+
+async function cptLoadStocks(){
+  const st = cptState;
+  if (!st || !cptModal) return;
+  const body = cptModal.el.querySelector('.modal-body');
+  const q = new URLSearchParams({ limit: String(st.limit), order: st.order });
+  const d = (curAnchor && curAnchor.date) || '';
+  if (d) q.set('trade_date', d);
+  if (body) body.innerHTML = '<div class="muted" style="padding:16px 2px;font-size:12.5px">正在读本地库…</div>';
+  try {
+    st.data = await apiGet('/api/concept/' + encodeURIComponent(st.code) + '/stocks?' + q.toString());
+    cptRenderStocks();
+  } catch (e) {
+    if (body) body.innerHTML = '<div class="muted" style="padding:16px 2px;font-size:12.5px">' +
+      '读取失败：' + esc(e.message) + '</div>';
+  }
+}
+
+function cptRenderStocks(){
+  const st = cptState, d = st && st.data;
+  if (!cptModal || !d) return;
+  const body = cptModal.el.querySelector('.modal-body');
+  if (!body) return;
+  const rows = d.stocks || [];
+  // 排序换的是**本地已回的那批**吗？不是 —— 这里重新问后端（排序要连着 `total`
+  // 一起重算，前端只排已回的前 100 只 = 把「涨跌幅前 100」误读成「全概念前 100」）。
+  const ORDS = [['pct', '涨跌幅 ↓'], ['pct_asc', '涨跌幅 ↑'], ['code', '代码']];
+  const bar = '<div class="cpt-bar"><div class="small muted">' + esc(d.note || '') + '</div>' +
+    '<div class="cpt-ord">' +
+      ORDS.map(([k, l]) => `<button class="btn sm${d.order === k ? ' on' : ''}" data-ord="${k}">${l}</button>`).join('') +
+      (d.total > rows.length
+        ? `<button class="btn sm" data-more="1">显示全部 ${d.total} 只</button>` : '') +
+    '</div></div>';
+  if (!rows.length){
+    body.innerHTML = bar + '<div class="muted" style="padding:10px 2px;font-size:12.5px">没有可显示的成分股</div>';
+  } else {
+    const p = cptKlineParams();
+    const qs = new URLSearchParams(p).toString();
+    body.innerHTML = bar + '<div class="tbl-wrap"><table class="data sm"><thead><tr>' +
+      '<th style="width:80px">代码</th><th>名称</th><th class="num" style="width:72px">收盘</th>' +
+      '<th class="num" style="width:78px">涨跌幅</th><th style="width:56px"></th></tr></thead><tbody>' +
+      rows.map((s, i) => `<tr${s.reason ? ` title="入选理由：${esc(s.reason)}"` : ''}>` +
+        `<td class="mono"><a href="/stock/${encodeURIComponent(s.ts_code)}${qs ? '?' + esc(qs) : ''}"` +
+        ` target="_blank" rel="noopener">${esc(s.code)}</a></td>` +
+        `<td>${esc(s.name)}</td>` +
+        `<td class="num">${esc(s.close_text)}</td>` +
+        `<td class="num pct ${esc(s.pct_cls)}">${esc(s.pct_text)}</td>` +
+        `<td><button class="btn sm" data-kline="${esc(s.ts_code)}" data-i="${i}">K线</button></td></tr>`).join('') +
+      '</tbody></table></div>';
+  }
+  $$('[data-ord]', body).forEach(b => { b.onclick = () => { cptState.order = b.dataset.ord; cptLoadStocks(); }; });
+  const more = $('[data-more]', body);
+  if (more) more.onclick = () => { cptState.limit = 3000; cptLoadStocks(); };
+  $$('[data-kline]', body).forEach(b => { b.onclick = guardClick(b, () => {
+    const i = Number(b.dataset.i);
+    window.klinePreview({
+      tsCode: b.dataset.kline, name: (rows[i] || {}).name,
+      params: cptKlineParams(), list: rows, index: i,
+    });
+  }); });
+}
+
+/* ---------- 筹码与两融：股东户数 / 融资融券 / 股东增减持 --------------------
+   与基本面、收益卡片同一套做法 —— 主数、小项、单位、涨跌色全部由后端给
+   （core/chips.py），前端只往格子里铺，不自己除 1e4 也不自己判断正负。 */
+function fillChipHead(block, ids){
+  const blk = block || {};
+  $(ids.badge).textContent = blk.badge || '';
+  $(ids.note).textContent = blk.note || '';
+  $(ids.note).title = blk.note || '';
+  const box = $(ids.chart);
+  if (!blk.available || !blk.hero){
+    $(ids.hero).innerHTML = '<span class="muted" style="font-size:13px">暂无数据</span>';
+    $(ids.head).innerHTML = '';
+    if (box) box.style.display = 'none';
+    return false;
+  }
+  if (box) box.style.display = '';
+  $(ids.hero).innerHTML = esc(blk.hero.text) +
+    `<small>${esc(blk.hero.label)}</small>`;
+  $(ids.head).innerHTML = (blk.items || []).map(i =>
+    `<span class="lb">${esc(i.label)}</span><b class="${esc(i.cls || '')}">${esc(i.text)}</b>`
+  ).join('');
+  return true;
+}
+
+function renderChips(){
+  const c = curChips || {};
+  const okH = fillChipHead(c.holder, {
+    badge:'#ch-holder-badge', note:'#ch-holder-note', hero:'#ch-holder-hero',
+    head:'#ch-holder-head', chart:'#chart-holder' });
+  if (okH) mkChart('#chart-holder', holderOption(c.holder));
+  const okM = fillChipHead(c.margin, {
+    badge:'#ch-margin-badge', note:'#ch-margin-note', hero:'#ch-margin-hero',
+    head:'#ch-margin-head', chart:'#chart-margin' });
+  if (okM) mkChart('#chart-margin', marginOption(c.margin));
+  renderTradeChips(c.trade);
+}
+
+/* 股东户数：柱子=户数（左轴），折线=户数增长率%（右轴）。
+   两轴都是 scale:true —— 户数动辄几十万，从 0 起画会把波动压成一条直线。 */
+function holderOption(blk){
+  const s = (blk || {}).series || [];
+  const d = s.map(x => x.end_date);
+  return {
+    animation: false,
+    grid: { left: 56, right: 46, top: 26, bottom: 22 },
+    tooltip: Object.assign({}, tooltipBase, { confine: true, formatter: p => {
+      const r = s[p[0].dataIndex] || {};
+      return `<b>${esc(r.end_date || '')}</b>` +
+        `<div>${p[0].marker}股东户数: ${r.holder_num === null || r.holder_num === undefined ? '—' : fmt.int(r.holder_num)}</div>` +
+        `<div>户数增长率: ${fmt.pct(r.growth)}</div>` +
+        `<div class="muted">公告日 ${esc(r.ann_date || '—')}</div>`;
+    }}),
+    legend: Object.assign({}, LEGEND_STYLE, { data:['股东户数','户数增长率'], top:0, right:0 }),
+    xAxis: withBase({ type:'category', data:d, boundaryGap:true },
+                    { interval: 0, fontSize:10 }),
+    yAxis: [
+      withBase({ type:'value', scale:true, name:'户数',
+                 nameTextStyle:{ color:'#8b95a9', fontSize:10, align:'left' } }),
+      withBase({ type:'value', scale:true, name:'增长率%',
+                 nameTextStyle:{ color:'#8b95a9', fontSize:10, align:'right' } },
+               { show:false }),
+    ],
+    // 第 2 条 y 轴不画网格线，否则两套横线叠在一起看不出哪根对应哪个轴
+    series: [
+      { name:'股东户数', type:'bar', barMaxWidth:26, data:s.map(x => x.holder_num),
+        itemStyle:{ color:'#4b83ff' } },
+      { name:'户数增长率', type:'line', yAxisIndex:1, data:s.map(x => x.growth),
+        symbolSize:5, lineStyle:{ width:1.4, color:'#e08a00' },
+        itemStyle:{ color:'#e08a00' } },
+    ],
+  };
+}
+
+/* 融资融券：左轴=融资余额（百亿级），右轴=收盘价（元），中间一根隐形轴=融券余额与融资净买入（亿级）。
+   放同一轴的话融券余额会被压成贴着 0 的直线、价格会被压成一条水平线，等于没画。
+   金额一律换算成**亿元**；价格折线用**同日日线收盘价**（后端
+   `chips.margin_history()` 按两融自己的交易日 LEFT JOIN 日线对齐，停牌日无价 ⇒ 断点）。
+   ⚠ 右侧**只能有一根带名字的轴**：两根 name 都在轴顶部、水平方向必然叠在一起。
+   所以「融券/净买入(亿)」整根隐藏（unit 靠图例与 tooltip 上的「亿」表达），
+   把右侧让给更该有刻度的「收盘价」。 */
+const YI = 1e8;
+const PRICE_COLOR = '#26c6da';
+function marginOption(blk){
+  const s = (blk || {}).series || [];
+  const d = s.map(x => x.trade_date);
+  const toYi = v => (v === null || v === undefined) ? null : +(v / YI).toFixed(4);
+  const barCls = v => (v >= 0 ? UP : DOWN);
+  return {
+    animation: false,
+    // ⚠ top:46 不是随手写的：这一格比别的图多一根轴（3 根），轴 name 画在**轴顶端**、
+    //   图例又钉在 `top:0,right:0`，两者都在右上角 —— top 给小了（26）会看到
+    //   「收盘价(元)」压在「融资净买入」图例项上（2026-10-10 截图实测）。
+    grid: { left: 56, right: 60, top: 46, bottom: 22 },
+    tooltip: Object.assign({}, tooltipBase, { confine: true, formatter: p => {
+      // 一律从行数据取数（不读 params.value）—— 柱子是 {value,itemStyle} 对象，
+      // 不同 ECharts 版本对 params.value 给的是对象还是数值并不一致，直接读 r 最稳。
+      const r = s[p[0].dataIndex] || {};
+      const amt = v => (v === null || v === undefined) ? '—' : (v / YI).toFixed(2) + '亿';
+      const sg = v => (v === null || v === undefined) ? '—'
+        : (v > 0 ? '+' : '') + amt(v);
+      const cls = v => (v > 0 ? 'up' : (v < 0 ? 'down' : 'flat'));
+      return `<b>${esc(r.trade_date || '')}</b>` +
+        `<div>收盘价: ${fmt.price(r.close)}</div>` +
+        `<div>融资余额: ${amt(r.rzye)}</div>` +
+        `<div>融资净买入: <span class="${cls(r.rz_net)}">${sg(r.rz_net)}</span></div>` +
+        `<div>融券余额: ${amt(r.rqye)}</div>` +
+        `<div>两融余额: ${amt(r.rzrqye)}</div>`;
+    }}),
+    legend: Object.assign({}, LEGEND_STYLE,
+      { data:['融资余额','融券余额','融资净买入','收盘价'], top:0, right:0 }),
+    dataZoom: [{ type:'inside', start: Math.max(0, 100 - 12000 / Math.max(d.length, 1)),
+                 end: 100 }],
+    xAxis: withBase({ type:'category', data:d, boundaryGap:true }, { hideOverlap:true }),
+    yAxis: [
+      withBase({ type:'value', scale:true, name:'融资余额(亿)',
+                 nameTextStyle:{ color:'#8b95a9', fontSize:10, align:'left' } }),
+      // 融券余额 / 融资净买入的坐标参照：整根隐形（见函数头注释），只负责定比例
+      withBase({ type:'value', scale:true, show:false, splitLine:{ show:false } }),
+      // 收盘价：右侧唯一带名字/刻度的轴，不画横格线（否则与左轴两套线叠在一起）
+      withBase({ type:'value', scale:true, name:'收盘价(元)', position:'right',
+                 splitLine:{ show:false },
+                 nameTextStyle:{ color:'#8b95a9', fontSize:10, align:'right' } },
+               { fontSize:9.5 }),
+    ],
+    series: [
+      { name:'融资余额', type:'line', data:s.map(x => toYi(x.rzye)), showSymbol:false,
+        lineStyle:{ width:1.5, color:'#4b83ff' } },
+      { name:'融券余额', type:'line', yAxisIndex:1, data:s.map(x => toYi(x.rqye)),
+        showSymbol:false, lineStyle:{ width:1.2, color:'#8b5cf6' } },
+      { name:'融资净买入', type:'bar', yAxisIndex:1, barMaxWidth:4,
+        data: s.map(x => ({ value: toYi(x.rz_net),
+                            itemStyle:{ color: barCls(x.rz_net || 0) } })) },
+      // 价格线放最后 = 画在最上层，不被量柱压住
+      { name:'收盘价', type:'line', yAxisIndex:2, data:s.map(x => x.close),
+        showSymbol:false, lineStyle:{ width:1.4, color:PRICE_COLOR },
+        itemStyle:{ color:PRICE_COLOR } },
+    ],
+  };
+}
+
+function renderTradeChips(blk){
+  const t = blk || {};
+  $('#ch-trade-badge').textContent = t.badge || '';
+  $('#ch-trade-note').textContent = t.note || '';
+  $('#ch-trade-note').title = t.note || '';
+  const sm = t.summary;
+  $('#ch-trade-sum').innerHTML = sm ? (sm.items || []).map(i =>
+    `<span class="lb">${esc(i.label)}</span><b class="${esc(i.cls || '')}">${esc(i.text)}</b>`
+  ).join('') : '';
+  const rows = t.items || [];
+  $('#ch-trade-table').innerHTML = rows.length ? `<table class="data"><thead><tr>
+    <th>公告日</th><th>股东</th><th>类型</th><th>方向</th>
+    <th class="num">变动数量</th><th class="num">变动比例</th><th class="num">变动后占比</th>
+    <th class="num">交易均价</th><th class="num">估算金额</th></tr></thead><tbody>
+    ${rows.map(x => `<tr>
+      <td class="mono small">${esc(x.ann_date)}</td>
+      <td class="chip-holder" title="${esc(x.holder_name)}">${esc(x.holder_name)}</td>
+      <td class="small muted">${esc(x.holder_type)}</td>
+      <td><span class="tag ${x.in_de === 'IN' ? 'r' : 'g'}">${esc(x.dir_text)}</span></td>
+      <td class="num">${esc(x.change_vol_text)}</td>
+      <td class="num">${esc(x.change_ratio_text)}</td>
+      <td class="num">${esc(x.after_ratio_text)}</td>
+      <td class="num">${esc(x.avg_price_text)}</td>
+      <td class="num">${esc(x.amount_text)}</td>
+      </tr>`).join('')}</tbody></table>` : '<div class="empty">暂无增减持记录</div>';
+}
+
+/* ---------- 下挂指标下拉：选项全部来自后端目录 ---------- */
+function fillIndicatorPicks(){
+  // 成交量是**固定格**（K 线正下方），所以不进下拉；目录里其余每组都能选到
+  const pickable = curCatalog.filter(g => g.key !== VOL_KEY);
+  const avail = pickable.map(g => g.key);
+  const opts = [{key:'', name:'（不显示）'}].concat(pickable.map(g => ({key:g.key, name:g.name})));
+  // 默认 MACD + KDJ；策略把某个指标关了（目录里没它）时退到前两个可用的
+  const defA = avail.indexOf('macd') >= 0 ? 'macd' : (avail[0] || '');
+  const defB = avail.indexOf('kdj') >= 0 && avail.length > 1 ? 'kdj'
+             : (avail.find(k => k !== defA) || '');
+  const prevA = $('#st-ind-a').value, prevB = $('#st-ind-b').value;
+  // ⚠ 'vol' 是老状态里可能残留的下拉值（它曾经可被选）—— 现在是固定格，不许占这个位置
+  const keepA = (prevA !== VOL_KEY && catByKey[prevA]) ? prevA : defA;
+  const keepB = (prevB !== VOL_KEY && catByKey[prevB]) ? prevB
+              : (defB !== keepA ? defB : (avail.find(k => k !== keepA) || ''));
+  fillSelect($('#st-ind-a'), opts, 'key', 'name', keepA);
+  fillSelect($('#st-ind-b'), opts, 'key', 'name', keepB);
+}
+
+function pickedGroups(){
+  const groups = [], skipped = [];
+  [$('#st-ind-a').value, $('#st-ind-b').value].forEach(k => {
+    const g = catByKey[k];
+    if (!g) return;
+    if (g.empty) { skipped.push(g.name); return; }
+    groups.push(g);
+  });
+  return { groups, skipped };
+}
+
+/* 默认显示窗口（dataZoom 的 start/end 百分比）：DEF_SPAN 根，落在**查询日**附近。
+   以前是「贴最右 120 根」—— 按 9/15 选完股点开 K 线，右边界正好卡在 9/15，看不到
+   选出来之后怎么走。现在：往前补够历史，查询日之后**有多少显示多少**（后端已经把
+   查询日之后的行一起返回了），查询日落在窗口里、尽量居中，但不越出数据两端。 */
+function defaultSpan(n){
+  if (n <= DEF_SPAN) return [0, 100];
+  let s = n - DEF_SPAN;                                  // 兜底：贴最右
+  const ai = curAnchor && curAnchor.index;
+  if (ai !== null && ai !== undefined && ai >= 0) {
+    s = Math.min(Math.max(0, ai - Math.floor((DEF_SPAN - 1) / 2)), n - DEF_SPAN);
+  }
+  return [s / n * 100, (s + DEF_SPAN) / n * 100];
+}
+
+/* ---------- 一个实例、多个 grid：主轴一拖，下挂格自动跟着走 ---------- */
+function buildOption(){
+  const rows = curRows, d = rows.map(x => x.trade_date), n = rows.length;
+  /* 成交量固定当**第一格下挂**（K 线正下方）—— 它来自目录，跟其余下挂格共用下面
+     这一段渲染；本地没这一组、或这一组整列没数据（`empty`）时整格不画（降级，
+     不拦着别的格）。 */
+  const volGroup = catByKey[VOL_KEY];
+  const groups = (volGroup && !volGroup.empty ? [volGroup] : []).concat(pickedGroups().groups);
+
+  const TOP = 38;      // 顶部留给 K 线图例
+  const KH  = 300;     // K 线格高
+  const K_PAD = 0.06;  // K 线价格轴顶部留白比例（给顶边的增减持 ± 标记让位）
+  const IH  = 78;      // 每个下挂格高（2026-09-25 由 118 收到 78：指标区整体收窄约 1/3）
+  const GAP = 38;      // 格间距（放该格的图例 + y 轴名）
+  const BOT = 56;      // 底部：缩放滑块 + 日期标签
+  const paneH = (g) => (g.key === VOL_KEY ? VH : IH);   // 成交量格矮一档（VH 见文件头常量）
+  const H = TOP + KH + groups.reduce((s, g) => s + GAP + paneH(g), 0) + BOT;
+  $('#chart-stock').style.height = H + 'px';
+
+  const grids = [{ left: 58, right: 58, top: TOP, height: KH }];
+  const xAxes = [], yAxes = [], legends = [], series = [];
+  seriesMeta = {};
+
+  // --- 主轴（K线）---
+  xAxes.push(withBase({ type:'category', data:d, gridIndex:0, boundaryGap:true }, { show:false }));
+  /* 顶部留一档白：给「股东增减持」的 ± 标记让位（标记贴在本格顶边，见 TRADE_Y）——
+     一点留白都不给的话，标记会正好压在当日最高价那根 K 线上。 */
+  yAxes.push(withBase({ type:'value', scale:true, gridIndex:0,
+                        max: (v) => v.max + Math.max((v.max - v.min) * K_PAD,
+                                                     Math.abs(v.max) * 0.004) }));
+  legends.push(Object.assign({}, LEGEND_STYLE, { data: BASE_ITEMS, top: 2, left: 0 }));
+
+  series.push(
+    { name:'K线', type:'candlestick', xAxisIndex:0, yAxisIndex:0,
+      data: rows.map(x=>[x.open, x.close, x.low, x.high]),
+      itemStyle:{ color:UP, color0:DOWN, borderColor:UP, borderColor0:DOWN } },
+    { name:'MA5',  type:'line', xAxisIndex:0, yAxisIndex:0, data:rows.map(x=>x.ma5),  showSymbol:false, lineStyle:{width:1,color:'#e08a00'} },
+    { name:'MA10', type:'line', xAxisIndex:0, yAxisIndex:0, data:rows.map(x=>x.ma10), showSymbol:false, lineStyle:{width:1,color:'#26c6da'} },
+    { name:'MA20', type:'line', xAxisIndex:0, yAxisIndex:0, data:rows.map(x=>x.ma20), showSymbol:false, lineStyle:{width:1,color:'#4b83ff'} },
+    { name:'MA60', type:'line', xAxisIndex:0, yAxisIndex:0, data:rows.map(x=>x.ma60), showSymbol:false, lineStyle:{width:1,color:'#8b5cf6'} },
+    { name:'BOLL上轨', type:'line', xAxisIndex:0, yAxisIndex:0, data:rows.map(x=>x.boll_upper), showSymbol:false, lineStyle:{width:1,color:'#b0b9cc',type:'dashed'} },
+    { name:'BOLL中轨', type:'line', xAxisIndex:0, yAxisIndex:0, data:rows.map(x=>x.boll_mid), showSymbol:false, lineStyle:{width:1,color:'#8b95a9',type:'dotted'} },
+    { name:'BOLL下轨', type:'line', xAxisIndex:0, yAxisIndex:0, data:rows.map(x=>x.boll_lower), showSymbol:false, lineStyle:{width:1.4,color:'#12a06a'} });
+
+  /* --- 策略信号：画在 K 线这一格上，位置/形状按后端 signals 来 ---------------
+     「有几根、该不该画」由后端算（core/strategy.signal_marks）—— 因为「买入触发
+     为空 = 次日无条件买入」这种情况每根都是 True，只看行数据会画成满屏红三角。 */
+  const sigNames = [];
+  curSignals.forEach(sg => {
+    if (!sg.draw) return;
+    const data = [];
+    rows.forEach((x, i) => {
+      if (!x[sg.f]) return;
+      const v = sg.side === 'above' ? x.high : x.low;    // 卖出标在最高价上方，其余标在最低价下方
+      if (v === null || v === undefined) return;
+      data.push([i, v]);
+    });
+    if (!data.length) return;
+    sigNames.push(sg.name);
+    // sig 标记：标记点的「值」是当日低/高价，在 tooltip 里当数值读没意义 ——
+    // 信号改由表头的徽标复述，所以这类点在 tooltip 正文里过滤掉。
+    seriesMeta[sg.name] = { f: sg.f, sig: true };
+    series.push({
+      name: sg.name, type:'scatter', xAxisIndex:0, yAxisIndex:0, data,
+      symbol: SIG_SHAPE[sg.shape] || 'circle',
+      symbolSize: SIG_PX[sg.shape] || 8,
+      symbolRotate: (sg.shape === 'arrow' && sg.side === 'above') ? 180 : 0,
+      symbolOffset: [0, (SIG_OFF[sg.side] || {})[sg.key] || 0],
+      itemStyle: { color: SIG_COLOR[sg.key] || NEUTRAL },
+      z: 6,
+    });
+  });
+  if (sigNames.length) legends[0].data = BASE_ITEMS.concat(sigNames);
+
+  /* --- 高开 / 低开标记（开盘形态，阈值可调）---------------------------------
+     挂在 K 线这一格：每个满足当前阈值的交易日，在**开盘价**打一个点。
+     高开=红（上挪一点）、低开=绿（下挪一点）——「集合竞价那一跳」标在开盘价最直观。
+     ⚠ 空的时候**不摆这条 series**：不画点却在图例里留一项，点开也什么都没有。
+     ⚠ 这两项独立成图例项（可以单独开关），不像策略信号那样只加名字。 */
+  const om = openMarkSeries();
+  if (om.hi.length) {
+    const nm = '高开' + fmtThr(openThr);
+    seriesMeta[nm] = { sig: true };      // 标记点的值是开盘价，在正文里读没意义（上面用文字复述）
+    series.push({ name: nm, type:'scatter', xAxisIndex:0, yAxisIndex:0,
+                  data: om.hi, symbol:'circle', symbolSize:6, symbolOffset:[0,-8],
+                  itemStyle:{ color: UP }, z: 5 });
+  }
+  if (om.lo.length) {
+    const nm = '低开' + fmtThr(openThr);
+    seriesMeta[nm] = { sig: true };
+    series.push({ name: nm, type:'scatter', xAxisIndex:0, yAxisIndex:0,
+                  data: om.lo, symbol:'circle', symbolSize:6, symbolOffset:[0, 8],
+                  itemStyle:{ color: DOWN }, z: 5 });
+  }
+  const openNames = series.filter(s => s.type === 'scatter' && /^[高低]开/.test(s.name))
+                          .map(s => s.name);
+  if (openNames.length) legends[0].data = (legends[0].data || BASE_ITEMS).concat(openNames);
+
+  // --- 下挂格：每组一格、各带一条 y 轴 ---
+  let cursor = TOP + KH;                 // 上一格的**底部**（K 线格底）
+  groups.forEach((g, gi) => {
+    const ax = gi + 1;
+    const paneTop = cursor + GAP;        // 本格上边；GAP 这段留给本格图例 + y 轴名
+    const pane = paneH(g);
+    grids.push({ left: 58, right: 58, top: paneTop, height: pane });
+    /* ⚠ 必须把本格高度也累加进去。只 `cursor += GAP` 的话每格只往下挪 38px，
+       而格子本身有 96 / 118 高 ⇒ 几格会互相叠在一起（成交量盖住 MACD 就是这么来的，
+       而且「top 递增」这种断言照样通过，看不出来）。 */
+    cursor = paneTop + pane;
+    const isLast = ax === groups.length;
+    xAxes.push(withBase({ type:'category', data:d, gridIndex:ax, boundaryGap:true },
+                        { show:isLast }));
+
+    const y = { type:'value', scale:true, gridIndex:ax, name:g.name,
+                nameTextStyle:{ color:'#8b95a9', fontSize:10, align:'left' }, nameGap:10 };
+    if (g.band) { y.min = g.band[0]; y.max = g.band[1]; }
+    yAxes.push(withBase(y));
+
+    const items = [];
+    (g.series || []).forEach((s, si) => {
+      items.push(s.label);
+      seriesMeta[s.label] = { f: s.f, fmt: s.fmt || 'plain' };
+      if (s.type === 'bar') {
+        // 柱子按涨跌着色：updown=数值正负，updown_open=当日 K 线阴阳（A股习惯：红涨绿跌）
+        const data = rows.map(x => {
+          const v = x[s.f];
+          let color = NEUTRAL;
+          if (v !== null && v !== undefined) {
+            color = s.role === 'updown_open' ? (x.close >= x.open ? UP : DOWN)
+                                             : (v >= 0 ? UP : DOWN);
+          }
+          return { value: v, itemStyle: { color } };
+        });
+        series.push({ name:s.label, type:'bar', xAxisIndex:ax, yAxisIndex:ax,
+                      barMaxWidth:6, data });
+      } else {
+        series.push({ name:s.label, type:'line', xAxisIndex:ax, yAxisIndex:ax,
+                      data: rows.map(x => x[s.f]), showSymbol:false,
+                      lineStyle:{ width:1.2, color:(PAL[g.key] || [])[si] || NEUTRAL } });
+      }
+    });
+    legends.push(Object.assign({}, LEGEND_STYLE, { data:items, top:paneTop - 26, right:10 }));
+
+    // 参考线用一条**空数据**的 series 承载：挂在数据 series 上会被图例一起点掉
+    if (g.guides && g.guides.length) {
+      series.push({ name: GUIDE_PREFIX + g.key, type:'line', xAxisIndex:ax, yAxisIndex:ax,
+                    data: [], silent:true, tooltip:{ show:false },
+                    markLine:{ silent:true, symbol:'none', label:{ show:false },
+                               lineStyle:{ color:'#3a4863', type:'dashed', width:1 },
+                               data: g.guides.map(v => ({ yAxis: v })) } });
+    }
+  });
+
+  /* --- 股东增减持：K 线图**顶边**的 ± 标记（2026-10-10 需求）----------------
+     + = 增持（红）、− = 减持（绿），固定画在 K 线那一格的顶边（见 TRADE_Y）。
+     挂在**同一格里另加的一根 0~1 隐形 y 轴**上（gridIndex 仍是 0），所以：
+       · 不用动任何既有 grid / x 轴下标，dataZoom 与十字光标照旧联动；
+       · 标记的 y 是"离顶边多远"，与价格无关 —— 涨跌都不会跑位。
+     ⚠ 没有增减持时**两条 series 都不摆**（不画点却在图例里留一项，点开什么都没有）。 */
+  const tms = tradeMarkSeries();
+  const tradeNames = [];
+  if (tms.up.length || tms.dn.length) {
+    const tyIdx = yAxes.length;          // 紧跟各下挂格的 y 轴之后，只归属 grid 0
+    yAxes.push(withBase({ type:'value', gridIndex:0, min:0, max:1,
+                          show:false, splitLine:{ show:false } }));
+    const mk = (nm, data, color, sym) => {
+      series.push({ name:nm, type:'scatter', xAxisIndex:0, yAxisIndex:tyIdx, data,
+                    symbol:'circle', symbolSize:13,
+                    itemStyle:{ color },
+                    label:{ show:true, formatter:sym, color:'#fff',
+                            fontSize:11, fontWeight:'bold' },
+                    z: 9 });
+      // 标记点的「值」是 0~1 的摆位，在 tooltip 正文里读没意义 —— 改用顶边的文字复述
+      //（与策略信号、高开/低开同一套：`tipFormatter` 按 seriesMeta.sig 把它从正文剔掉）
+      seriesMeta[nm] = { sig: true };
+      tradeNames.push(nm);
+    };
+    if (tms.up.length) mk(TRADE_UP, tms.up, UP, '+');
+    if (tms.dn.length) mk(TRADE_DN, tms.dn, DOWN, '-');
+  }
+  if (tradeNames.length) {
+    legends[0].data = (legends[0].data || BASE_ITEMS).concat(tradeNames);
+  }
+
+  /* --- 查询日竖虚线 ---------------------------------------------------------
+     选股是按**某一天**查的，图上要说清「哪一根是查询日」：左边是选股时看到的行情，
+     右边是之后才发生的（后端已把它右侧的信号全部清掉，见 screener._cut_after_anchor）。
+     只在**图上有查询日之后行情**时才画（也就是查询日不是最后一根）—— 否则查询日
+     正好压在右边界上，一条贴着边框的线只会添乱。
+     挂在一条**空数据**的 series 上（与下挂格参考线同一做法）：挂 K 线 series 上会被
+     图例开关带着一起消失，还会混进 tooltip。 */
+  if (curAnchor && curAnchor.date && curAnchor.extended) {
+    series.push({
+      name: ANCHOR_NAME, type:'line', xAxisIndex:0, yAxisIndex:0,
+      data: [], silent:true, legendHoverLink:false, tooltip:{ show:false },
+      markLine: {
+        silent:true, symbol:'none', animation:false,
+        lineStyle:{ color:'#c9a227', type:'dashed', width:1.2 },
+        label:{ show:true, position:'insideEndTop', rotate:0, color:'#e6c07b',
+                fontSize:11, backgroundColor:'#1b2130', padding:[2,5],
+                borderRadius:3, formatter: (curView || {}).anchor_label || '' },
+        data: [{ xAxis: curAnchor.date }],
+      },
+    });
+  }
+
+  /* 缩放与十字光标作用在**全部** x 轴上 —— 这一句就是「拖 K 线时间轴、下挂格同步」的本体 */
+  const allX = xAxes.map((_, i) => i);
+  const def = defaultSpan(n);
+  const start = curZoom ? curZoom[0] : def[0];
+  const end = curZoom ? curZoom[1] : def[1];
+
+  return {
+    animation: false,
+    axisPointer: { link: [{ xAxisIndex: 'all' }], label: { backgroundColor: '#3a4863', fontSize: 11 } },
+    tooltip: Object.assign({}, tooltipBase, { confine: true, formatter: tipFormatter }),
+    legend: legends,
+    grid: grids,
+    xAxis: xAxes,
+    yAxis: yAxes,
+    dataZoom: [
+      { type:'inside', xAxisIndex: allX, start, end },
+      { type:'slider', xAxisIndex: allX, height:16, bottom:12,
+        borderColor:'#2a3444', fillerColor:'rgba(75,131,255,.14)',
+        handleStyle:{ color:'#4b83ff' }, textStyle:{ color:'#8b95a9', fontSize:10 } },
+    ],
+    series,
+  };
+}
+
+/* 指标格没有 OHLC，所以表头固定带上 K 线的开高低收 —— 拖到哪一根都看得见形态 */
+function tipFormatter(p){
+  if (!p || !p.length) return '';
+  const i = p[0].dataIndex, r = curRows[i] || {};
+  const head = `<b>${esc(r.trade_date || '')}</b>　开 ${fmt.price(r.open)} 高 ${fmt.price(r.high)} 低 ${fmt.price(r.low)} 收 ${fmt.price(r.close)} (${fmt.pct(r.pct_chg)})`;
+  // 这一根上有哪些策略信号 —— 标记点很小，用文字复述一遍，免得看漏
+  const marks = curSignals.filter(sg => r[sg.f]).map(sg =>
+    `<span style="display:inline-block;margin-left:6px;padding:0 5px;border-radius:3px;` +
+    `font-size:11px;color:#fff;background:${SIG_COLOR[sg.key] || NEUTRAL}">${esc(sg.name)}</span>`).join('');
+  // 这一根是不是高开/低开（开盘形态标记）—— 顺带把开盘涨跌幅报出来，比只看点更清楚。
+  // 取值走**同一份原料**（openAdj.bars 里按 idx 找），不另算一遍。
+  const ob = (((openAdj || {}).bars) || []).find(b => b.idx === i);
+  let openTag = '';
+  if (ob && ob.gap !== null && ob.gap !== undefined) {
+    if (isHighOpen(ob.gap, openThr)) {
+      openTag = `<span style="display:inline-block;margin-left:6px;padding:0 5px;border-radius:3px;` +
+        `font-size:11px;color:#fff;background:${UP}">高开 ${ob.gap.toFixed(2)}%</span>`;
+    } else if (isLowOpen(ob.gap, openThr)) {
+      openTag = `<span style="display:inline-block;margin-left:6px;padding:0 5px;border-radius:3px;` +
+        `font-size:11px;color:#fff;background:${DOWN}">低开 ${ob.gap.toFixed(2)}%</span>`;
+    }
+  }
+  // 这一根上有没有股东增减持公告（K 线顶边那个 ± 标记）—— 标记只有十几像素，
+  // 同样用文字复述一遍，并把同一组公告的明细列出来（明细字段由后端算好）。
+  const tmk = tradeMarksAll().filter(m => m.idx === i);
+  const tradeTags = tmk.map(m =>
+    `<span style="display:inline-block;margin-left:6px;padding:0 5px;border-radius:3px;` +
+    `font-size:11px;color:#fff;background:${m.in_de === 'IN' ? UP : DOWN}">` +
+    `股东${esc(m.dir_text)} ${m.count} 条 · ${esc(m.vol_text)}</span>`).join('');
+  const tradeDetail = tmk.map(m => (m.items || []).map(x =>
+    `<div class="muted">${esc(x.holder_name)}` +
+    (x.holder_type ? '（' + esc(x.holder_type) + '）' : '') +
+    ` ${esc(x.vol_text)} · ${esc(x.ratio_text)}</div>`).join('')).join('');
+  const body = p.filter(x => {
+    const meta = seriesMeta[x.seriesName];
+    return String(x.seriesName).indexOf(GUIDE_PREFIX) !== 0 && !(meta && meta.sig);
+  }).map(x => {    let v = x.value;
+    if (v && typeof v === 'object' && !Array.isArray(v)) v = v.value;
+    const meta = seriesMeta[x.seriesName];
+    let s;
+    if (v === null || v === undefined || (typeof v === 'number' && isNaN(v))) {
+      s = '—';
+    } else if (Array.isArray(v)) {
+      // 蜡烛图的 value 首位是 dataIndex，直接当价格打出来会多一个假数字
+      const arr = (x.seriesType === 'candlestick' && v.length === 5 && v[0] === i) ? v.slice(1) : v;
+      s = arr.map(y => fmt.price(y)).join(' / ');
+    } else {
+      s = (FMT_TOKEN[meta && meta.fmt] || FMT_TOKEN.plain)(v);
+    }
+    return `<div>${x.marker}${esc(x.seriesName)}: ${s}</div>`;
+  }).join('');
+  return head + (marks || openTag || tradeTags
+    ? `<div style="margin-top:2px">${marks}${openTag}${tradeTags}</div>` : '') +
+    tradeDetail + body;
+}
+
+function drawChart(){
+  const { skipped } = pickedGroups();
+  // 固定的成交量格整列没数据时也要报出来 —— 否则「少了一格」没人知道（与下挂格同一句话）
+  const volG = catByKey[VOL_KEY];
+  if (volG && volG.empty) skipped.push(volG.name);
+  $('#st-ind-tag').textContent = skipped.length
+    ? ('本地无 ' + skipped.join('、') + ' 数据，该格已隐藏')
+    : '下挂指标与主轴同步（拖动时间轴一起走）';
+  // 有哪档信号画不出来（未设条件 / 本区间没命中）就写在标题栏，别让图上「少了一档」没人知道
+  const notes = curSignals.filter(sg => sg.note).map(sg => sg.name + '：' + sg.note);
+  const st = $('#st-sig-tag');
+  st.style.display = notes.length ? '' : 'none';
+  st.textContent = notes.join('；');
+  const c = mkChart('#chart-stock', buildOption());
+  if (c && !c.__smBound) {
+    c.__smBound = true;
+    // 切指标时 setOption 会把 dataZoom 重置回默认窗口，先记住当前窗口再续上
+    c.on('dataZoom', () => {
+      const z = (c.getOption().dataZoom || [])[0];
+      if (z && typeof z.start === 'number') curZoom = [z.start, z.end];
+    });
+  }
+  return c;
+}
+
+function renderTable(){
+  const rows = curRows.slice(-60).reverse();
+  $('#st-table').innerHTML = `<table class="data"><thead><tr>
+    <th>日期</th><th class="num">开</th><th class="num">高</th><th class="num">低</th><th class="num">收</th>
+    <th class="num">涨跌幅</th><th class="num">BOLL下轨</th><th class="num">MA5</th><th class="num">RSI6</th>
+    <th class="num">K/D/J</th><th>选股</th><th>买入触发</th><th>卖出信号</th></tr></thead><tbody>
+    ${rows.map(x=>`<tr>
+      <td class="mono small">${esc(x.trade_date)}</td>
+      <td class="num">${fmt.price(x.open)}</td><td class="num">${fmt.price(x.high)}</td>
+      <td class="num">${fmt.price(x.low)}</td><td class="num">${fmt.price(x.close)}</td>
+      <td class="num ${fmt.cls(x.pct_chg)}">${fmt.pct(x.pct_chg)}</td>
+      <td class="num">${fmt.price(x.boll_lower)}</td><td class="num">${fmt.price(x.ma5)}</td>
+      <td class="num">${x.rsi6===null?'—':Number(x.rsi6).toFixed(1)}</td>
+      <td class="num small">${x.kdj_k===null?'—':Number(x.kdj_k).toFixed(0)+'/'+Number(x.kdj_d).toFixed(0)+'/'+Number(x.kdj_j).toFixed(0)}</td>
+      <td>${x.entry?'<span class="tag g">✔</span>':''}</td>
+      <td>${x.buy_trigger?'<span class="tag b">✔</span>':''}</td>
+      <td>${x.sell_signal?'<span class="tag r">✔</span>':''}</td>
+      </tr>`).join('')}</tbody></table>`;
+}
+
+/* ---- 查询框的「股票候选」下拉 --------------------------------------------------
+   输入名称（或代码前缀）时列出候选，点一条就填进去并查询 —— 它只是**加快输入**。
+
+   ⚠ 「输名称也能查」这件事本身在后端（`market.resolve_stock`，唯一实现）：
+     直接按回车、或者输入框里留着一只多义词，都由后端给结果/报错 —— 这个下拉不是
+     那条路的前置条件，删了它照样能按名称查（只是重名那几只不好挑）。
+   ⚠ 键盘只留「查询条件」卡上那一个监听器（回车 = 查询、Esc = 把这个下拉收起）：
+     逐框绑迟早漏一个，绑 document 又会劫持 K 线卡上的回车 —— 两条都踩过。
+     这里只绑输入框自己的 input。 */
+const sugBox = $('#st-suggest');
+let sugSeq = 0, sugTimer = null;   // sugSeq：连打时**丢掉过期响应**（后发的先回就串了）
+
+function sugHide(){ sugBox.innerHTML = ''; sugBox.style.display = 'none'; }
+
+function sugDraw(list){
+  // **只有 2 条以上才弹**：命中的唯一时后端能直接认（回车就查到了），
+  // 弹一条反而挡住下面的按钮。这个下拉的定位是**消歧**，不是"搜索框随便配一个"。
+  if (!list || list.length < 2) return sugHide();
+  sugBox.innerHTML = '<div class="stk-sug-list">' + list.slice(0, 8).map(x =>
+    '<div class="stk-sug-row" data-code="' + esc(x.ts_code) + '">' +
+      '<span class="n">' + esc(x.name || '') + '</span>' +
+      '<span class="c">' + esc(x.ts_code) + '</span>' +
+      '<span class="d">' + esc(x.industry || '') + '</span>' +
+    '</div>').join('') + '</div>';
+  sugBox.style.display = '';
+  sugBox.querySelectorAll('.stk-sug-row').forEach(el => {
+    el.onclick = () => {
+      $('#st-code').value = el.getAttribute('data-code');
+      sugHide();
+      $('#btn-load').click();      // 与回车同一条路：防连点共用同一道 guardClick
+    };
+  });
+}
+
+async function sugFetch(q){
+  const seq = ++sugSeq;
+  let list = [];
+  try { list = (await apiGet('/api/stock/search?q=' + encodeURIComponent(q))) || []; }
+  catch (e) { list = []; }         // 搜索接口挂了就当没有候选，输入框与查询照常
+  if (seq !== sugSeq) return;
+  sugDraw(list);
+}
+
+$('#st-code').addEventListener('input', () => {
+  const q = $('#st-code').value.trim();
+  clearTimeout(sugTimer);
+  // 已经是完整代码（600519 / 600519.SH）就别弹了：这时用户是「输完了」，
+  // 再列一串 6005xx 只会挡住按钮
+  if (!q || /^\d{6}(\.(SH|SZ|BJ))?$/i.test(q)) return sugHide();
+  sugTimer = setTimeout(() => sugFetch(q), 260);
+});
+document.addEventListener('click', e => {
+  if (e.target.closest && (e.target.closest('#st-suggest') || e.target === $('#st-code'))) return;
+  sugHide();
+});
+
+$('#btn-load').onclick = guardClick($('#btn-load'), load);
+// 「AI 分析」：把这一页当前这只、以及页面上算出来的收盘/涨跌幅交给**内联卡片**
+// （window.aiInline，见 static/js/ai.js）。这里**不弹窗、不传模板/模型** ——
+// 用默认语句模板 + 当前生效的那条模型配置直接开跑，回答流式写进下面的卡片。
+// （要挑这次的模板/模型请去「今日选股」结果表的弹窗，或「模型设置」页改默认。）
+function aiPayload(){
+  const m = curMeta || {};
+  const s = strategiesById()[$('#st-strategy').value];
+  return { ts_code: m.ts_code || $('#st-code').value.trim(), name: m.name || '',
+           industry: m.industry || '', trade_date: m.trade_date || '',
+           source: 'stock', strategy: (s && s.name) || '',
+           close: m.close, pct_chg: m.pct_chg };
+}
+$('#btn-ai').onclick = guardClick($('#btn-ai'), () => {
+  const p = aiPayload();
+  if (!p.ts_code) return toast('先查询一只股票，再点 AI 分析', 'warn');
+  if (!window.aiInline) return toast('AI 脚本没加载上，刷新页面再试', 'err');
+  window.aiInline.run(p);
+});
+// 回车 = 点那个「查询」按钮（2026-10-10 需求）：在**整张「查询条件」卡**里按回车都算，
+// 不是只有代码框 —— 改完「K线根数」、选完策略/周期，手不用离开键盘。
+// ⚠ 走**按钮那条路**（`#btn-load.click()`）而不是直接调 `load()`：这样「查询中」时回车
+//   和点按钮一样被 guardClick 挡住，两条入口共用同一道防连点，不会一条收紧一条漏。
+// ⚠ 绑在**卡**上而不是逐个框绑：卡里还有两个下拉（策略/周期），逐框绑迟早漏一个；
+//   也别绑到 document —— 焦点在下挂指标/高开幅度那些控件上时，回车不该跑去查询。
+// ⚠ 焦点在按钮上时交给浏览器原生点击（否则一次回车 = 原生 + 我们各点一下）。
+// ⚠ Esc 也归这里：把「股票候选」下拉收起来（`sugHide` 是函数声明，提升得到）。
+//   收在下拉自己身上就得在代码框上再绑一个 keydown —— 那张卡上的键盘入口**只留这一个**。
+$('#st-card-query').addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') return sugHide();
+  if (e.key !== 'Enter') return;
+  const t = e.target;
+  if (t && t.closest && t.closest('button')) return;
+  e.preventDefault();
+  $('#btn-load').click();
+});
+// 卡片右下角「历史回复」：列出这只票以前的分析，点某条就把正文摆进卡片。
+// 没有历史时它是 disabled（title 里写了原因），所以这里不用再判一次。
+$('#ai-card-hist').onclick = guardClick($('#ai-card-hist'), () => {
+  const p = aiPayload();
+  if (!p.ts_code) return toast('先查询一只股票', 'warn');
+  if (window.aiInline) window.aiInline.history(p);
+});
+$('#st-ind-a').addEventListener('change', drawChart);
+$('#st-ind-b').addEventListener('change', drawChart);
+// 周期要重新取数（周K是另一份面板），所以直接重查；与「切下挂指标只重画」不同。
+$('#st-freq').addEventListener('change', () => { freqTouched = true; load(); });
+// 下拉与分段按钮是一个状态源的两个入口：下拉动了按钮要跟上（按钮那边在 setFreq 里做）。
+$('#st-freq').addEventListener('change', paintFreqSeg);
+// 分段按钮**不锁** guardClick：与旁边那个周期下拉保持一致，来回点两下比对日线/周线是正常操作。
+$$('#st-freq-seg button').forEach(b => b.onclick = () => setFreq(b.dataset.f));
+// 换策略只把周期拨到它的口径上，**不自动查询** —— 查不查由用户点按钮决定。
+$('#st-strategy').addEventListener('change', () => { if (!freqTouched) syncFreqFromStrategy(); });
+
+/* ---- 高开/低开幅度：**即时重算**，不发请求（2026-10-09 需求）--------------
+   输入框与 1%/3%/5% 快捷按钮改的都是 `openThr` 这一个状态源（applyOpenThr）：
+   立刻重算四格概率 + 重画图上标记。
+   · `input` 事件（每敲一下/每按一次上下箭头都触发）→ 即时反馈；值越界先不收，
+     等 `change`（失焦/回车）时才夹回边界 —— 否则用户想输 "15" 敲了 "1" 就被夹成边界。
+   · 快捷按钮**不套 guardClick**：本地瞬时计算，连点两下是正常操作（C38 同款判断）。 */
+$('#st-open-pct').addEventListener('input', (e) => {
+  const v = Number(e.target.value);
+  if (isFinite(v)) applyOpenThr(v, false);
+});
+$('#st-open-pct').addEventListener('change', (e) => {
+  applyOpenThr(e.target.value, true);        // 失焦时把越界值夹回 [min,max] 并回显
+});
+$$('#st-open-seg button').forEach(b => b.onclick = () => applyOpenThr(b.dataset.t, true));
+
+document.addEventListener('DOMContentLoaded', async () => {
+  // 预览模式：表单与策略下拉都被藏起来了，参数全在 URL 上，直接查。
+  // 周期先落进 `#st-freq` —— 分段按钮的选中态、以及之后切周期，用的都是这一个值。
+  if (EMBED) {
+    const f0 = new URLSearchParams(location.search).get('freq');
+    if (f0 === 'weekly' || f0 === 'daily') $('#st-freq').value = f0;
+    paintFreqSeg();
+    load();
+    return;
+  }
+  strategies = await apiGet('/api/strategies');
+  fillSelect($('#st-strategy'), strategies.map(s=>({id:s.id,label:s.name})), 'id', 'label');
+  const qs = new URLSearchParams(location.search);
+  if (qs.get('strategy_id')) $('#st-strategy').value = qs.get('strategy_id');
+  syncFreqFromStrategy();
+  if (qs.get('freq') === 'weekly' || qs.get('freq') === 'daily') {
+    $('#st-freq').value = qs.get('freq');
+    freqTouched = true;
+  }
+  load();
+});
+
+/* 探针专用钩子（只给验证脚本引用，页面逻辑不依赖） */
+window.__stDebug = {
+  option: () => buildOption(),
+  catalog: () => curCatalog,
+  pal: () => PAL,
+  fmtTokens: () => Object.keys(FMT_TOKEN),
+  picked: () => pickedGroups(),
+  rows: () => curRows,
+  fund: () => curFund,
+  perf: () => curPerf,
+  signals: () => curSignals,
+  // 贴价偏移常量（`SIG_OFF`）。探针用它核对「图上每条 series 的 symbolOffset 真的按它来」——
+  // ⚠ 别让探针去硬编码 15/6：偏移量只有 `SIG_OFF` 一处定义（2026-10-11）。
+  sigOff: () => SIG_OFF,
+  view: () => curView,
+  anchor: () => curAnchor,
+  span: (n) => defaultSpan(n),      // 默认显示窗口（探针用它查「查询日落在窗口里」）
+  chips: () => curChips,
+  concepts: () => curConcepts,
+  cptList: (i, limit) => openConceptStocks(i, limit),   // 等价于双击第 i 个概念标签
+  cptState: () => cptState,                             // 探针轮询它等数据回齐
+  strategies: () => strategies,
+  aiPayload: () => aiPayload(),     // 探针用它核对「AI 分析」带出去的参数
+  openstat: () => curOpenstat,      // 探针用它核对「四格 vs 后端」与即时重算
+  openThr: () => openThr,           // 当前阈值（探针改它 / 读它）
+  setOpenThr: (v, clamp) => applyOpenThr(v, clamp),   // 等价于用户改幅度
+  calcOpen: (t) => calcOpenStat(t === undefined ? openThr : t),  // 前端即时重算的结果
+  openMarks: () => openMarkSeries(),                    // 图上高开/低开标记的数据点
+  tradeMarks: () => tradeMarkSeries(),                  // K 线顶边的增减持 ± 标记数据点
+  meta: () => curMeta,      // 「这一只」= 后端解析出来的（输名称时用它验真解析成了代码）
+  sugRows: () => (sugBox.querySelectorAll('.stk-sug-row') || []).length,  // 候选下拉当前几条
+  status: () => $('#st-status'),        // 查询状态区（探针读它的文字/类名验「报错与加载」）
+  statusText: () => ($('#st-status') || {}).textContent || '',
+  statusKind: () => {                   // '' / 'loading' / 'error' / 'empty'（按 class 判）
+    const b = $('#st-status') && $('#st-status').querySelector('.box-st');
+    if (!b) return '';
+    return ['loading', 'error', 'empty'].filter(k => b.classList.contains(k))[0] || '';
+  },
+};
+</script>
+{% endblock %}

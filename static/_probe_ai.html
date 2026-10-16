@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>probe · AI 分析</title></head>
+<body>
+<!--
+  AI 分析探针（给 tools/verify_ai.py 用）。
+
+  为什么用 iframe：`aiInline` / `aiAnalyze`（static/js/ai.js）、诊断页的 `#btn-ai`、
+  今日选股结果表的 `[data-ai]` 都是真页面上的东西，抄一份就等于测了个假的。这里把
+  **真页面**挂进同源 iframe，真点按钮、真读后端的流，再读它真渲染出来的 DOM。
+
+  ⚠ iframe.src 必须用 JS 赋值（写死在标签上会在脚本跑之前 load 完，监听挂不上去）。
+  ⚠ 探针不自带假模型：它打的是**后端当前配置**的那个模型地址
+    （verify_ai.py 会先把配置指到自己起的假模型服务上，所以这里能断言「假模型」四个字）。
+
+  ## 结果怎么回传（别再用 `--dump-dom` + `--virtual-time-budget`）
+
+  虚拟时间会把预算飞快烧完（定时器照跑）而网络流还在慢慢来 → 提前 dump，
+  卡片还停在「正在提交…」，于是「流式到底有没有出内容」被验成假红（实测踩过）。
+  改成**回传**：每记一条就 `POST` 给宿主机上那个 sink（verify_ai.py 起的 ThreadingHTTPServer），
+  真实时间里等多久都行。`mode:'no-cors'` 是简单请求，没有预检。
+-->
+<iframe id="f1" style="width:1500px;height:800px;border:0"></iframe>
+<iframe id="f2" style="width:1500px;height:800px;border:0"></iframe>
+<pre id="out">running</pre>
+<script>
+const SINK = new URLSearchParams(location.search).get('sink');
+const RES = [];
+
+function ok(name, cond, extra) {
+  RES.push({ name, ok: !!cond, extra: extra === undefined ? '' : String(extra) });
+  report(false);
+}
+function report(doneFlag, err) {
+  const body = JSON.stringify({ res: RES, done: !!doneFlag, error: err || null });
+  document.getElementById('out').textContent = body;
+  if (!SINK) return;
+  const url = 'http://127.0.0.1:' + SINK + '/';
+  try {
+    if (navigator.sendBeacon) navigator.sendBeacon(url, body);
+    else fetch(url, { method: 'POST', mode: 'no-cors', body });
+  } catch (e) { /* 回传失败不该掩盖探针自己的结论：<pre> 里还有一份 */ }
+}
+function dump(msg) { report(true, msg); }
+
+const tick = (ms) => new Promise(r => setTimeout(r, ms === undefined ? 80 : ms));
+
+function loaded(fr) {
+  return new Promise(res => fr.addEventListener('load', () => res(), { once: true }));
+}
+
+async function waitFor(fn, budget, step) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < (budget || 20000)) {
+    try { const v = await fn(); if (v) return v; } catch (e) { /* 还没准备好 */ }
+    await tick(step || 150);
+  }
+  return null;
+}
+
+/* 今日选股结果表要的那份假结果（形状 = /api/screen/run 的返回） */
+function fakeRes() {
+  return {
+    trade_date: '2026-09-18', scanned: 300, count: 1, returned: 1,
+    strategy_name: '探针策略', universe: '全部A股', timeframe: 'daily',
+    extra_cols: [{ key: 'ma5', label: 'MA5', dec: 2, color: '', fmt: 'num' }],
+    items: [{
+      ts_code: '601872.SH', name: '招商轮船', industry: '航运', close: 12.34, pct_chg: 3.21,
+      amount: 1234567.0, turnover_rate: 1.85, total_mv: 12345678.0, mf_main_net: 2345.6,
+      score: 12.3, ma5: 12.0, detail: { conditions: [], values: {} },
+    }],
+  };
+}
+
+/* ===========================================================================
+   一、个股诊断页：点「AI 分析」→ **不弹窗**，正文流进「查询条件」下面那张卡片
+   =========================================================================== */
+async function step1_stock() {
+  const f1 = document.getElementById('f1');
+  f1.src = '/stock/000001.SZ';
+  await loaded(f1);
+  const w = f1.contentWindow, d = f1.contentDocument;
+  const rows = await waitFor(
+    () => (w.__stDebug && w.__stDebug.rows && w.__stDebug.rows().length) ? w.__stDebug.rows() : null,
+    25000);
+  ok('诊断页把行情拉回来了（探针在真页面上跑）', !!rows, rows ? rows.length + ' 根' : '超时');
+
+  ok('页面上有「AI 分析」按钮', !!d.querySelector('#btn-ai'));
+  const p = (w.__stDebug && w.__stDebug.aiPayload) ? w.__stDebug.aiPayload() : {};
+  ok('aiPayload 带齐 代码/名称/查询日/收盘/涨跌幅',
+     !!(p.ts_code && p.name && p.trade_date && p.close !== null && p.pct_chg !== null),
+     JSON.stringify(p).slice(0, 130));
+
+  /* 需求原话：「分析结果就在查询条件卡片下新增一个卡片展示AI的最新回复」 */
+  const order = Array.from(d.querySelectorAll('.card[id]')).map(e => e.id);
+  const iq = order.indexOf('st-card-query'), ia = order.indexOf('st-card-ai');
+  ok('「查询条件」卡片下面就是 AI 卡片（结果长在同一页里）',
+     iq >= 0 && ia > iq, '卡片顺序：' + order.join(' > ').slice(0, 120));
+  ok('而且**紧挨着**查询条件卡（就是「下面新增一张卡」，没被别的东西隔开）',
+     (d.querySelector('#st-card-query') || {}).nextElementSibling
+       === d.querySelector('#st-card-ai'),
+     '下一张=' + (((d.querySelector('#st-card-query') || {}).nextElementSibling || {}).id || '（无）'));
+  ok('卡片入口挂在 window.aiInline（诊断页专用，不弹窗）',
+     !!w.aiInline && typeof w.aiInline.run === 'function'
+     && typeof w.aiInline.history === 'function');
+  ok('卡片里有输出区 / 状态标签 / 元信息 / 右下角「历史回复」按钮',
+     !!d.querySelector('#ai-card-out') && !!d.querySelector('#ai-card-tag')
+     && !!d.querySelector('#ai-card-meta') && !!d.querySelector('#ai-card-hist'));
+  /* 需求原话：「如果之前分析过的话」才给看历史 —— 所以验的是**关系**而不是某一刻的初值：
+     等进页面那次历史请求落地，按钮的可用性必须等于「这只票到底有没有历史」。
+     （直接断言「一进页面就是灰的」会假红：库里已经有记录时，请求一回来它就亮了。） */
+  await tick(1500);
+  const his = await (await fetch('/api/ai/analysis?limit=20&ts_code='
+    + encodeURIComponent(p.ts_code))).json();
+  const nHis = (his.data || []).length;
+  ok('「历史回复」的可用性 = 这只票有没有历史（有就能点、没有才灰）',
+     d.querySelector('#ai-card-hist').disabled === (nHis === 0),
+     '库里 ' + nHis + ' 条，按钮 disabled=' + d.querySelector('#ai-card-hist').disabled);
+  /* 「卡片展示 AI 的最新回复」：有历史时这里就该是**那条回复的正文**（不是空壳、
+     也不是一句「还没有分析过」）；没历史才摆空状态。meta 里要能看出这是历史那条。 */
+  const outTxt0 = (d.querySelector('#ai-card-out').textContent || '').trim();
+  ok('页面加载完卡片里就有东西（不是空壳）', outTxt0.length > 6, outTxt0.slice(0, 46));
+  if (nHis > 0) {
+    ok('有历史 → 摆的是**最新一条**回复，且 meta 里标了出处',
+       /最新一条历史/.test((d.querySelector('#ai-card-meta') || {}).textContent || '')
+       && outTxt0.length > 6,
+       (d.querySelector('#ai-card-meta') || {}).textContent);
+  } else {
+    ok('没历史 → 摆的是「还没有分析过」的提示（不是空白）',
+       /还没有分析过/.test(outTxt0), outTxt0.slice(0, 40));
+  }
+
+  d.querySelector('#btn-ai').click();
+  ok('点「AI 分析」**不弹窗**（整页没有 .modal-bg / .modal / .mask）',
+     d.querySelectorAll('.modal-bg, .modal, .mask').length === 0,
+     d.querySelectorAll('.modal-bg, .modal, .mask').length + ' 个遮罩/弹窗');
+  /* 立刻看（不能 await：假模型几十毫秒就跑完，等一下就恢复了 —— 那就验不到「防连点」） */
+  ok('点了之后按钮当场变「分析中…」（防连点）',
+     /分析中/.test((d.querySelector('#btn-ai') || {}).textContent || ''),
+     (d.querySelector('#btn-ai') || {}).textContent);
+
+  const out = await waitFor(() => {
+    const e = d.querySelector('#ai-card-out');
+    return (e && /假模型/.test(e.textContent)) ? e.textContent : null;
+  }, 60000);
+  ok('卡片里真出内容了（流式边收边画，不是等一个同步响应）',
+     !!out, (out || '').slice(0, 46));
+  const metaTxt = (d.querySelector('#ai-card-meta') || {}).textContent || '';
+  ok('卡片标了模板与模型', /模型/.test(metaTxt) && /模板/.test(metaTxt), metaTxt.slice(0, 70));
+  ok('跑完打了状态标签', (d.querySelector('#ai-card-tag') || {}).style.display !== 'none'
+     && !!(d.querySelector('#ai-card-tag') || {}).textContent,
+     (d.querySelector('#ai-card-tag') || {}).textContent);
+  ok('跑完之后按钮恢复可点', d.querySelector('#btn-ai').disabled === false);
+  ok('跑完之后「历史回复」按钮变可点（刚跑完就多了一条）',
+     d.querySelector('#ai-card-hist').disabled === false);
+
+  /* 需求原话：「卡片右下角添加按钮可点击查看之前回复」 */
+  const tH = Date.now();
+  d.querySelector('#ai-card-hist').click();
+  const hm = await waitFor(() => {
+    const bg = d.querySelector('.modal-bg');
+    return (bg && bg.querySelectorAll('table.data tbody tr').length) ? bg : null;
+  }, 40000);
+  const msH = Date.now() - tH;
+  ok('点「历史回复」列出这只票的历史记录（读 MySQL）', !!hm,
+     hm ? hm.querySelectorAll('table.data tbody tr').length + ' 条（' + msH + 'ms 出来）'
+        : '没弹出来 / 没数据（' + msH + 'ms）');
+  /* ⚠ 这条盯的是「流刚跑完，紧接着的那个请求会不会卡死」——Werkzeug 把 chunked 的 SSE
+     连接留在池里复用时踩过：服务端连请求行都读不到，页面上就是「分析完点历史一直转圈」。
+     修法是 SSE 响应显式 `Connection: close`。这里要的是**快**，不是「最终能出来」。 */
+  ok('流刚跑完，紧接着的请求不卡（历史表 5s 内就出来）', !!hm && msH < 5000, msH + 'ms');
+  const hx = hm && hm.querySelector('.modal-head [data-close]');
+  if (hx) hx.click();
+  ok('关掉历史弹窗后不留残壳', !d.querySelector('.modal-bg'));
+  return p;
+}
+
+/* ===========================================================================
+   二、今日选股结果表：仍然走弹窗（这边要能挑「这次用哪条模板 / 哪条配置」）
+   =========================================================================== */
+async function step2_screen() {
+  const f2 = document.getElementById('f2');
+  f2.src = '/screen';
+  await loaded(f2);
+  const w = f2.contentWindow, d = f2.contentDocument;
+  await waitFor(() => Array.isArray(w.__strategies), 15000);
+  w.__strategies = [{ id: 999, name: '探针策略', config: {} }];
+  w.renderResult(fakeRes());
+
+  const ths = Array.from(d.querySelectorAll('#sc-result thead th'));
+  const last = ths.length ? ths[ths.length - 1].textContent.trim() : '';
+  ok('结果表最后一列表头是「操作」', last === '操作', '实际：' + (last || '（无）'));
+  const btn = d.querySelector('#sc-result [data-ai]');
+  ok('每行「操作」里有 AI分析 按钮', !!btn);
+  if (!btn) return;
+
+  btn.click();
+  const open = await waitFor(() => d.querySelector('.modal-bg #ai-out'), 8000);
+  ok('列表这边仍然是弹窗（能挑这次的模板与模型）', !!open);
+  ok('弹窗里有模板下拉与「开始分析」按钮',
+     !!d.querySelector('.modal-bg #ai-tpl') && !!d.querySelector('.modal-bg #ai-run'));
+
+  /* 模型下拉：列的是设置页配的那几条，默认停在「当前」那条；
+     换它只影响这一次分析 —— **不许**顺手把全局默认改掉。
+     ⚠ 选项是弹窗建好之后异步填的（要等一次 /api/ai/config），所以先等它有内容。 */
+  const prof = d.querySelector('.modal-bg #ai-prof');
+  await waitFor(() => (prof && prof.options.length) ? true : null, 8000);
+  const opts = prof ? Array.from(prof.options) : [];
+  ok('弹窗里有模型下拉（列的是设置页配的那几条）', opts.length >= 1,
+     opts.map(o => o.textContent).join(' / ').slice(0, 90));
+  const cfg0 = (await (await fetch('/api/ai/config')).json()).data || {};
+  ok('模型下拉默认停在「当前」那条', !!prof && String(prof.value) === String(cfg0.active_id),
+     'sel=' + (prof ? prof.value : '-') + ' active=' + cfg0.active_id);
+  if (opts.length > 1) {
+    const other = opts.find(o => o.value !== String(cfg0.active_id));
+    prof.value = other.value;
+    prof.dispatchEvent(new Event('change'));
+    await tick(200);
+    const cfg1 = (await (await fetch('/api/ai/config')).json()).data || {};
+    ok('换下拉**不改**全局默认（改默认是设置页「设为当前」的事）',
+       String(cfg1.active_id) === String(cfg0.active_id),
+       'active 还是 ' + cfg1.active_id + '，提示='
+       + (d.querySelector('.modal-bg #ai-note') || {}).textContent);
+    prof.value = String(cfg0.active_id);
+    prof.dispatchEvent(new Event('change'));
+  }
+
+  const out = await waitFor(() => {
+    const e = d.querySelector('.modal-bg #ai-out');
+    return (e && /假模型/.test(e.textContent)) ? e.textContent : null;
+  }, 60000);
+  ok('弹窗里点一次就真跑通模型（流式出正文）', !!out, (out || '').slice(0, 46));
+  const metaTxt = (d.querySelector('.modal-bg #ai-meta') || {}).textContent || '';
+  ok('弹窗标了模板与模型', /模型/.test(metaTxt) && /模板/.test(metaTxt), metaTxt.slice(0, 70));
+
+  const tH2 = Date.now();
+  const hist = await waitFor(() => {
+    const t = d.querySelectorAll('.modal-bg #ai-hist tbody tr');
+    return t.length ? t : null;
+  }, 40000);
+  const msH2 = Date.now() - tH2;
+  ok('弹窗列出历史记录（读 MySQL）', !!hist, hist ? hist.length + ' 条（' + msH2 + 'ms）' : '0 条（' + msH2 + 'ms）');
+  ok('（同一条防线）流完之后的请求也不卡（8s 内出来）', !!hist && msH2 < 8000, msH2 + 'ms');
+
+  const bg = d.querySelector('.modal-bg');
+  const x = bg && bg.querySelector('.modal-head [data-close]');
+  if (x) x.click();
+  ok('关掉弹窗后遮罩被移除（不留残壳）', !d.querySelector('.modal-bg'));
+
+  const rec = await waitFor(async () => {
+    const r = await (await fetch('/api/ai/analysis?limit=5')).json();
+    const rows = (r.data || []).filter(x => x.source === 'screen');
+    return rows.length ? rows[0] : null;
+  }, 20000);
+  ok('发出去的记录 = 列表这一行（代码/名称对得上）',
+     !!rec && rec.ts_code === '601872.SH' && rec.name === '招商轮船',
+     rec ? rec.ts_code + ' ' + rec.name + ' src=' + rec.source : '没找到 screen 来源的记录');
+}
+
+async function step3_settings() {
+  /* 设置页的「模型配置」卡：真打开真页面，验列表渲染出来了、编辑区停在哪条、
+     两个纯前端按钮（新建 / 按预设填默认值）有没有反应。
+     ⚠ 全程**不点保存**（不落库），只验界面 —— 接口那一套在【2】【3】里已经验过。 */
+  const f3 = document.createElement('iframe');
+  f3.style.cssText = 'width:1500px;height:900px;border:0';
+  document.body.appendChild(f3);
+  f3.src = '/settings';
+  await loaded(f3);
+  const d = f3.contentDocument;
+  const rows = await waitFor(() => {
+    const t = d.querySelectorAll('#prof-list tbody tr');
+    return t.length ? t : null;
+  }, 20000);
+  ok('设置页把模型配置列表渲染出来了（脚本没在运行时报错）', !!rows,
+     rows ? rows.length + ' 条' : '还停在「加载中」——多半是页面脚本抛了');
+  ok('设置页顶部写明「当前使用」哪条',
+     /当前使用/.test((d.querySelector('#ai-status') || {}).textContent || ''),
+     ((d.querySelector('#ai-status') || {}).textContent || '').slice(0, 56));
+  const nm = (d.querySelector('#prof-name') || {}).value || '';
+  ok('编辑区默认停在「当前」那条上（字段是填好的）', !!nm, nm);
+  ok('列表里能看出哪条是当前',
+     /当前/.test((d.querySelector('#prof-list') || {}).textContent || ''));
+
+  const nb = d.querySelector('#btn-new-prof');
+  if (nb) {
+    nb.click();
+    await tick(150);
+    ok('点「新建配置」→ 表单清空并提示「新建配置」',
+       !((d.querySelector('#prof-name') || {}).value || '')
+       && /新建/.test((d.querySelector('#prof-hint') || {}).textContent || ''));
+  }
+  const rs = d.querySelector('#btn-reset-preset');
+  const sel = d.querySelector('#ai-preset');
+  if (rs && sel) {
+    sel.value = 'ollama';
+    sel.dispatchEvent(new Event('change'));
+    rs.click();
+    await tick(150);
+    ok('「按预设填默认值」把地址与模型名填回表单（纯前端，不落库）',
+       !!(d.querySelector('#ai-base') || {}).value && !!(d.querySelector('#ai-model') || {}).value,
+       ((d.querySelector('#ai-base') || {}).value || ''));
+  }
+}
+
+(async () => {
+  try {
+    await step1_stock();
+    await step2_screen();
+    await step3_settings();
+    dump();
+  } catch (e) {
+    dump(String(e && e.stack ? e.stack : e).slice(0, 400));
+  }
+})();
+</script>
+</body>
+</html>

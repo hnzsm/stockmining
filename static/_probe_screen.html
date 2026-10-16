@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>probe · 选股结果表</title></head>
+<body>
+<!--
+  选股结果表探针（给 tools/verify_screen_ui.py 用）。
+
+  为什么用 iframe 而不是把逻辑抄一遍：`renderResult` / `colText` / `csvLines` 都是
+  screen.html 里的内联脚本，抄一份就等于测了个假的。这里把**真页面**挂进同源 iframe，
+  喂一份构造好的结果调它的真函数，再读它真渲染出来的 DOM。
+
+  ⚠ iframe.src 必须用 JS 赋值：写死在标签上会在脚本跑之前就 load 完，
+    下面的 load 监听挂不上去（本项目踩过）。
+-->
+<iframe id="f" style="width:1500px;height:900px;border:0"></iframe>
+<pre id="out">running</pre>
+<script>
+const RES = [];
+function ok(name, cond, extra) { RES.push({ name, ok: !!cond, extra: extra === undefined ? '' : String(extra) }); }
+function dump(msg) {
+  document.getElementById('out').textContent =
+    JSON.stringify(msg ? { error: msg, res: RES } : { res: RES }, null, 1);
+}
+
+/* 构造一份结果：extra_cols 就是后端 `indicators.col_spec` 的产出形状 */
+function fakeRes() {
+  return {
+    trade_date: '2026-09-16', scanned: 300, count: 2, returned: 2,
+    strategy_name: '筹码验证', universe: '沪深300', timeframe: 'daily',
+    extra_cols: [
+      { key: 'hold_num', label: '股东户数',    dec: 0, color: '',       fmt: 'int' },
+      { key: 'hold_chg', label: '户数环比%',   dec: 2, color: 'updown', fmt: 'pct' },
+      { key: 'rz_net5',  label: '5日融资净额万', dec: 2, color: 'updown', fmt: 'big' },
+      { key: 'ht_net30', label: '30日净增持万', dec: 2, color: 'updown', fmt: 'big' },
+      { key: 'ma5',      label: 'MA5',        dec: 2, color: '',       fmt: 'num' },
+      { key: 'open',     label: '开盘',       dec: 2, color: '',       fmt: 'price' },
+    ],
+    items: [
+      { ts_code: '601872.SH', name: '招商轮船', industry: '航运', close: 12.34, pct_chg: 3.21,
+        amount: 1234567.0, turnover_rate: 1.85, total_mv: 12345678.0, mf_main_net: 2345.6,
+        score: 66702.9181,
+        hold_num: 119876, hold_chg: 5.2939, rz_net5: 66702.9181, ht_net30: -320.5,
+        ma5: 19.4295, open: 11.9,
+        detail: { conditions: [
+            { group: '选股条件', expr: 'hold_num > 0', ok: true, error: null },
+            { group: '买入触发', expr: 'open > 0', ok: true, error: null }],
+          values: { close: 12.34, hold_num: 119876, hold_chg: 5.2939, rz_net5: 66702.9181,
+                    ma5: 19.4295 } } },
+      { ts_code: '000001.SZ', name: '平安银行', industry: '银行', close: 11.1, pct_chg: -1.2,
+        amount: 888888.0, turnover_rate: 0.9, total_mv: 22222222.0, mf_main_net: -100.0,
+        score: 1.5,
+        hold_num: null, hold_chg: 0, rz_net5: null, ht_net30: 0, ma5: null, open: 11.2,
+        detail: { conditions: [], values: { hold_num: null } } },
+    ],
+  };
+}
+
+/* 等一拍：runScreen 是 async 的（点完按钮要等 apiPost 的回调落下来） */
+const tick = (ms) => new Promise(r => setTimeout(r, ms === undefined ? 80 : ms));
+
+async function run() {
+  const f = document.getElementById('f');
+  const w = f.contentWindow, d = f.contentDocument;
+  ok('iframe 里确实加载了 /screen（有 #sc-result）', !!d.getElementById('sc-result'));
+  ok('renderResult / colText / csvLines 是页面上的全局函数（探针调的就是真代码）',
+     typeof w.renderResult === 'function' && typeof w.colText === 'function'
+     && typeof w.csvLines === 'function');
+
+  w.renderResult(fakeRes());
+
+  const ths = [...d.querySelectorAll('#sc-result thead th')];
+  const heads = ths.map(t => t.textContent.trim());
+  const labels = ['股东户数', '户数环比%', '5日融资净额万', '30日净增持万', 'MA5', '开盘'];
+  const at = labels.map(l => heads.indexOf(l));
+  ok('表头按后端 extra_cols 出列、且顺序一致（条件里先出现的排前面）',
+     at.every(i => i > 0) && at.join(',') === at.slice().sort((a, b) => a - b).join(','),
+     heads.join(' | '));
+  ok('表头带 title=字段名（悬停能看到条件里该写哪个词）',
+     labels.every((l, i) => ths[at[i]].getAttribute('title') ===
+                   ['hold_num', 'hold_chg', 'rz_net5', 'ht_net30', 'ma5', 'open'][i]),
+     ths[at[0]] && ths[at[0]].getAttribute('title'));
+  ok('固定列仍在（收盘/涨跌幅/评分…），没被挤掉', heads.includes('收盘') && heads.includes('评分'));
+
+  const cell = (row, key) => {
+    const i = heads.indexOf(labels[['hold_num', 'hold_chg', 'rz_net5', 'ht_net30', 'ma5', 'open']
+      .indexOf(key)]);
+    return d.querySelectorAll('#sc-result tbody tr')[row].children[i];
+  };
+  const c0 = (k) => cell(0, k), c1 = (k) => cell(1, k);
+
+  ok('户数按整数千分位（fmt=int，不显示小数）', c0('hold_num').textContent.trim() === '119,876',
+     c0('hold_num').textContent.trim());
+  ok('环比 % 带正号（fmt=pct）', c0('hold_chg').textContent.trim() === '+5.29%',
+     c0('hold_chg').textContent.trim());
+  ok('万元金额按亿/万自适应（fmt=big → 6.67万）',
+     c0('rz_net5').textContent.trim() === '6.67万', c0('rz_net5').textContent.trim());
+  ok('净增持为负时直接给 -320.50（不再加正号）',
+     c0('ht_net30').textContent.trim() === '-320.50', c0('ht_net30').textContent.trim());
+  ok('均线按 2 位（fmt=num）', c0('ma5').textContent.trim() === '19.43',
+     c0('ma5').textContent.trim());
+  ok('开盘按价格 2 位（fmt=price）', c0('open').textContent.trim() === '11.90',
+     c0('open').textContent.trim());
+
+  // 缺值 → 破折号，且不带涨跌色
+  ok('缺值列显示 —（不显示 NaN/0）',
+     c1('hold_num').textContent.trim() === '—' && c1('ma5').textContent.trim() === '—',
+     c1('hold_num').textContent.trim() + ' / ' + c1('ma5').textContent.trim());
+  ok('0 值按「平」上色（flat），不冒充上涨', c1('hold_chg').className.includes('flat')
+     && !c1('hold_chg').className.includes('up'), c1('hold_chg').className);
+
+  // 涨跌色：只有后端标了 updown 的列才上色，且涨红跌绿
+  const rgb = el => getComputedStyle(el).color.replace(/\s/g, '');
+  ok('涨跌幅列：正值 = 红（#e5352b）', c0('hold_chg').className.includes('up')
+     && rgb(c0('hold_chg')) === 'rgb(229,53,43)', rgb(c0('hold_chg')));
+  ok('净增持列：负值 = 绿（#12a06a）', c0('ht_net30').className.includes('down')
+     && rgb(c0('ht_net30')) === 'rgb(18,160,106)', rgb(c0('ht_net30')));
+  ok('没标 updown 的列不上色（户数/均线是"水平量"，涂色会把对象搞错位）',
+     !c0('hold_num').className.includes('up') && !c0('hold_num').className.includes('down')
+     && !c0('ma5').className.includes('up'), c0('hold_num').className);
+
+  // 明细弹层：用中文表头，字段名留在 title
+  const dh = w.detailHtml(fakeRes().items[0]);
+  ok('命中明细「关键指标」用中文表头、字段名进 title',
+     dh.includes('股东户数 = 119876') && dh.includes('title="hold_num"'),
+     dh.slice(dh.indexOf('关键指标'), dh.indexOf('关键指标') + 90));
+
+  // CSV：列头与屏幕同一份
+  const lines = w.csvLines();
+  const head = (lines && lines[0]) || '';
+  ok('CSV 列头含全部额外列且顺序一致',
+     labels.every(l => head.includes(l)) &&
+     labels.map(l => head.indexOf(l)).every((v, i, a) => i === 0 || v > a[i - 1]), head);
+  ok('CSV 数据行列数与表头一致',
+     lines.length === 3 && lines[1].split(',').length === head.split(',').length,
+     lines.length + ' 行 / ' + lines[1].split(',').length + ' 列');
+
+  // 没有额外列时不该凭空多出列
+  const r2 = fakeRes(); r2.extra_cols = []; r2.items = r2.items.slice(0, 1);
+  w.renderResult(r2);
+  const n2 = d.querySelectorAll('#sc-result thead th').length;
+  ok('extra_cols 为空时不多画列（固定 13 列）', n2 === 13, n2 + ' 列');
+
+  /* ---- 点表头排序：真点一下，读真 DOM 里的行序 ------------------------------
+     只看模板没用：表头可能挂了 class 却没绑事件、或者排完序「#」还留着原行号、
+     或者「K线」的「下一个」仍按原顺序翻（跟屏幕对不上）。所以这里真点表头。 */
+  w.renderResult(fakeRes());
+  const thOf = k => d.querySelector('#sc-result th[data-sort="' + k + '"]');
+  const rowsOf = () => [...d.querySelectorAll('#sc-result tbody tr')];
+  const KEYLAB = { ts_code: '代码', name: '名称', industry: '行业', close: '收盘',
+    pct_chg: '涨跌幅', amount: '成交额(千元)', turnover_rate: '换手%', total_mv: '总市值(亿)',
+    mf_main_net: '主力净额(万)', hold_num: '股东户数', hold_chg: '户数环比%',
+    rz_net5: '5日融资净额万', ht_net30: '30日净增持万', ma5: 'MA5', open: '开盘', score: '评分' };
+  const colIdx = k => [...d.querySelectorAll('#sc-result thead th')]
+    .findIndex(t => t.textContent.trim() === KEYLAB[k]);
+  const colTxt = (row, k) => rowsOf()[row].children[colIdx(k)].textContent.trim();
+  const codes = () => rowsOf().map(t => t.children[colIdx('ts_code')].textContent.trim()).join(',');
+
+  ok('表头挂了可排序标记（含额外列与评分）',
+     ['ts_code', 'name', 'pct_chg', 'close', 'hold_num', 'score'].every(k => !!thOf(k)));
+  ok('「命中明细 / K线」这两列不给排序（它们不是字段）',
+     [...d.querySelectorAll('#sc-result thead th')]
+       .filter(t => !t.hasAttribute('data-sort')).length === 2,
+     [...d.querySelectorAll('#sc-result thead th')]
+       .filter(t => !t.hasAttribute('data-sort')).map(t => t.textContent.trim()).join('|'));
+  ok('没点表头时保持服务端顺序（601872 在前）',
+     colTxt(0, 'ts_code') === '601872.SH' && colTxt(1, 'ts_code') === '000001.SZ', codes());
+  ok('初始没有列标出 ▲/▼（箭头只表示「客户端点出来的排序」）',
+     [...d.querySelectorAll('#sc-result thead th')]
+       .every(t => !/sort-(asc|desc)/.test(t.className)),
+     [...d.querySelectorAll('#sc-result thead th')]
+       .filter(t => /sort-(asc|desc)/.test(t.className)).map(t => t.textContent.trim()).join('|'));
+  ok('「#」列不冒充排序（可点但不带 ▲/▼）',
+     !/<span class="sarrow"><\/span>/.test(thOf('__orig').outerHTML)
+     && !!thOf('__orig').classList.contains('sortable'),
+     thOf('__orig').outerHTML);
+
+  thOf('close').click();                       // 数值列 → 默认降序
+  ok('点「收盘」→ 降序（12.34 在 11.10 前）且表头标 ▼',
+     colTxt(0, 'close') === '12.34' && colTxt(1, 'close') === '11.10'
+     && thOf('close').className.includes('sort-desc'),
+     colTxt(0, 'close') + ' / ' + colTxt(1, 'close') + ' | ' + thOf('close').className);
+  thOf('close').click();                       // 同列再点 → 升序（顺序真的翻了）
+  ok('再点「收盘」→ 升序（11.10 在前）且表头换 ▲',
+     colTxt(0, 'close') === '11.10' && colTxt(1, 'close') === '12.34'
+     && thOf('close').className.includes('sort-asc'),
+     colTxt(0, 'close') + ' / ' + colTxt(1, 'close') + ' | ' + thOf('close').className);
+  ok('排完序行序真的换了（第一行变成 000001.SZ）',
+     colTxt(0, 'ts_code') === '000001.SZ', codes());
+  ok('「#」列跟着显示顺序重编号（1、2）',
+     rowsOf()[0].children[0].textContent.trim() === '1'
+     && rowsOf()[1].children[0].textContent.trim() === '2',
+     rowsOf().map(t => t.children[0].textContent.trim()).join(','));
+  const kb = rowsOf()[0].querySelector('button[data-kline]');
+  ok('行内「K线」按钮跟着换行（data-kline = 当前第一行，「下一个」才对得上）',
+     !!kb && kb.getAttribute('data-kline') === '000001.SZ',
+     kb ? kb.getAttribute('data-kline') : '没找到');
+
+  thOf('__orig').click();                      // 「#」→ 回服务端原序
+  ok('点「#」恢复到服务端原顺序（601872 回第一行）',
+     colTxt(0, 'ts_code') === '601872.SH', codes());
+  ok('回原序后旧列的 ▲/▼ 一起清掉（不残留上一列的箭头）',
+     !/sort-(asc|desc)/.test(thOf('close').className), thOf('close').className);
+
+  thOf('ma5').click();                         // 缺值（第二只 MA5=null）→ 降序
+  ok('缺值沉底：降序时也是有值的在前（— 不冒头）',
+     colTxt(0, 'ma5') === '19.43' && colTxt(1, 'ma5') === '—',
+     colTxt(0, 'ma5') + ' / ' + colTxt(1, 'ma5'));
+  thOf('ma5').click();                         // → 升序
+  ok('缺值沉底：升序时「—」仍在最后（不随方向翻上来）',
+     colTxt(0, 'ma5') === '19.43' && colTxt(1, 'ma5') === '—',
+     colTxt(0, 'ma5') + ' / ' + colTxt(1, 'ma5'));
+
+  /* ---- 「K线」按钮 → 弹窗预览（嵌诊断页的预览模式，不跳页） ------------------
+     这里同样不能只看模板：按钮可能还留着 href（那就跳走了）、参数可能没带基准日
+     （图会停在最新那天，跟列表不是同一天）。所以真点一下、读真弹窗。 */
+  w.renderResult(fakeRes());                     // 上面把 items 改短了，恢复
+  const kbtn = d.querySelector('#sc-result button[data-kline]');
+  ok('「K线」是按钮、行内没有指向 /stock/ 的链接（点它不跳页）',
+     !!kbtn && kbtn.tagName === 'BUTTON' && !d.querySelector('#sc-result a[href^="/stock/"]'),
+     kbtn ? kbtn.getAttribute('data-kline') : '没找到按钮');
+  const hrefBefore = w.location.href;
+  if (kbtn) kbtn.click();
+  const mbg = d.querySelector('.modal-bg');
+  const fr = mbg && mbg.querySelector('iframe.kl-frame');
+  const src = fr ? (fr.getAttribute('src') || '') : '';
+  ok('弹窗里嵌的是诊断页预览模式（/stock/<代码> 且带 embed=1）',
+     !!fr && src.indexOf('/stock/601872.SH') === 0 && /[?&]embed=1/.test(src),
+     decodeURIComponent(src).slice(0, 170));
+  ok('预览带上基准日 trade_date=2026-09-16（与列表同一天，不是"最新那天"）',
+     /[?&]trade_date=2026-09-16/.test(src), decodeURIComponent(src).slice(0, 170));
+  /* 买卖策略留空 = 只看选股策略 → sel_only=1，否则诊断页会拿默认买卖参数跑一遍
+     单票回测，弹窗里冒出「策略收益」（2026-09-20 用户在选股策略页点名过同一问题） */
+  ok('没挂买卖策略时预览带 sel_only=1（不套默认买卖策略、不算策略收益）',
+     /[?&]sel_only=1/.test(src), decodeURIComponent(src).slice(0, 170));
+  ok('外层页面没被跳走（URL 未变）',
+     w.location.href === hrefBefore && w.location.pathname === '/screen', w.location.pathname);
+  const foot = mbg && mbg.querySelector('.modal-foot [data-close]');
+  ok('弹窗有明确的关闭入口（页脚按钮 + 右上角 ✕）',
+     !!foot && !!mbg.querySelector('.modal-head [data-close]'));
+
+  /* ---- 「下一个」：✕ 左边翻下一只（不关弹窗、不跳页） --------------------------
+     名单来自**当页这张表**（r.items），所以「下一个」必须是表里的下一行 ——
+     这里喂的是 2 行的结果，正好走到末位，顺带验一下末位变灰。 */
+  const nx = mbg.querySelector('.modal-head [data-next]');
+  const bx = mbg.querySelector('.modal-head [data-close]');
+  ok('右上角有「下一个」按钮，且排在 ✕ 左边',
+     !!nx && nx.textContent.trim() === '下一个' && !!bx &&
+     (nx.compareDocumentPosition(bx) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+     nx ? nx.textContent.trim() : '没找到');
+  const h3before = mbg.querySelector('.modal-head h3').textContent;
+  let src2 = '';
+  if (nx) { nx.click(); src2 = fr.getAttribute('src') || ''; }
+  ok('点「下一个」换到表里的下一只（601872.SH → 000001.SZ）',
+     src2.indexOf('/stock/000001.SZ') === 0 && /[?&]embed=1/.test(src2),
+     decodeURIComponent(src2).slice(0, 170));
+  ok('翻页仍带同一份口径（trade_date 与 sel_only 一起过去）',
+     /[?&]trade_date=2026-09-16/.test(src2) && /[?&]sel_only=1/.test(src2),
+     decodeURIComponent(src2).slice(0, 170));
+  ok('翻页只换 iframe（弹窗没被重建、外层页面也没跳走）',
+     d.querySelectorAll('.modal-bg').length === 1 && w.location.pathname === '/screen',
+     d.querySelectorAll('.modal-bg').length + ' 个弹窗 / ' + w.location.pathname);
+  const h3after = mbg.querySelector('.modal-head h3').textContent;
+  ok('标题跟着换到下一只，并标出进度（2/2）',
+     h3after !== h3before && h3after.indexOf('000001.SZ') >= 0 && h3after.indexOf('2/2') >= 0,
+     h3before + ' → ' + h3after);
+  ok('到末位时「下一个」变灰（没有下一只就别让人空点）',
+     !!nx && nx.disabled === true, nx ? 'disabled=' + nx.disabled : '没找到');
+
+  if (foot) foot.click();
+  ok('关掉后弹窗被移除', !d.querySelector('.modal-bg'));
+
+  /* ---- 排序表达式：选股页能直接填，而且**真的随请求发出去** --------------------
+     只看模板没用：输入框可能压根没被读、或者刚填就被 syncSortFromStrategy 冲回空，
+     页面照样渲染得像模像样。所以这里把 apiPost 拦下来，直接看发出去的 body。 */
+  const sel = d.getElementById('sc-strategy');
+  const sortEl = d.getElementById('sc-sort');
+  ok('页面有「排序表达式」输入框', !!sortEl);
+  if (!sortEl || !sel) return;
+
+  // 诊断：① 万一没发请求，得知道是「被前置校验拦了」还是别的
+  let LAST_TOAST = '';
+  if (typeof w.toast === 'function') w.toast = (m) => { LAST_TOAST = String(m); };
+  const dbg = () => {
+    let spec = '?';
+    try { spec = JSON.stringify(w.poolSpec()); } catch (e) { spec = 'ERR ' + e; }
+    return `spec=${spec} sid=${sel.value} sort=${sortEl.value} toast=${LAST_TOAST}`;
+  };
+
+  let sent = null;
+  w.apiPost = (url, b) => {
+    sent = { url, body: b };
+    return Promise.resolve({
+      trade_date: '2026-09-16', timeframe: 'daily', universe: '沪深300',
+      strategy_name: '（探针）', scanned: 0, count: 0, returned: 0,
+      sort_expr: (b && b.sort_expr) || '', extra_cols: [], items: [],
+    });
+  };
+  // 绕开「请先选一条选股策略」的拦截。⚠ 不能去改 `poolEd`：它是内联脚本里的
+  // `let`（全局**词法**绑定），给 window 挂同名属性根本盖不住它；而且
+  // `PoolEditor.value()` 在「自定义池没写条件」时会返回**字符串** `'all'`，
+  // 正好落进那条守卫。这里直接换掉 `poolSpec()`（函数声明 = window 属性，换得动），
+  // 本段要验的是「排序表达式有没有进请求」，不该被池子编辑器的状态牵着走。
+  w.poolSpec = () => ({ pool_id: 1 });
+  // 等页面自己的 DOMContentLoaded 收尾（里面有几段 await：策略/池子列表、基准日）。
+  // 不等的话第一下可能赶在基准日填好之前 —— 本段断言不受影响，但会白跑一个空日期。
+  for (let i = 0; i < 50 && !Array.isArray(w.__strategies); i++) await tick(20);
+
+  const clickRun = async () => {
+    sent = null;
+    d.getElementById('btn-screen').click();
+    /* ⚠ 2026-10-09：这里原来是 `await tick()`（80ms），而「开始选股」按钮走
+       `guardClick`（C38 三道保护之一：**<600ms 的连点直接忽略**）。本段是连着点三下
+       验三种填法 —— 第二、三下全被防连点吞掉 ⇒ `sent` 一直是 null ⇒
+       报「没发请求」的**假红**（接口实测 200、`sort_expr` 也确实生效）。
+       间隔给到 700ms，迈过那道闸门。 */
+    await tick(700);
+  };
+
+  // ① 什么都没填 → 连字段都不发，交给后端按买卖策略的评分表达式排
+  sel.value = '';
+  sel.dispatchEvent(new w.Event('change'));
+  ok('没选买卖策略时排序表达式为空（不凭空编一个出来）', sortEl.value === '', sortEl.value);
+  await clickRun();
+  ok('没填排序表达式时不发这个字段（后端沿用买卖策略的评分表达式）',
+     !!sent && sent.url === '/api/screen/run' && sent.body.sort_expr === undefined,
+     sent ? JSON.stringify(sent.body) : ('没发请求 | ' + dbg()));
+
+  // ② 选一条买卖策略 → 自动填它的评分表达式，并随选股请求发出
+  w.__strategies = [{ id: 999, name: '探针策略', config: { score_expr: 'boll_pos' } }];
+  sel.innerHTML = '<option value="">（不指定 · 只看选股策略）</option>'
+    + '<option value="999">探针策略</option>';
+  sel.value = '999';
+  sel.dispatchEvent(new w.Event('change'));
+  ok('选了买卖策略 → 排序表达式默认填它的评分表达式', sortEl.value === 'boll_pos', sortEl.value);
+  await clickRun();
+  ok('选股时把排序表达式发出去（body.sort_expr）',
+     !!sent && sent.body.sort_expr === 'boll_pos',
+     sent ? JSON.stringify(sent.body) : '没发请求');
+
+  // ③ 手改过之后，再换买卖策略不该把刚写的式子冲掉
+  sortEl.value = 'turnover_rate';
+  sortEl.dispatchEvent(new w.Event('input'));
+  sel.value = '';
+  sel.dispatchEvent(new w.Event('change'));
+  ok('用户手改过之后，换买卖策略不再覆盖（不冲掉刚写的式子）',
+     sortEl.value === 'turnover_rate', sortEl.value);
+  await clickRun();
+  ok('未挂买卖策略时也照样按手填的式子排（排序不依赖买卖策略）',
+     !!sent && sent.body.sort_expr === 'turnover_rate',
+     sent ? JSON.stringify(sent.body) : '没发请求');
+}
+
+const f = document.getElementById('f');
+f.addEventListener('load', () => {                 // 先挂监听
+  Promise.resolve().then(run).then(() => dump(),
+    e => dump(String((e && e.stack) || e)));
+});
+f.src = '/screen';                                  // 再赋 src（必须 JS 赋）
+setTimeout(() => { if (document.getElementById('out').textContent === 'running') dump('load 超时'); }, 20000);
+</script>
+</body>
+</html>

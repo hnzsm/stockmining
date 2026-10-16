@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>自选股交互探针（拖拽 · 表头排序 · 布林下轨批量）</title>
+<style>
+  body { margin: 0; font: 12px/1.6 monospace; }
+  #out { white-space: pre-wrap; margin: 0; padding: 8px; background: #111; color: #ddd; }
+  iframe { width: 1400px; height: 1000px; border: 0; display: block; }
+</style>
+</head>
+<body>
+<pre id="out">running…</pre>
+<iframe id="fr"></iframe>
+<script>
+/* 我的关注页「把自选股拖到分组上换组」的探针（`tools/verify_watch.py` 第【7】段用）。
+
+   为什么必须真拖一次：这一功能的两条路（**左半 = 移动到 / 右半 = 复制到**）在代码里
+   只差一个字符串比较，静态断言能证明「模板里写了 data-drop="copy"」，但证明不了
+   「鼠标落在右半时真的走高亮切换、drop 时真的算出 copy」。而这两件事错了的现象都很安静：
+   用户拖到右边以为复制了，其实整只票从原组消失了 —— 只看页面看不出来。
+
+   ⚠ 事件用合成 `DragEvent`（`dispatchEvent`）。拖动状态在页面里存在 JS 变量上、**不读
+     `dataTransfer` 的内容**，所以合成事件完全够用；真拖拽那半边（dragend / 拖影）不在这里验。
+   ⚠ 合成 `dragover` 必须给 `clientX`：页面的左右半判定是
+     `(clientX - 行左沿) < 行宽 / 2`，不给坐标就永远是 0，两半都判不出。
+
+   不动用户的数据：只在三个临时组里做（源 / 目标 / 副本），跑完整组删掉、并把探针自己
+   建的提醒规则也删掉。
+
+   【第 6 段】表头排序也在这里验（2026-10-08 需求「自选股列表可点击表头进行顺序排列」）——
+   跟拖拽共用这个 iframe 和这批临时数据，省一次无头 Chrome 启动。为什么不能只做静态断言：
+   「点一下按数值降序」错了很好看出来，但「**重画之后按钮就失灵**」（`paintStocks()` 换了整张
+   表的节点、绑定没重挂）和「**缺值不沉底**」这两种错都很安静，只能真点一下再看一遍。
+   ⚠ 断言只比**关系**、不写字面量：涨跌幅每天都在变，绝不写死百分比（硬规矩 15）。
+
+   【第 7 段】布林下轨批量加提醒（2026-10-08 需求「对日k在布林下轨的股票全部添加
+   日k触及boll下轨提醒」）—— 这一段**只点确认框里的「取消」**，绝不点那个真写的按钮：
+   那个按钮写的是**全部自选股**（上百条规则），探针不该去改用户的库状态；
+   真写那条路在接口契约里用临时组的显式 codes 验。 */
+
+const API = async (p, body) => {
+  const r = await fetch(p, body === undefined ? {} : {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return r.json();
+};
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+/* `<` `>` `&` 换成近形字符：JSON 一旦被 DOM 序列化成实体，外面 `json.loads` 就炸 */
+const safe = s => String(s).split('&').join('＆').split('<').join('‹').split('>').join('›');
+const checks = [], debug = [];
+const log = (ok, name, extra) => checks.push({ name, ok: !!ok, extra: safe(extra || '') });
+const dbg = s => debug.push(safe(s));
+function dump() {
+  document.getElementById('out').textContent = JSON.stringify({ checks, debug }, null, 1);
+}
+const bad = (name, extra) => { log(false, name, extra); dbg(extra); dump(); };
+
+const GA = 'ZZ·拖拽探针源', GB = 'ZZ·拖拽探针目标', GC = 'ZZ·拖拽探针副本';
+const C1 = '600000', C2 = '000001', C3 = '300750';
+const ID = {}; let AID = null;
+
+const wipe = async () => {
+  const gs = (await API('/api/watch/groups')).data.groups || [];
+  for (const g of gs) {
+    if ([GA, GB, GC].indexOf(g.name) >= 0) await API('/api/watch/group/delete', { id: g.id });
+  }
+};
+
+/* ---- 拆开的拖放三步：`dragOver` 与 `drop` 之间要能停下来看高亮，所以不能合成一个函数 ---- */
+let DT = null;
+const dragStart = row => {
+  DT = new DataTransfer();
+  row.dispatchEvent(new DragEvent('dragstart',
+    { bubbles: true, cancelable: true, dataTransfer: DT }));
+};
+const posOf = (dst, frac) => {
+  const r = dst.getBoundingClientRect();
+  return { r, x: r.left + r.width * frac, y: r.top + r.height / 2 };
+};
+const dragOver = (dst, frac) => {
+  const p = posOf(dst, frac);
+  dst.dispatchEvent(new DragEvent('dragover',
+    { bubbles: true, cancelable: true, dataTransfer: DT, clientX: p.x, clientY: p.y }));
+  return p.r;
+};
+const drop = (dst, frac) => {
+  const p = posOf(dst, frac);
+  dst.dispatchEvent(new DragEvent('drop',
+    { bubbles: true, cancelable: true, dataTransfer: DT, clientX: p.x, clientY: p.y }));
+  return p.r;
+};
+/* 真拖拽里 drop 之后浏览器会自动补一个 dragend；合成得自己发一次（页面靠它复位状态）。
+   ⚠ 行要**先存下来**再拖：`drop` 走完那张表就重建了，「移动」还把这一行从本组删掉了，
+     事后再用 `rowOf(code)` 去取会拿到 undefined，`dispatchEvent` 当场抛异常。 */
+const dragEnd = row => {
+  if (row) row.dispatchEvent(new DragEvent('dragend',
+    { bubbles: true, cancelable: true, dataTransfer: DT }));
+};
+
+(async function main() {
+  try {
+    await run();
+  } catch (e) {
+    bad('拖拽探针：整体跑通（中途抛异常就没结果了）', (e && e.stack) || String(e));
+    dump();
+  }
+})();
+
+async function run() {
+  const q = new URLSearchParams(location.search);
+  if (!q.get('run')) { dump(); return; }
+  if (q.get('shot')) {
+    document.getElementById('out').style.display = 'none';
+    document.getElementById('fr').style.height = '1100px';
+  }
+
+  await wipe();
+  ID.a = (await API('/api/watch/group/save', { name: GA })).data.id;
+  ID.b = (await API('/api/watch/group/save', { name: GB })).data.id;
+  ID.c = (await API('/api/watch/group/save', { name: GC })).data.id;
+  await API('/api/watch/stocks/add', { group_id: ID.a, codes: [C1, C2, C3] });
+  await API('/api/watch/stock/note', { group_id: ID.a, ts_code: '600000.SH', note: '探针备注' });
+  AID = (await API('/api/watch/alert/save',
+    { ts_code: '600000.SH', line: 'ma10', op: 'cross_up', note: '探针·规则' })).data.id;
+
+  const fr = document.getElementById('fr');
+  const loaded = new Promise(r => { fr.onload = r; });
+  fr.src = '/watch';
+  await loaded;
+  await sleep(2600);
+  const d = fr.contentDocument;
+  const $$ = s => [...d.querySelectorAll(s)];
+  /* ⚠ 分组行**必须每次现取**，不能像别的探针那样先捞一份存着：`loadGroups()` 会把
+     `#grp-list` 的 innerHTML 整个换掉，之前存下来的节点当场变成游离节点 ——
+     `getBoundingClientRect()` 全 0，于是左右半判定退化成「永远判右半（复制）」，
+     而 `classList` 还照样能加，看起来「高亮也对」。2026-10-08 第一版就是这么假红的：
+     5 条失败里 4 条都是它，产品逻辑其实没错。 */
+  const grpOf = name => $$('#grp-list .grp')
+    .find(el => el.querySelector('.nm').textContent.trim() === name);
+  const rowOf = code => $$('#stk-list tbody tr[data-code]').find(t => t.dataset.code === code);
+
+  if (!grpOf(GA) || !grpOf(GB) || !grpOf(GC)) {
+    return bad('拖拽探针：三个临时组都渲染在左侧分组列表里',
+      '找到 ' + [GA, GB, GC].map(n => !!grpOf(n)).join('/'));
+  }
+  grpOf(GA).click();
+  await sleep(1400);
+
+  // ---- 1) 结构：行可拖、首列有勾选、分组行里有左右两个投放区 ----
+  const rows = $$('#stk-list tbody tr[data-code]');
+  log(rows.length === 3, '拖拽探针：源组 3 只都渲染出来了', '实 ' + rows.length + ' 行');
+  log(rows.length > 0 && rows.every(t => t.getAttribute('draggable') === 'true'),
+    '拖拽探针：自选股每一行都挂了 draggable（整行可拖，不是只有某一个小图标能拖）');
+  log($$('#stk-list [data-pick]').length === rows.length && !!d.querySelector('#stk-all'),
+    '拖拽探针：首列有勾选框 + 表头有全选（一次拖一整批）');
+  const kids = [...(grpOf(GB).querySelector('.dz') || { children: [] }).children]
+    .map(x => x.getAttribute('data-drop'));
+  log(kids.join(',') === 'move,copy',
+    '拖拽探针：分组行里预置了「左半移动 / 右半复制」两个投放区', JSON.stringify(kids));
+  dbg('三组 id = ' + JSON.stringify(ID));
+
+  // ---- 2) 拖到「当前组自己」上：只提示、一只都不动（别删了又加回来） ----
+  let row = rowOf('600000.SH');
+  dragStart(row);
+  const tipEl = d.querySelector('#drag-tip');
+  log(tipEl.classList.contains('on') && /左半/.test(tipEl.textContent) && /右半/.test(tipEl.textContent),
+    '拖拽探针：一开始拖就浮出提示，写清「左半移动到 / 右半复制到」',
+    tipEl.textContent);
+  dragOver(grpOf(GA), 0.25);
+  drop(grpOf(GA), 0.25);
+  await sleep(1400);
+  dragEnd(row);
+  let st = (await API('/api/watch/stocks?group_id=' + ID.a)).data.stocks.map(s => s.ts_code);
+  log(st.length === 3, '拖拽探针：拖到**当前组自己**上 ⇒ 只提示、一只都不动（不是先删再加）',
+    JSON.stringify(st));
+
+  // ---- 3) 左半 = 移动 ----
+  row = rowOf('600000.SH');
+  dragStart(row);
+  const rB = dragOver(grpOf(GB), 0.25);
+  log(rB.width > 80, '拖拽探针：目标分组行有真实宽度（宽 0 的话左右半判定会失效）',
+    '宽 ' + Math.round(rB.width));
+  log(grpOf(GB).classList.contains('hot'), '拖拽探针：划过的那一行才展开投放区（别的行不动）');
+  let mv = grpOf(GB).querySelector('.dz-move'), cp = grpOf(GB).querySelector('.dz-copy');
+  log(mv.classList.contains('on') && !cp.classList.contains('on'),
+    '拖拽探针：落点在**左半** ⇒ 高亮「移动到」',
+    'move.on=' + mv.classList.contains('on') + ' copy.on=' + cp.classList.contains('on'));
+  drop(grpOf(GB), 0.25);
+  await sleep(1900);
+  dragEnd(row);
+  const stA1 = (await API('/api/watch/stocks?group_id=' + ID.a)).data.stocks.map(s => s.ts_code);
+  const stB1 = (await API('/api/watch/stocks?group_id=' + ID.b)).data.stocks;
+  log(stA1.indexOf('600000.SH') < 0 && stB1.some(s => s.ts_code === '600000.SH'),
+    '拖拽探针：左半落点 ⇒ 真「移动」了（源组没了、目标组有了）',
+    '源=' + JSON.stringify(stA1) + ' 目标=' + JSON.stringify(stB1.map(s => s.ts_code)));
+  log(stB1.some(s => s.ts_code === '600000.SH' && s.note === '探针备注'),
+    '拖拽探针：移动把备注一起带过去了',
+    JSON.stringify(stB1.map(s => s.ts_code + ':' + s.note)));
+  const al = (await API('/api/watch/alerts?ts_code=600000.SH')).data.alerts || [];
+  log(al.length >= 1, '拖拽探针：被移走的票**提醒规则还在**（先加到目标组、再删源组 ⇒ 不会被当孤儿清掉）',
+    al.length + ' 条');
+  log(!grpOf(GB).classList.contains('hot')
+      && !grpOf(GB).querySelector('.dz-move').classList.contains('on')
+      && !grpOf(GB).querySelector('.dz-copy').classList.contains('on'),
+    '拖拽探针：放下之后投放区收起来（不留一堆高亮）');
+
+  // ---- 4) 右半 = 复制 ----
+  row = rowOf('000001.SZ');
+  dragStart(row);
+  dragOver(grpOf(GC), 0.75);
+  mv = grpOf(GC).querySelector('.dz-move'); cp = grpOf(GC).querySelector('.dz-copy');
+  log(cp.classList.contains('on') && !mv.classList.contains('on'),
+    '拖拽探针：落点在**右半** ⇒ 高亮「复制到」',
+    'move.on=' + mv.classList.contains('on') + ' copy.on=' + cp.classList.contains('on'));
+  drop(grpOf(GC), 0.75);
+  await sleep(1900);
+  dragEnd(row);
+  const stA2 = (await API('/api/watch/stocks?group_id=' + ID.a)).data.stocks.map(s => s.ts_code);
+  const stC2 = (await API('/api/watch/stocks?group_id=' + ID.c)).data.stocks.map(s => s.ts_code);
+  log(stA2.indexOf('000001.SZ') >= 0 && stC2.indexOf('000001.SZ') >= 0,
+    '拖拽探针：右半落点 ⇒ 真「复制」了（源组留着、目标组也有）',
+    '源=' + JSON.stringify(stA2) + ' 副本=' + JSON.stringify(stC2));
+
+  // ---- 5) 勾选多只 ⇒ 拖任意一行 = 拖整批 ----
+  const n = $$('#stk-list tbody tr[data-code]').length;
+  const allBox = d.querySelector('#stk-all');
+  allBox.checked = true;
+  allBox.dispatchEvent(new Event('change'));
+  await sleep(300);
+  let s = fr.contentWindow.__watchDebug.state();
+  log(d.querySelectorAll('#stk-list tbody tr.picked').length === n && s.pick.length === n && n >= 2,
+    '拖拽探针：表头全选 ⇒ 本组每一行都进了勾选态',
+    s.pick.length + ' / ' + n);
+  const bar = d.querySelector('#stk-sel');
+  log(bar.classList.contains('on') && /已选/.test(bar.textContent),
+    '拖拽探针：勾上之后浮出「已选 N 只」操作条', bar.textContent.replace(/\s+/g, ' ').slice(0, 60));
+  row = $$('#stk-list tbody tr[data-code]')[0];
+  dragStart(row);
+  s = fr.contentWindow.__watchDebug.state();
+  log(s.dragging && s.dragging.codes.length === n,
+    '拖拽探针：勾选后拖任意一行 ⇒ 拖的是**整批**（不是只拖那一行）',
+    JSON.stringify(s.dragging));
+  dragOver(grpOf(GB), 0.25);
+  drop(grpOf(GB), 0.25);
+  await sleep(2100);
+  dragEnd(row);
+  const stA3 = (await API('/api/watch/stocks?group_id=' + ID.a)).data.stocks.map(s => s.ts_code);
+  const stB3 = (await API('/api/watch/stocks?group_id=' + ID.b)).data.stocks.map(s => s.ts_code);
+  log(stA3.length === 0 && stB3.length >= 3,
+    '拖拽探针：整批移动 ⇒ 源组清空、目标组全收下',
+    '源=' + JSON.stringify(stA3) + ' 目标=' + JSON.stringify(stB3));
+  log(fr.contentWindow.__watchDebug.state().pick.length === 0,
+    '拖拽探针：拖完自动清空勾选（免得下一轮把上一批又拖一遍）');
+  dump();
+
+  // ---- 6) 点表头排序（客户端，只排当前这一批） ----
+  // 此刻 B 组 = 600000.SH（带备注「探针备注》）/ 000001.SZ / 300750.SH；换到 B 组看排序。
+  // ⚠ 表头节点**每次现取**：`paintStocks()` 会整张表换新节点，存下来的引用当场游离，
+  //   `classList` 照样读得到、却读的是**上一版**表头（跟分组行那个坑同源）。
+  grpOf(GB).click();
+  await sleep(1700);
+  const thOf = label => $$('#stk-list thead th')
+    .find(t => t.textContent.trim().indexOf(label) === 0);
+  const codesNow = () => $$('#stk-list tbody tr[data-code]').map(t => t.dataset.code);
+
+  log($$('#stk-list thead th.sortable[data-sort]').length === 7 && !!thOf('#'),
+    '排序探针：6 个值列 + 「#」都能点（代码/名称/收盘/涨跌幅/提醒规则/备注）',
+    $$('#stk-list thead th.sortable[data-sort]').length + ' 个可点表头');
+  // 「#」是回原序的入口，不是「按序号排」——不该带 ▲/▼
+  log(!thOf('#').classList.contains('sort-asc') && !thOf('#').classList.contains('sort-desc')
+      && thOf('#').getAttribute('data-sort') === '__orig',
+    '排序探针：「#」列只作「恢复原序」入口，默认不带升降序箭头');
+
+  const orig = codesNow().slice();          // 刚换组 ⇒ 屏幕上就是后端原序
+  thOf('代码').click();
+  await sleep(150);
+  const asc = codesNow();
+  log(asc.join(',') === orig.slice().sort((a, b) => a.localeCompare(b, 'zh')).join(',')
+      && thOf('代码').classList.contains('sort-asc'),
+    '排序探针：点「代码」⇒ 文本列默认**升序**，表头报出 ▲',
+    JSON.stringify(asc));
+  thOf('代码').click();
+  await sleep(150);
+  log(codesNow().join(',') === asc.slice().reverse().join(',')
+      && thOf('代码').classList.contains('sort-desc'),
+    '排序探针：同一列再点一次 ⇒ 翻成**降序**（表头变 ▼）', JSON.stringify(codesNow()));
+
+  // 备注：只有 600000.SH 有备注，另外两只是空串 ⇒ 空值**永远沉底**，升降序都不翻上来
+  thOf('备注').click();
+  await sleep(150);
+  const nAsc = codesNow();
+  thOf('备注').click();
+  await sleep(150);
+  const nDesc = codesNow();
+  log(nAsc[0] === '600000.SH' && nDesc[0] === '600000.SH',
+    '排序探针：点「备注」⇒ 有备注的在前、空备注沉底（升降序都不翻上来）',
+    '升=' + JSON.stringify(nAsc) + ' 降=' + JSON.stringify(nDesc));
+
+  // 涨跌幅：数值列默认降序，且顺序要跟**真实数值**对得上（不是「看着像排了」）
+  const stkAll = (await API('/api/watch/stocks?group_id=' + ID.b)).data.stocks;
+  const pct = {}; stkAll.forEach(x => { pct[x.ts_code] = x.pct_chg; });
+  const gone = v => v === null || v === undefined;
+  const expPct = Object.keys(pct).sort((a, b) => {
+    const na = gone(pct[a]), nb = gone(pct[b]);
+    if (na || nb) return (na && nb) ? 0 : (na ? 1 : -1);
+    return pct[b] - pct[a];
+  });
+  thOf('涨跌幅').click();
+  await sleep(150);
+  log(codesNow().join(',') === expPct.join(',')
+      && thOf('涨跌幅').classList.contains('sort-desc'),
+    '排序探针：点「涨跌幅」⇒ 按真实数值降序（取不到行情的沉底）',
+    '屏上=' + JSON.stringify(codesNow()) + ' 期望=' + JSON.stringify(expPct));
+
+  // 「#」= 回后端原序（`ORDER BY sort, id`，不是按序号排）
+  thOf('#').click();
+  await sleep(150);
+  log(codesNow().join(',') === stkAll.map(x => x.ts_code).join(','),
+    '排序探针：点「#」⇒ 回到后端原序（与接口给的顺序逐只相同）',
+    JSON.stringify(codesNow()));
+
+  // 重画后交互没断：行仍可拖（`paintStocks()` 里重新挂过 dragstart）
+  row = $$('#stk-list tbody tr[data-code]')[0];
+  dragStart(row);
+  s = fr.contentWindow.__watchDebug.state();
+  log(s.dragging && s.dragging.codes.length === 1 && s.dragging.codes[0] === row.dataset.code,
+    '排序探针：排完序行仍能拖（重画后拖拽绑好了，不是「排一次序按钮就失灵」）',
+    JSON.stringify(s.dragging));
+  dragEnd(row);
+  dump();
+
+  // ---- 7) 布林下轨批量加提醒（2026-10-08 需求
+  //      「对日k在布林下轨的股票全部添加日k触及boll下轨提醒」）----
+  // 为什么必须真点一次：这个按钮会一口气往库里写**上百条**规则，它唯一的安全阀就是
+  // 「先 dry_run 报数、用户在确认框里点头才写」。静态断言只证明得了代码里写了
+  // `dry_run: 1`，证明不了**预演那一下真的没写库**、也证明不了确认框里报的数跟后端
+  // 算的是同一个数。而这两件事错了都很安静：用户以为只是「看一眼有多少」，规则已经堆进去了。
+  // ⚠ 这里**只点确认框里的「取消」**，绝不点「给 N 只加提醒」（那是真写全部自选股，
+  //   会把用户那 149 只的库状态改掉）。真写那条路在【3】接口契约里用临时组的显式 codes 验。
+  // ⚠ 断言按 `pending` 分两条路走：用户自己把那批规则加过之后 `pending` 会变 0，
+  //   那时页面**故意不弹**确认框（只提示一句）。两条路都验、都不假红。
+  const blBtn = d.querySelector('#btn-boll-lower');
+  const st0 = fr.contentWindow.__watchDebug.state();
+  log(!!blBtn, '布林下轨探针：「布林下轨加提醒」按钮在页面上');
+  log(Math.abs(st0.boll_pos - 0.1) < 1e-9,
+    '布林下轨探针：页面拿到的阈值就是后端那个（「在布林下轨」口径只有一处）',
+    'BOLL_POS=' + st0.boll_pos);
+  const alertsBefore = ((await API('/api/watch/alerts')).data.alerts || []).length;
+  const preBL = (await API('/api/watch/alerts/boll_lower', { dry_run: 1 })).data.result;
+  dbg('预演：扫 ' + preBL.scanned + ' 只 / 命中 ' + preBL.matched
+      + ' 只 / 待加 ' + preBL.pending + ' 条 / 跳过 ' + preBL.skipped + ' 条');
+
+  blBtn.click();
+  let box = null;
+  if (preBL.pending > 0) {
+    // 预演要扫**全部自选股**（几百只），好几秒才弹框 —— 轮询等它出来
+    for (let i = 0; i < 60; i++) {
+      await sleep(500);
+      box = d.querySelector('.modal-bg');
+      if (box) break;
+    }
+    log(!!box, '布林下轨探针：有要加的票 ⇒ 点一下按钮就弹确认框（不是闷头直接写库）');
+  } else {
+    /* ⚠ 这一路**不弹窗**，只出一句 toast，而 toast 6 秒后自动消失 —— 所以「一发现就走」，
+       别照着上面那样傻等 30 秒：等完 toast 早没了，断言必红（2026-10-08 第一版就这么假红的）。 */
+    for (let i = 0; i < 40; i++) {
+      await sleep(400);
+      if (d.querySelector('#toast-wrap .toast')) break;
+    }
+    log(!d.querySelector('.modal-bg'),
+      '布林下轨探针：预演发现**都已经有这条规则**了 ⇒ 不弹确认框（免得点了什么也没发生）');
+    log(!!d.querySelector('#toast-wrap .toast'),
+      '布林下轨探针：那条路会提示一句（用户点完不会一脸茫然）',
+      ((d.querySelector('#toast-wrap .toast') || {}).textContent || '').slice(0, 60));
+  }
+  if (box) {
+    const txt = box.textContent.replace(/\s+/g, ' ');
+    log(/布林位置 ≤ 0\.1/.test(txt),
+      '布林下轨探针：确认框里写清了判定口径（阈值从后端来，没在页面上另写一个）', txt.slice(0, 100));
+    log(/全部自选股/.test(txt),
+      '布林下轨探针：确认框写明了扫的是**全部自选股**（不是当前这一组）');
+    log(/日K 触及布林下轨/.test(txt) && /跳过/.test(txt),
+      '布林下轨探针：确认框说了要加哪条规则、以及已有的会跳过');
+    const goBtn = box.querySelector('#bl-go');
+    log(goBtn && goBtn.textContent.replace(/\D/g, '') === String(preBL.pending),
+      '布林下轨探针：确认框报的条数 = 后端预演的 pending（不是前端自己估的）',
+      '按钮「' + (goBtn ? goBtn.textContent.trim() : '无') + '」/ pending=' + preBL.pending);
+    box.querySelector('[data-close]').click();
+    await sleep(400);
+    log(!d.querySelector('.modal-bg'), '布林下轨探针：点「取消」⇒ 弹窗收掉');
+  }
+  const alertsAfter = ((await API('/api/watch/alerts')).data.alerts || []).length;
+  log(alertsAfter === alertsBefore,
+    '布林下轨探针：**预演那一下一条库都没写**（点了按钮/取消了，规则条数一只不变）',
+    alertsBefore + ' → ' + alertsAfter);
+  dump();
+
+  // ---- 收尾：探针自己建的东西全删掉 ----
+  if (AID) await API('/api/watch/alert/delete', { id: AID });
+  await wipe();
+  const left = ((await API('/api/watch/groups')).data.groups || []).map(g => g.name);
+  log([GA, GB, GC].every(x => left.indexOf(x) < 0), '拖拽探针：临时组与临时规则都清干净了',
+    '剩 ' + left.length + ' 组');
+  dump();
+}
+</script>
+</body>
+</html>

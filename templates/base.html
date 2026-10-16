@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- 深色主题：这两条要在 CSS 之前，否则首屏会先闪一下白（浏览器默认画布色）
+     与滚动到边界时的橡皮筋底色都还是白的。theme-color 顺带把手机地址栏也压深。 -->
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0d1117">
+<title>{% block title %}短线选股工作台{% endblock %}</title>
+<link rel="icon" href="{{ url_for('static', filename='favicon.ico') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+<script>window.__echarts_cdn__ = 'https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js';</script>
+<script src="{{ url_for('static', filename='js/echarts.min.js') }}"></script>
+<script>if(!window.echarts){document.write('<script src="'+window.__echarts_cdn__+'"><\/script>');}</script>
+</head>
+<body class="{{ 'embed' if embed }}">
+{# 全站「正在取数」指示条：任何页面打 /api 时在顶部走一条细线（app.js 的 busyInc/busyDec）。
+   放在 layout 之外、fixed 定位，所以弹窗预览（?embed=1 的同源 iframe）里也照样有 ——
+   那一份页面同样在取数，没有理由让它变成「点了没反应」。 #}
+<div id="busy-bar" aria-hidden="true"><i></i></div>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">SM</div>
+      <div>
+        <div class="brand-name">短线选股工作台</div>
+        <div class="brand-sub">StockMining · tushare + MySQL</div>
+      </div>
+    </div>
+    <nav class="nav">
+      <a href="/" class="nav-item {{ 'active' if page=='home' }}"><span class="ico">◎</span>总览</a>
+      <a href="/monitor" class="nav-item {{ 'active' if page=='monitor' }}"><span class="ico">◷</span>分时监控</a>
+      <a href="/futures" class="nav-item {{ 'active' if page=='futures' }}"><span class="ico">⚖</span>今日期货</a>
+      <a href="/screen" class="nav-item {{ 'active' if page=='screen' }}"><span class="ico">⌖</span>今日选股</a>
+      <a href="/watch" class="nav-item {{ 'active' if page=='watch' }}"><span class="ico">★</span>我的关注<span class="nav-badge" id="nav-watch-badge" style="display:none">0</span></a>
+      <a href="/backtest" class="nav-item {{ 'active' if page=='backtest' }}"><span class="ico">↗</span>策略回测</a>
+      <a href="/strategies" class="nav-item {{ 'active' if page=='strategy' }}"><span class="ico">⚙</span>买卖策略</a>
+      <a href="/pools" class="nav-item {{ 'active' if page=='pool' }}"><span class="ico">⧉</span>选股策略</a>
+      <a href="/data" class="nav-item {{ 'active' if page=='data' }}"><span class="ico">⛁</span>数据管理</a>
+      <a href="/settings" class="nav-item {{ 'active' if page=='settings' }}"><span class="ico">✱</span>模型设置</a>
+    </nav>
+    <div class="side-foot">
+      <div class="side-stat">
+        <span class="k">日线数据</span>
+        <span class="v" id="side-end">—</span>
+      </div>
+      <div class="side-stat">
+        <span class="k">数据库</span>
+        <span class="v" id="side-db">检测中</span>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1 class="page-title">{% block pagetitle %}{% endblock %}</h1>
+        <p class="page-desc">{% block pagedesc %}{% endblock %}</p>
+      </div>
+      <div class="topbar-right">
+        <span class="pill" id="pill-latest">最新交易日 —</span>
+        <span class="pill" id="pill-rows">行情 —</span>
+      </div>
+    </header>
+    <div class="content">
+      {% block content %}{% endblock %}
+    </div>
+  </main>
+</div>
+
+<div id="toast-wrap"></div>
+
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+<script src="{{ url_for('static', filename='js/ac.js') }}"></script>
+<script src="{{ url_for('static', filename='js/ai.js') }}"></script>
+<script src="{{ url_for('static', filename='js/pool.js') }}"></script>
+<script src="{{ url_for('static', filename='js/tradechart.js') }}"></script>
+{% block scripts %}{% endblock %}
+
+<script>
+/* 侧栏「我的关注」角标 = 最新交易日命中的提醒条数（`watch.summary()`）。
+   失败就安静地不显示 —— 一个装饰性角标不值得让页面弹错误提示。
+   ⚠ 不在「分时监控」页打这个接口：那一页是纯前端（腾讯行情 + localStorage），
+   本站 /api 只允许交易日历与日K线两条（`tools/verify_monitor.py` 锁着）。 */
+{% if page != 'monitor' %}
+(async function () {
+  const b = document.getElementById('nav-watch-badge');
+  if (!b) return;
+  try {
+    const r = await fetch('/api/watch/summary');
+    const j = await r.json();
+    const n = (j && j.ok && j.data && j.data.fired_today) || 0;
+    if (n > 0) { b.textContent = n > 99 ? '99+' : n; b.style.display = ''; }
+    else { b.style.display = 'none'; }
+  } catch (e) { b.style.display = 'none'; }
+})();
+{% endif %}
+</script>
+</body>
+</html>

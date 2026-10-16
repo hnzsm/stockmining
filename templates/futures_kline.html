@@ -1,0 +1,189 @@
+{% extends "base.html" %}
+{% block title %}{{ name or secid }} · 期货K线{% endblock %}
+{% block pagetitle %}期货 K 线{% endblock %}
+{% block pagedesc %}主力连续合约的历史走势（东方财富，含夜盘）。{% endblock %}
+
+{% block content %}
+<div class="card" id="fk-card">
+  <div class="card-head">
+    <div class="card-title">
+      <span id="fk-name">{{ name or secid }}</span>
+      <span class="tag mono" id="fk-secid">{{ secid }}</span>
+      <span id="fk-last" class="fk-last">—</span>
+    </div>
+    <div class="flex">
+      <select id="fk-klt" title="周期">
+        <option value="101">日K</option>
+        <option value="102">周K</option>
+        <option value="103">月K</option>
+      </select>
+      <select id="fk-limit" title="加载多少根">
+        <option value="120">120 根</option>
+        <option value="250" selected>250 根</option>
+        <option value="500">500 根</option>
+        <option value="1000">1000 根</option>
+      </select>
+      <button class="btn sm" id="fk-refresh">刷新</button>
+    </div>
+  </div>
+  <div class="card-body">
+    <div id="fk-chart" class="fk-chart"></div>
+    <div class="small muted" id="fk-note">
+      滚轮/双指缩放，拖动底部滑块看更早的历史。数据来自东方财富公开接口（含夜盘），不落本地库。
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+/* 期货 K 线：独立一页（期货没有基本面/筹码/信号，套不进个股诊断页）。
+   ⚠ 弹窗里嵌的就是这一页（`/futures/kline?embed=1`，同源 iframe）——
+      K 线只有这一份实现，弹窗与单独打开不会分叉。
+   配色沿用全局约定：涨红跌绿是业务约定（换主题也不许动），
+   坐标轴/tooltip/图例复用 app.js 里的 baseAxis / withBaseAxis / tooltipBase / CHART_LEGEND。 */
+const FK_SECID = {{ secid | tojson }};
+const FK_NAME = {{ name | tojson }};
+
+const UP = '#e5352b', DOWN = '#12a06a';
+const MA_COLOR = { 5: '#e08a00', 10: '#26c6da', 20: '#4b83ff', 60: '#8b5cf6' };
+const MA_SPAN = [5, 10, 20, 60];
+
+let fkChart = null;
+let fkBars = [];
+
+function maOf(arr, n, i) {
+  if (i + 1 < n) return null;
+  let s = 0;
+  for (let k = i - n + 1; k <= i; k++) s += arr[k];
+  return +(s / n).toFixed(2);
+}
+
+function ptext(v) { return v === null || v === undefined ? '—' : fmt.num(v, 2); }
+
+function draw() {
+  const bars = fkBars;
+  if (!bars.length) return;
+  const dates = bars.map(b => b.date);
+  const closes = bars.map(b => b.close);
+
+  const mas = {};
+  MA_SPAN.forEach(n => { mas[n] = bars.map((b, i) => maOf(closes, n, i)); });
+
+  // 显示窗口：默认落在**最后 120 根**（加载量是上面的下拉，两个数不是一回事）
+  const show = Math.min(bars.length, 120);
+  const start = Math.max(0, 100 - show / bars.length * 100);
+
+  const volColors = bars.map(b => (b.close >= b.open ? UP : DOWN));
+
+  const series = [
+    { name: 'K线', type: 'candlestick', xAxisIndex: 0, yAxisIndex: 0,
+      data: bars.map(b => [b.open, b.close, b.low, b.high]),
+      itemStyle: { color: UP, color0: DOWN, borderColor: UP, borderColor0: DOWN } },
+  ];
+  MA_SPAN.forEach(n => {
+    series.push({ name: 'MA' + n, type: 'line', xAxisIndex: 0, yAxisIndex: 0,
+      data: mas[n], showSymbol: false, connectNulls: false,
+      lineStyle: { width: 1, color: MA_COLOR[n] } });
+  });
+  series.push({ name: '成交量', type: 'bar', xAxisIndex: 1, yAxisIndex: 1,
+    data: bars.map((b, i) => ({ value: b.vol, itemStyle: { color: volColors[i] } })) });
+
+  const allX = [0, 1];
+  const base = window.baseAxis;
+  const axisLabel = { show: false };
+
+  fkChart.setOption({
+    animation: false,
+    backgroundColor: 'transparent',
+    legend: Object.assign({}, window.CHART_LEGEND, {
+      data: ['K线'].concat(MA_SPAN.map(n => 'MA' + n)), top: 0, left: 0 }),
+
+    tooltip: Object.assign({}, window.tooltipBase, { confine: true, formatter: function (ps) {
+      if (!ps || !ps.length) return '';
+      const i = ps[0].dataIndex, k = bars[i];
+      if (!k) return '';
+      const cls = k.close >= k.open ? UP : DOWN;
+      const row = (a, b, c) => '<div style="display:flex;gap:10px;justify-content:space-between">'
+        + '<span style="color:#9aa6ba">' + a + '</span><span' + (c ? ' style="color:' + c + '"' : '')
+        + '>' + b + '</span></div>';
+      return '<div style="font-weight:600;margin-bottom:4px">' + esc(k.date)
+        + '<span style="font-weight:400;color:#9aa6ba;margin-left:8px">'
+        + (FK_NAME || FK_SECID) + '</span></div>'
+        + row('开', ptext(k.open)) + row('收', ptext(k.close), cls)
+        + row('高', ptext(k.high)) + row('低', ptext(k.low))
+        + row('涨跌幅', fmt.pct(k.pct_chg), cls)
+        + row('成交量', fmt.int(k.vol) + ' 手')
+        + row('成交额', fmt.big(k.amount));
+    } }),
+
+    axisPointer: { link: [{ xAxisIndex: allX }] },
+
+    grid: [{ left: 62, right: 58, top: 30, height: '56%' },
+           { left: 62, right: 58, top: '73%', height: '15%' }],
+
+    xAxis: [
+      window.withBaseAxis({ type: 'category', data: dates, gridIndex: 0, boundaryGap: true }, axisLabel),
+      window.withBaseAxis({ type: 'category', data: dates, gridIndex: 1, boundaryGap: true },
+        Object.assign({}, base.axisLabel, { show: true })),
+    ],
+    yAxis: [
+      window.withBaseAxis({ type: 'value', scale: true, gridIndex: 0, axisLabel: { fontSize: 11 } }),
+      window.withBaseAxis({ type: 'value', scale: true, gridIndex: 1, splitNumber: 2,
+                            axisLabel: { fontSize: 11 } }),
+    ],
+
+    dataZoom: [
+      { type: 'inside', xAxisIndex: allX, start: start, end: 100 },
+      { type: 'slider', xAxisIndex: allX, top: '92%', height: 18,
+        borderColor: '#2a3444', backgroundColor: '#151a22',
+        fillerColor: 'rgba(75,131,255,.16)', handleStyle: { color: '#4b83ff' },
+        textStyle: { color: '#8b95a9', fontSize: 10 },
+        start: start, end: 100 },
+    ],
+
+    series: series,
+  }, true);
+
+  // 表头角落：最新一根的价格 + 涨跌幅（涨红跌绿，与列表同一套口径）
+  const last = bars[bars.length - 1];
+  const el = document.getElementById('fk-last');
+  if (el && last) {
+    el.innerHTML = '<b class="' + fmt.cls(last.pct_chg) + '">' + ptext(last.close) + '</b>'
+      + '<span class="' + fmt.cls(last.pct_chg) + '"> ' + fmt.pct(last.pct_chg) + '</span>'
+      + '<span class="muted"> ' + esc(last.date) + '</span>';
+  }
+}
+
+async function load() {
+  const klt = document.getElementById('fk-klt').value;
+  const limit = document.getElementById('fk-limit').value;
+  const note = document.getElementById('fk-note');
+  try {
+    const r = await apiGet('/api/futures/kline?secid=' + encodeURIComponent(FK_SECID)
+      + '&klt=' + encodeURIComponent(klt) + '&limit=' + encodeURIComponent(limit));
+    fkBars = r.bars || [];
+    if (r.name) document.getElementById('fk-name').textContent = r.name;
+    document.title = (r.name || FK_SECID) + ' · 期货K线';
+    draw();
+    if (note) note.textContent = '共 ' + fkBars.length + ' 根 · 数据来自东方财富公开接口（含夜盘），不落本地库。';
+  } catch (e) {
+    if (note) {
+      note.textContent = '';
+      note.className = 'small fk-err';
+      note.textContent = e && e.message ? e.message : '取 K 线失败';
+    }
+  }
+}
+
+document.addEventListener('DOMContentLoaded', function () {
+  fkChart = echarts.init(document.getElementById('fk-chart'));
+  window.addEventListener('resize', function () { if (fkChart) fkChart.resize(); });
+  document.getElementById('fk-klt').onchange = load;
+  document.getElementById('fk-limit').onchange = load;
+  document.getElementById('fk-refresh').onclick =
+    guardClick(document.getElementById('fk-refresh'), load);
+  load();
+});
+</script>
+{% endblock %}

@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>深色主题探针</title>
+<style>
+  body{margin:0;background:#0d1117;color:#e6ebf4;font:13px/1.6 Consolas,monospace}
+  #out{white-space:pre-wrap;padding:12px;margin:0}
+  iframe{position:fixed;left:-99999px;top:0;width:1440px;height:1000px;border:0}
+</style>
+</head>
+<body>
+<pre id="out">未运行 —— 本页是自检探针，加 ?run=1 才开始（它只读 DOM，不改任何数据）。</pre>
+<script>
+/* ============================================================================
+   深色主题探针
+   ----------------------------------------------------------------------------
+   目的：验证「切换主题后每张页面**真的**变暗了」，而不是只改了 CSS 文件里几个
+   变量却在某个页面上漏了 —— 漏色最容易出现在「自己写了内联样式 / ECharts 配置
+   里写死浅色」的地方，静态查文本查不出来，只能把页面真渲染出来量计算样式。
+
+   做法（沿用本项目探针的既有套路）：
+     · 8 个页面依次塞进**同源 iframe**（src 必须用 JS 设，否则 load 监听挂不上）；
+     · 对每个关键元素取 getComputedStyle，把祖先链上的背景按 alpha 逐层合成，
+       得到「这个元素实际坐在什么颜色上」；
+     · 算 WCAG 相对亮度与对比度，断言：背景够暗、正文对比度达标；
+     · 有图表 canvas 的页面，再抓画布四角像素（ECharts 的 grid 有留白，四角一定是
+       空背景）—— 这一条能抓住「控件暗了但图还是一块白」的情况。
+   结果 JSON 写进 <pre id="out">，由 tools/verify_theme.py 解析。
+   ============================================================================ */
+(function () {
+  /* /monitor 必须带 ?codes= 播种：干净档案下它是空态，画布根本不存在，
+     而这一页恰恰是图表配置最多、最容易漏色的地方 —— 不播种就等于没验。
+     播种只写进本次探针的临时 Chrome 档案，跑完随档案一起删。 */
+  var PAGES = ['/', '/monitor?force=open&codes=sz000001,sh600519,sh601318',
+               '/screen', '/backtest', '/strategies', '/pools', '/data', '/stock/600519.SH'];
+  var params = new URLSearchParams(location.search);
+  var out = document.getElementById('out');
+
+  if (params.get('run') !== '1') return;   // 门禁：防用户误打开
+
+  /* ---------- 颜色工具 ---------- */
+  function parseColor(s) {
+    var m = String(s || '').match(/rgba?\(([^)]+)\)/);
+    if (!m) return null;
+    var p = m[1].split(',').map(function (x) { return parseFloat(x); });
+    return { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 };
+  }
+  function over(fg, bg) {              // fg 叠在 bg 上（都按 0-255）
+    var a = fg.a;
+    return { r: fg.r * a + bg.r * (1 - a), g: fg.g * a + bg.g * (1 - a), b: fg.b * a + bg.b * (1 - a), a: 1 };
+  }
+  function lum(c) {
+    var f = function (v) { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+    return 0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b);
+  }
+  function contrast(a, b) {
+    var l1 = lum(a), l2 = lum(b);
+    var hi = Math.max(l1, l2), lo = Math.min(l1, l2);
+    return (hi + 0.05) / (lo + 0.05);
+  }
+  /* 元素实际坐落的底色：从 html 往下把背景一层层合成 */
+  function bgOf(el, win) {
+    var chain = [], n = el;
+    while (n && n.nodeType === 1) { chain.unshift(n); n = n.parentElement; }
+    var cur = { r: 255, g: 255, b: 255, a: 1 };       // 画布默认白
+    chain.forEach(function (node) {
+      var c = parseColor(win.getComputedStyle(node).backgroundColor);
+      if (c && c.a > 0) cur = over(c, cur);
+    });
+    return cur;
+  }
+
+  function measure(win, sel, optional) {
+    var el = win.document.querySelector(sel);
+    if (!el) return optional ? null : { sel: sel, missing: true };
+    var cs = win.getComputedStyle(el);
+    var fg = parseColor(cs.color) || { r: 0, g: 0, b: 0, a: 1 };
+    var bg = bgOf(el, win);
+    var box = el.getBoundingClientRect();
+    return {
+      sel: sel, fg: [Math.round(fg.r), Math.round(fg.g), Math.round(fg.b)],
+      bg: [Math.round(bg.r), Math.round(bg.g), Math.round(bg.b)],
+      bgLum: +lum(bg).toFixed(4), contrast: +contrast(fg, bg).toFixed(2),
+      w: Math.round(box.width), h: Math.round(box.height)
+    };
+  }
+
+  /* 画布四角取像素：ECharts 的 grid 有留白，四角必为空背景 */
+  function canvasCorners(win) {
+    var cvs = win.document.querySelectorAll('canvas');
+    var res = [];
+    for (var i = 0; i < cvs.length && i < 4; i++) {
+      var cv = cvs[i];
+      if (!cv.width || !cv.height) continue;
+      try {
+        var ctx = cv.getContext('2d');
+        var pts = [[2, 2], [cv.width - 3, 2], [2, cv.height - 3], [cv.width - 3, cv.height - 3]];
+        var worst = 0, sample = null;
+        pts.forEach(function (p) {
+          var d = ctx.getImageData(p[0], p[1], 1, 1).data;
+          var l = lum({ r: d[0], g: d[1], b: d[2] });
+          if (l > worst) { worst = l; sample = [d[0], d[1], d[2], d[3]]; }
+        });
+        res.push({ i: i, maxLum: +worst.toFixed(4), sample: sample });
+      } catch (e) { res.push({ i: i, error: String(e).slice(0, 60) }); }
+    }
+    return res;
+  }
+
+  function loadOne(url, w, h) {
+    return new Promise(function (resolve) {
+      var f = document.createElement('iframe');
+      f.width = w; f.height = h;
+      f.addEventListener('load', function () {
+        var win = f.contentWindow;
+        // 图表 / 接口渲染留点时间（主题量的是布局，不用等太久）
+        setTimeout(function () {
+          var rec = { url: url.split('?')[0], ok: true, checks: {}, absent: [], canvases: [], err: null };
+          try {
+            var root = win.getComputedStyle(win.document.documentElement);
+            rec.checks['color-scheme'] = {
+              value: root.colorScheme || root.getPropertyValue('color-scheme'),
+              want: 'dark'
+            };
+            ['body', '.sidebar', '.topbar', '.card', 'table.data th', 'input[type=text]', '.pill',
+             '.mon-cell', '.nav-item.active', '.btn', '.logbox'].forEach(function (sel) {
+              // 全部按「可选」量：页面不一定有（/monitor 干净档案下没有 .mon-cell、
+              // 没有表格的页面就没有 table.data th）。缺席只记进 absent，不算失败 ——
+              // 但必须有 body/.sidebar/.topbar 这三个，否则说明页面压根没渲染出来。
+              var m = measure(win, sel, true);
+              if (m) rec.checks[sel] = m;
+              else rec.absent.push(sel);
+            });
+            rec.canvases = canvasCorners(win);
+            // 顺带记一下有没有浅色残留的可见元素（背景亮度 > 0.5 且面积不小）
+            rec.bright = [];
+            var all = win.document.querySelectorAll('body *');
+            for (var i = 0; i < all.length; i++) {
+              var e = all[i], b = e.getBoundingClientRect();
+              if (b.width < 60 || b.height < 24) continue;
+              var bg2 = bgOf(e, win);
+              if (lum(bg2) > 0.5) {
+                rec.bright.push(e.tagName.toLowerCase() + '.' + (e.className || '').toString().slice(0, 30) +
+                                ' ' + Math.round(b.width) + 'x' + Math.round(b.height) +
+                                ' rgb(' + Math.round(bg2.r) + ',' + Math.round(bg2.g) + ',' + Math.round(bg2.b) + ')');
+                if (rec.bright.length >= 6) break;
+              }
+            }
+          } catch (e) { rec.ok = false; rec.err = String(e).slice(0, 200); }
+          f.remove();
+          resolve(rec);
+        }, 900);
+      });
+      f.src = url;                     // 必须先挂 load 监听再赋 src
+      document.body.appendChild(f);
+    });
+  }
+
+  (async function () {
+    var res = [];
+    for (var i = 0; i < PAGES.length; i++) res.push(await loadOne(PAGES[i], 1440, 1000));
+    out.textContent = JSON.stringify(res, null, 1);
+  })();
+})();
+</script>
+</body>
+</html>

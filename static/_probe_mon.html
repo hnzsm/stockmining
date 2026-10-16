@@ -1,0 +1,1125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>mon probe</title>
+<style>body{margin:0;font:12px/1.55 monospace}#fr{width:1500px;height:900px;border:0;display:block}#out{padding:6px}</style>
+</head>
+<body>
+<iframe id="fr"></iframe>
+<pre id="out">PENDING</pre>
+<script>
+/* 分时监控交互探针（仅供 verify_monitor.py 无头 Chrome 使用）。
+   同源 iframe 加载 /monitor，直接操作子文档的真实控件（.click / 输入框赋值），
+   走的是页面里真实的事件监听与真实腾讯行情请求，不是模拟函数调用。
+   结果写进主文档的 <pre id="out">，因为 --dump-dom 只 dump 主框架。
+
+   流程分两趟：先**清掉代码清单**加载一次，验「空配置 = 空宫格、不内置任何股票」；
+   再种上 6 只代码重载，走后面那一整套（盘口 / 副图 / 全字段 / 增删拖拽 / 时段门禁）。
+
+   另外两组手段（否则测不了「时段」和「有没有发请求」）：
+   1) 包一层 win.fetch 计数 —— 断言**每轮只有 1 个请求**（且带上全部宫格代码）；
+      非交易时段同样只取一次快照（1 个请求），空态则一次都不发；
+   2) win.__monDebug.force('open'|'closed') 覆盖时钟 —— 真跑测试时本地时间可能正是收盘后。
+
+   日K 视图这一段（点工具栏的「日K」按钮）另验两件事：日线走**本站** /api/monitor/kline
+   （腾讯那个接口没有历史日线，一次问全部格），**当天那根不在库里** ——
+   由页面拿本地缓存现算，所以它要等于格子上的现价、且包住今开/高低。
+   顺手证明「切视图不往 localStorage 里写东西」（这期间只有分时采样在写 sm_mon_pts_*）。 */
+(function () {
+  'use strict';
+  /* 防误触：这个页面会真去增删分时监控的宫格（改 localStorage），
+     所以必须带 ?run=1 才跑（verify_monitor.py 会自动带上）。直接打开只提示，不动数据。 */
+  if (location.search.indexOf('run=1') < 0) {
+    document.getElementById('out').textContent =
+      '分时监控交互探针：请勿直接打开。\n这是 tools/verify_monitor.py 用的临时测试页，' +
+      '会自动增删监控宫格并改写浏览器本地存储。\n如需手动运行，请访问 ' + location.pathname + '?run=1';
+    return;
+  }
+  const log = [];
+  let pass = 0, fail = 0, skip = 0;
+  function ok(name, cond, extra) {
+    if (cond) pass++; else fail++;
+    log.push((cond ? 'OK   ' : 'FAIL ') + name + (extra ? '  ' + extra : ''));
+    flush('RUNNING');
+  }
+  /* 「本项不适用」：占位但不计入通过/失败。
+     唯一用途是**盘前**——交易日 09:15 之前腾讯只挂一份昨收快照，
+     今开/最高/最低/五档/量比/成交额**全是 0**（实测 09:11 取到 f5=f9=f19=f33=f49=0）。
+     那时「盘口有价」「量比 > 0」这类断言不是失败、是压根没数据可比，
+     报 FAIL 等于让开盘前跑回归得到一片假红，反而掩盖真问题。 */
+  function skipIt(name, why) {
+    skip++;
+    log.push('SKIP ' + name + (why ? '  ' + why : ''));
+    flush('RUNNING');
+  }
+  /* 实时行情是否已经产生（有五档买价即认为已开始撮合）——盘前那次会话里为 false */
+  function liveQuote() {
+    try {
+      const b = dbg.book(0);
+      return !!(b && b.bids && b.bids[0] && b.bids[0][0] > 0);
+    } catch (e) { return false; }
+  }
+  function okLive(name, cond, extra) {
+    if (LIVE === null) LIVE = liveQuote();      // 懒判定：第一次用到时行情早取到了
+    if (!LIVE) { skipIt(name, '盘前尚未产生当日成交（五档/量比/量为 0），本项不适用'); return; }
+    ok(name, cond, extra);
+  }
+  let LIVE = null;      // null = 还没判过；false = 盘前无数据；true = 有行情
+  function flush(tag) {
+    document.getElementById('out').textContent = log.join('\n') + '\n' + (tag || '');
+  }
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  const fr = document.getElementById('fr');
+  let doc = null, win = null;                             // 必须等 iframe load 之后再取；
+  const cells = () => Array.from(doc.querySelectorAll('.mon-cell[data-i]'));   // iframe load 之后同步取到的
+  const codeOf = i => { const c = cells()[i]; return c ? c.querySelector('.mon-code').value : null; };
+  const delOf = i => { const c = cells()[i]; return c ? c.querySelector('.mon-del') : null; };
+  const canvasN = () => doc.querySelectorAll('canvas').length;
+  // 取**最新一条** toast：3.2 秒内的多条会同时挂在容器里，querySelector 拿到的是最早那条
+  const lastToast = () => { const a = doc.querySelectorAll('#toast-wrap .toast'); return a[a.length - 1] || null; };
+  function add(text) { const inp = doc.getElementById('mon-add-code'); inp.value = text; doc.getElementById('mon-add').click(); }
+
+  /* 代码清单是「用户自己加的」—— 页面不内置任何股票，所以探针得先把清单种进本地存储，
+     后面那套「6 宫格 + 盘口 + 副图」的断言才有对象可测。种之前先验一遍「空配置 = 空宫格」。 */
+  const SEED = ['sz000001', 'sh600519', 'sh601318', 'sz300750', 'sh688981', 'sz000858'];
+  const LS_CODES = 'sm_mon_codes';
+  let loadN = 0;
+  /* 重载 iframe：换 URL 触发导航（同一个 src 再赋一次不一定重载），保证拿到的是全新页面 */
+  function loadPage() {
+    return new Promise(res => {
+      fr.addEventListener('load', res, { once: true });
+      fr.src = '/monitor?probe=' + (++loadN);
+    });
+  }
+  function codesRaw() { try { return localStorage.getItem(LS_CODES); } catch (e) { return null; } }
+  /* 等页面把宫格画出来再断言：boot() 要等交易日历接口回来才 rebuild()，
+     而 iframe 的 load 事件**不等 fetch** —— load 之后立刻查 DOM 会查到「还没画」的空网格。 */
+  async function waitGrid(ms) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < (ms || 8000)) {
+      if (doc.querySelector('.mon-empty') || cells().length) return true;
+      await sleep(100);
+    }
+    return false;
+  }
+  /* 给某个 window 的 fetch 装计数器（要断言「一次行情请求都没发」只能靠它）。
+     日历请求（本站 /api）也会进 urls，所以腾讯请求单独计 net.qt，别拿 calls 当行情数。 */
+  function hookNet(w) {
+    const n = { calls: 0, qt: 0, urls: [] };
+    const orig = w.fetch.bind(w);
+    w.fetch = function (u, o) {
+      n.calls++;
+      if (String(u).indexOf('qt.gtimg.cn') >= 0) n.qt++;
+      n.urls.push(String(u));
+      return orig(u, o);
+    };
+    return n;
+  }
+
+  (async function () {
+    try {
+      /* ================= ① 空配置：页面不内置任何股票 =================
+         这是用户明确要的口径：「没有内置的，我添加哪个缓存哪个」。
+         所以清掉代码清单后必须是 0 格 + 一句添加引导，而不是冒出几只没添加过的票。 */
+      try { localStorage.removeItem(LS_CODES); } catch (e) { /* ignore */ }
+      await loadPage();
+      doc = fr.contentDocument;
+      win = fr.contentWindow;
+      await waitGrid();
+
+      ok('清掉配置后一个宫格都不渲染（没有内置代码）', cells().length === 0, cells().length + ' 格');
+      const emp = doc.querySelector('.mon-empty');
+      ok('空态给出添加引导（不是一片白）',
+         !!emp && /还没有添加股票/.test(emp.textContent),
+         emp ? emp.textContent.replace(/\s+/g, ' ').trim().slice(0, 64) : '无 .mon-empty');
+      ok('空态引导写明输入方式与上限',
+         !!emp && /最多 6 只/.test(emp.textContent) && /sh600519/.test(emp.textContent));
+      ok('空态下没有任何代码输入框 / 删除按钮',
+         doc.querySelectorAll('.mon-code').length === 0 && doc.querySelectorAll('.mon-del').length === 0);
+      ok('空态计数写 0 / 6 格',
+         (doc.getElementById('mon-count') || {}).textContent === '0 / 6 格',
+         (doc.getElementById('mon-count') || {}).textContent);
+      ok('空态状态栏提示还没添加股票',
+         ((doc.getElementById('mon-state') || {}).textContent || '').indexOf('还没有添加股票') >= 0,
+         (doc.getElementById('mon-state') || {}).textContent);
+      ok('空配置不会被改写成默认票（要么没写、要么是空清单）',
+         (function () { const r = codesRaw(); return r === null || /"codes":\s*\[\s*\]/.test(r); })(),
+         String(codesRaw()));
+      /* 一格都没有时，就算强制盘中也不该发任何行情请求（没有目标可轮询） */
+      const netE = hookNet(win);
+      win.__monDebug.force('open');
+      await sleep(2500);
+      ok('空态下强制盘中也不发行情请求', netE.qt === 0,
+         netE.calls + ' 次 fetch（其中腾讯 ' + netE.qt + ' 次）');
+
+      /* ================= ② 种上 6 只代码后重载，走原来那一整套 ================= */
+      try { localStorage.setItem(LS_CODES, JSON.stringify({ v: 2, codes: SEED })); } catch (e) { /* ignore */ }
+      await loadPage();
+      doc = fr.contentDocument;
+      win = fr.contentWindow;
+      await waitGrid();
+
+      const dbg = win.__monDebug;
+      ok('页面暴露 __monDebug 钩子', !!dbg && typeof dbg.force === 'function');
+
+      /* 真实时间可能正是收盘后 —— 先强制成「盘中」，后面这堆交互才测得到行情 */
+      const net = hookNet(win);
+      dbg.force('open');
+      await sleep(9000);                                   // 让首轮轮询（和启动时的日历请求）跑起来
+
+      /* ---- 交易日历：真取到本站日历（不是按周末猜） ---- */
+      ok('交易日历取到（calOk）', dbg.info().calOk === true);
+      ok('日历把 2026-10-01 定为休市（国庆）', dbg.isTradeDay(new Date(2026, 9, 1)) === false);
+      ok('日历把 2026-10-08 定为交易日', dbg.isTradeDay(new Date(2026, 9, 8)) === true);
+      ok('日历把周日 2026-09-13 定为休市', dbg.isTradeDay(new Date(2026, 8, 13)) === false);
+
+      ok('强制盘中后确实在请求腾讯行情', net.qt > 0, net.qt + ' 次');
+      ok('盘中状态栏显示运行中', dbg.info().status.indexOf('运行中') >= 0, dbg.info().status.trim());
+
+      /* ---- 初始布局：配置里有几只就渲染几只（探针自己种了 6 只） ---- */
+      ok('初始渲染 6 个宫格', cells().length === 6, cells().length + ' 格');
+      ok('每格都有删除按钮', doc.querySelectorAll('.mon-del').length === 6,
+         doc.querySelectorAll('.mon-del').length + ' 个');
+      ok('删除按钮挂在格子右上角（.mon-cell 的直接子元素）',
+         cells().every(c => !!c.querySelector(':scope > .mon-del')));
+      ok('代码就是本地存储里那一份（不掺默认票）',
+         JSON.stringify(cells().map(c => c.querySelector('.mon-code').value)) === JSON.stringify(SEED),
+         cells().map(c => c.querySelector('.mon-code').value).join(','));
+      ok('工具栏有添加输入框与按钮',
+         !!doc.getElementById('mon-add-code') && !!doc.getElementById('mon-add'));
+      const cy = doc.getElementById('mon-cycle');
+      ok('节拍提示改成「1 个请求 / 每 3 秒」',
+         !!cy && cy.textContent.indexOf('每 3 秒') >= 0 && cy.textContent.indexOf('1 个请求') >= 0,
+         cy && cy.textContent);
+
+      /* ================= 核心：一轮 = 1 个请求覆盖全部宫格 =================
+         用户要的是「一次请求所有方格、3 秒一次」，不是每格各发一个再轮转。
+         所以这里既不数次数也不猜，直接把 fetch 的 URL 掏出来看 q= 里是不是全部代码。 */
+      {
+        const r0 = dbg.info().reqs, q0 = net.qt, u0 = net.urls.length;
+        await sleep(7500);                              // 至少跨过两轮
+        const added = dbg.info().reqs - r0;             // 页内记的「轮」数
+        const sent = net.qt - q0;                       // 实际发出去的行情请求数
+        ok('间隔确实是 3 秒', dbg.info().pollMs === 3000, String(dbg.info().pollMs) + 'ms');
+        ok('7.5 秒里走了 2~4 轮（≈3 秒一轮）', added >= 2 && added <= 4, added + ' 轮');
+        ok('轮数 : 请求数 = 1 : 1（每轮只发一个请求，不是每格一个）', sent === added,
+           sent + ' 个请求 / ' + added + ' 轮 / ' + cells().length + ' 格');
+        const urls = net.urls.slice(u0).filter(u => u.indexOf('qt.gtimg.cn') >= 0);
+        ok('每个请求的 q= 里带全了所有宫格代码（逗号分隔）',
+           urls.length > 0 && urls.every(function (u) {
+             const q = u.slice(u.indexOf('q=') + 2);
+             const parts = q.split(',');
+             return parts.length === cells().length &&
+                    cells().every(c => parts.indexOf(c.querySelector('.mon-code').value) >= 0);
+           }),
+           urls.length ? urls[0].slice(urls[0].indexOf('q=')) : '没抓到行情请求');
+        ok('一轮就把所有格都刷新了（不存在「有的格还没轮到」）',
+           cells().every(c => c.querySelector('.mon-price').textContent !== '—') &&
+           dbg.info().lastN === cells().length,
+           '本轮 ' + dbg.info().lastN + '/' + cells().length);
+      }
+
+      /* ================= 日K 视图：库里近 60 根（不含当天）+ 当天由本地缓存现算 =================
+         两件事都只能真跑才看得出来：
+           ① 日线是**本站接口**给的（腾讯那个接口没有历史日线）；
+           ② 当天那根**不在库里**（日线收盘后才同步），是页面拿本地缓存（每整分钟的全字段
+              存档 + 最新快照）现算的 —— 所以它必须等于格子上的现价、且包住当日高低。
+         日线只放内存，这里顺手证明「切视图不往 localStorage 里写东西」
+         （这期间会有写入，但清一色是分时轮询在写 sm_mon_pts_*，不该多出别的 key）。 */
+      {
+        const todayStr = (function (d) {
+          const p = n => String(n).padStart(2, '0');
+          return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+        })(new Date());
+        const lsKeysOf = () => {
+          const out = [];
+          for (let i = 0; i < win.localStorage.length; i++) out.push(win.localStorage.key(i));
+          return out.sort().join(',');
+        };
+        const keys0 = lsKeysOf();
+        const u0 = net.urls.length;
+        const dkUrls = () => net.urls.slice(u0).filter(u => u.indexOf('/api/monitor/kline') >= 0);
+
+        const modeBtn = doc.getElementById('mon-mode');
+        ok('工具栏有「日K」切换按钮', !!modeBtn, modeBtn ? modeBtn.textContent : '无');
+        ok('默认是分时视图（按钮文案＝点下去会切到哪）',
+           dbg.mode() === 'intraday' && !!modeBtn && modeBtn.textContent === '日K',
+           dbg.mode() + ' / ' + (modeBtn && modeBtn.textContent));
+
+        const wkeys = [];
+        const origSet2 = win.localStorage.setItem;
+        let hooked2 = false;
+        try {
+          win.localStorage.setItem = function (k, v) { wkeys.push(String(k)); return origSet2.call(win.localStorage, k, v); };
+          hooked2 = win.localStorage.setItem !== origSet2;
+        } catch (e) { hooked2 = false; }
+
+        const rounds0 = dbg.info().rounds;
+        modeBtn.click();                       // 真实点击（走页面里那条监听器）
+        await sleep(4000);                     // 等日线回来 + 一轮行情刷新
+
+        ok('点按钮切到日K视图', dbg.mode() === 'daily', dbg.mode());
+        ok('按钮文案变成「分时」', doc.getElementById('mon-mode').textContent === '分时',
+           doc.getElementById('mon-mode').textContent);
+        ok('状态栏点了视图名（不会「看着日线以为在分时」）', /日K视图/.test(dbg.info().status),
+           dbg.info().status.trim());
+
+        /* ---- 日线来自本站、一次问全部格、不含当天 ---- */
+        const urls = dkUrls();
+        ok('日线走本站接口 /api/monitor/kline（腾讯没有历史日线）',
+           urls.length >= 1, urls.length + ' 个：' + (urls[0] || '没抓到').slice(0, 90));
+        ok('日线也是一次问全部格子（1 个请求、codes 里带全代码）',
+           urls.length === 1 && (function () {
+             const c = urls[0].slice(urls[0].indexOf('codes=') + 6).split('&')[0].split(',');
+             return c.length === cells().length &&
+                    cells().every(x => c.indexOf(x.querySelector('.mon-code').value) >= 0);
+           })(), urls.length ? urls[0].slice(urls[0].indexOf('codes=')) : '没抓到');
+        const cfg0 = dbg.dkCfg();
+        ok('要的是「画 ' + cfg0.bars + ' 根 + 预热 ' + cfg0.warm + ' 根」= bars=' + cfg0.req,
+           new RegExp('bars=' + cfg0.req).test(urls[0] || ''), urls[0] || '');
+        ok('切日K本身不写 localStorage（这期间的写入全是分时采样 sm_mon_pts_*）',
+           hooked2 && wkeys.every(k => k.indexOf('sm_mon_pts_') === 0), hooked2
+             ? (wkeys.length + ' 次：' + JSON.stringify(wkeys.slice(0, 4)))
+             : 'setItem 未被接管，计数无效');
+        ok('切日K没有多出任何本地存储 key（日线只在内存里）',
+           lsKeysOf() === keys0, lsKeysOf().slice(0, 90));
+        try { win.localStorage.setItem = origSet2; } catch (e) { /* ignore */ }
+
+        /* ---- 画出来的东西：蜡烛图 + 成交量副图 ---- */
+        ok('6 格全部画上了日K（没有空格子 / 没有「加载中」）',
+           cells().length === 6 && doc.querySelectorAll('.mon-cell.blank').length === 0,
+           cells().length + ' 格 / blank ' + doc.querySelectorAll('.mon-cell.blank').length);
+        const dkInst = win.echarts.getInstanceByDom(doc.getElementById('mon-chart-0'));
+        const dkOpt = dkInst && dkInst.getOption();
+        ok('日K 主图是蜡烛图（不是折线）',
+           !!dkOpt && dkOpt.series[0].type === 'candlestick', dkOpt ? dkOpt.series[0].type : 'null');
+        ok('日K 副图是成交量柱（挂第 2 根轴）',
+           !!dkOpt && dkOpt.series[1].type === 'bar' && dkOpt.series[1].xAxisIndex === 1 &&
+           dkOpt.series[1].yAxisIndex === 1, dkOpt ? dkOpt.series.map(s => s.type).join(',') : 'null');
+        ok('日K 同样是「一个实例两层 grid」', !!dkOpt && dkOpt.grid.length === 2,
+           dkOpt ? String(dkOpt.grid.length) : 'null');
+        ok('蜡烛涨红跌绿（中国习惯）',
+           !!dkOpt && dkOpt.series[0].itemStyle.color === '#e5352b' &&
+           dkOpt.series[0].itemStyle.color0 === '#12a06a',
+           dkOpt ? (dkOpt.series[0].itemStyle.color + ' / ' + dkOpt.series[0].itemStyle.color0) : 'null');
+
+        /* ---- 数据：库里的 60 根 + 本地现算的当天那根 ---- */
+        const bars = dbg.dk(0);
+        ok('每只都拿到了日线（6 只都进了内存缓存）', dbg.dkCache().length === 6,
+           dbg.dkCache().join(','));
+        ok('根数 = 库里 60 根（本地采到了今天就是 61 根）',
+           bars.length === 60 || bars.length === 61, bars.length + ' 根');
+        ok('按日期升序、最后一根不晚于今天',
+           bars.every((b, i) => i === 0 || b.date > bars[i - 1].date) &&
+           bars[bars.length - 1].date <= todayStr,
+           bars[0].date + ' → ' + bars[bars.length - 1].date);
+        ok('每根 OHLC 自洽（低 ≤ 开/收 ≤ 高，且都 > 0）',
+           bars.every(b => b.open > 0 && b.high > 0 && b.low > 0 && b.close > 0 &&
+                           b.low <= Math.min(b.open, b.close) + 1e-6 &&
+                           b.high >= Math.max(b.open, b.close) - 1e-6),
+           bars.slice(-2).map(b => [b.open, b.high, b.low, b.close].join('/')).join('  '));
+        okLive('成交量都带上了（副图画的是它）',
+           bars.every(b => b.vol >= 0) && bars[bars.length - 1].vol > 0,
+           String(bars[bars.length - 1].vol));
+
+        const tb = dbg.todayBar(0);
+        if (bars[bars.length - 1].date === todayStr) {
+          const px = parseFloat(cells()[0].querySelector('.mon-price').textContent);
+          ok('当天那根由本地缓存现算（收 ＝ 格子上的现价）',
+             !!tb && Math.abs(tb.close - px) / px < 0.01,
+             tb ? ('本地收 ' + tb.close.toFixed(3) + ' / 现价 ' + px) : '今天没有本地缓存');
+          ok('当天那根的 高/低 包住今开与最新价',
+             !!tb && tb.high >= Math.max(tb.open, tb.close) - 1e-6 &&
+             tb.low <= Math.min(tb.open, tb.close) + 1e-6,
+             tb ? [tb.open, tb.high, tb.low, tb.close].join(' / ') : 'null');
+          okLive('当天那根用的是「当日累计」口径（量额来自存档/快照，不是单帧）',
+             !!tb && tb.vol > 0 && tb.amount > 0,
+             tb ? ('量 ' + tb.vol + ' 手 / 额 ' + tb.amount + ' 万') : 'null');
+        } else {
+          ok('（今日无本地分时数据，只画库里的 60 根）', bars.length === 60, bars.length + ' 根');
+        }
+
+        /* ---- 指标：BOLL(20,2) + MA5/10/20/30/60 + 跳空线 --------------------
+           两条腿都要验：
+             ① 页面自己算的指标 == 拿同一批收盘价**在探针里独立重算**的结果
+                （证明实现没写错、且当天那根确实参与了计算）；
+             ② 页面算的 == 后端 core/indicators.py 经 /api/kline 输出的
+                （证明「图上看到的」和「策略回测用的」是同一套数 —— 这条最要紧）。 */
+        const cfg = dbg.dkCfg();
+        const allBars = dbg.dkAll(0);
+        const view = dbg.dkView(0);
+        const todayPresent = allBars.length > 0 && allBars[allBars.length - 1].date === todayStr;
+        ok('全量 = 接口要的 ' + cfg.req + ' 根 + 当天那根（预热带就是这么来的）',
+           allBars.length === cfg.req + (todayPresent ? 1 : 0),
+           allBars.length + ' 根全量 / 接口要 ' + cfg.req + ' 根 / 今天' + (todayPresent ? '在' : '不在'));
+        ok('展示窗口 = 全量的最后 ' + cfg.bars + ' 根(+当天)：预热带只用来算指标，不画出来',
+           view.bars.length === Math.min(cfg.bars + (todayPresent ? 1 : 0), allBars.length) &&
+           view.bars[view.bars.length - 1].date === allBars[allBars.length - 1].date,
+           allBars.length + ' 根全量 → 画 ' + view.bars.length + ' 根');
+
+        if (!allBars.length) {
+          ok('（这一格没有日线，指标段跳过）', false, 'dkAll 为空');
+        } else {
+          const closes = allBars.map(b => b.close);
+          const avg = a => a.reduce((x, y) => x + y, 0) / a.length;
+          const lastOf = a => a[a.length - 1];
+          const off = allBars.length - view.bars.length;
+
+          /* ① 均线：最后一根 = 全量最后 N 根的均值（含当天那根本地现算的收盘） */
+          cfg.ma.forEach(function (n) {
+            const want = avg(closes.slice(-n));
+            const got = lastOf(view.ma[n]);
+            ok('MA' + n + ' 与探针自算一致' + (n === 60 ? '（窗口第一根起就有值，预热带生效）' : ''),
+               got !== null && Math.abs(got - want) < 1e-9, '页面 ' + got + ' / 自算 ' + want);
+          });
+          /* 预热带的意义就在这条：展示窗口第一根（= 全量下标 off）要算 MA60，
+             用的是全量的 [off-59 .. off] 这 60 根 —— 没有预热的话 off < 59，这里必然是空 */
+          const nMax = cfg.ma[cfg.ma.length - 1];
+          ok('MA' + nMax + ' 在**窗口第一根**就有值（预热带生效，不是只有最后几个点）',
+             view.ma[nMax][0] !== null &&
+             Math.abs(view.ma[nMax][0] - avg(closes.slice(off - nMax + 1, off + 1))) < 1e-9,
+             '页面 ' + view.ma[nMax][0] + ' / 自算 ' + avg(closes.slice(off - nMax + 1, off + 1)));
+          /* 动态性：当天那根（本地现算、值＝格子上的实时价）就是均线的最后一项 ——
+             所以每轮行情一变，均线/布林/跳空就跟着重算，不需要任何额外触发 */
+          if (todayPresent) {
+            const px = parseFloat(cells()[0].querySelector('.mon-price').textContent);
+            ok('当天那根参与指标计算（最后一根收盘＝格子上的现价，均线因此是活的）',
+               Math.abs(lastOf(view.ma[5]) - avg(closes.slice(-5))) < 1e-9 &&
+               Math.abs(closes[closes.length - 1] - px) / px < 0.01,
+               'MA5 ' + lastOf(view.ma[5]) + ' / 现价 ' + px);
+          }
+
+          /* ① 布林：中轨 = MA20；上下轨 = 中轨 ± 2×**样本**标准差（÷n-1，与 pandas 一致） */
+          const w = closes.slice(-cfg.boll.n);
+          const bm = avg(w);
+          const sd = Math.sqrt(w.reduce((s, v) => s + (v - bm) * (v - bm), 0) / (w.length - 1));
+          const bi = view.boll.mid.length - 1;
+          ok('BOLL 中轨 = MA20（同一条线，图上重合是对的）',
+             Math.abs(view.boll.mid[bi] - lastOf(view.ma[20])) < 1e-9,
+             '中轨 ' + view.boll.mid[bi] + ' / MA20 ' + lastOf(view.ma[20]));
+          ok('BOLL 上/下轨 = 中轨 ± ' + cfg.boll.k + '×样本标准差',
+             Math.abs(view.boll.up[bi] - (bm + cfg.boll.k * sd)) < 1e-9 &&
+             Math.abs(view.boll.dn[bi] - (bm - cfg.boll.k * sd)) < 1e-9,
+             '上 ' + view.boll.up[bi] + ' / 自算 ' + (bm + cfg.boll.k * sd));
+          /* 边界口径用**合成序列**单测 —— 真 K 线上这些边界根本碰不到（有 59 根预热，
+             窗口里全是满窗口值）。合成序列同时把「样本标准差 vs 总体标准差」区分开：
+             19 个 1 + 一个 21，窗口均值 2，样本方差 380/19 = 20（总体方差会是 380/20 = 19）。 */
+          const cs = [];
+          for (let i = 0; i < cfg.boll.n - 1; i++) cs.push(1);
+          cs.push(21);
+          const b20 = dbg.bollOf(cs, cfg.boll.n, cfg.boll.k);
+          const expMid = 2, expSd = Math.sqrt(20);
+          const biS = cfg.boll.n - 1;
+          ok('BOLL 不足 ' + cfg.boll.n + ' 根不出值（合成 ' + cs.length + ' 根：前 ' +
+             biS + ' 根为空、第 ' + cfg.boll.n + ' 根起才有值）',
+             b20.mid.slice(0, biS).every(v => v === null) && b20.mid[biS] !== null,
+             JSON.stringify(b20.mid.slice(0, 2)) + ' … ' + JSON.stringify(b20.mid.slice(-1)));
+          ok('BOLL 中轨 = 窗口均值（合成序列手算 = 2）',
+             Math.abs(b20.mid[biS] - expMid) < 1e-12, String(b20.mid[biS]));
+          ok('BOLL 用**样本**标准差 ÷(n-1)：合成上轨 = 2+2√20 ≈ ' +
+             (expMid + 2 * expSd).toFixed(6) + '（若误用总体标准差会是 ' +
+             (expMid + 2 * Math.sqrt(19)).toFixed(6) + '）',
+             Math.abs(b20.up[biS] - (expMid + cfg.boll.k * expSd)) < 1e-12 &&
+             Math.abs(b20.dn[biS] - (expMid - cfg.boll.k * expSd)) < 1e-12,
+             '上轨 ' + b20.up[biS] + ' / 下轨 ' + b20.dn[biS]);
+          /* 均线 min_periods=1：合成 [1,2,3]、n=5 → [1, 1.5, 2]（不足 5 根也出值，与 pandas 一致） */
+          const m5s = dbg.maOf([1, 2, 3], 5);
+          ok('均线不足 n 根也出值（合成 [1,2,3]、n=5 → [1,1.5,2]，同 pandas min_periods=1）',
+             Math.abs(m5s[0] - 1) < 1e-12 && Math.abs(m5s[1] - 1.5) < 1e-12 &&
+             Math.abs(m5s[2] - 2) < 1e-12, JSON.stringify(m5s));
+          /* 跳空：合成「两条向上 + 一条向下」，顺便验区间与「已回补」判定（都是手算出来的） */
+          const gb = [{ high: 10.0, low: 9.5 }, { high: 11.3, low: 11.1 },
+                      { high: 11.6, low: 11.5 }, { high: 9.8, low: 9.55 },
+                      { high: 9.9, low: 9.4 }, { high: 10.5, low: 9.6 }];
+          const gs = dbg.gapsOf(gb);
+          ok('跳空识别（合成：0→1、1→2 向上，2→3 向下；边界价＝昨高 / 昨低）',
+             gs.length === 3 && gs[0].i === 1 && gs[0].dir === 1 && gs[0].y === 10 &&
+             gs[1].i === 2 && gs[1].dir === 1 && gs[1].y === 11.3 &&
+             gs[2].i === 3 && gs[2].dir === -1 && gs[2].y === 11.5,
+             JSON.stringify(gs.map(g => [g.i, g.dir, g.y])));
+          ok('缺口区间（向上＝[昨高,今低]、向下＝[今高,昨低]）与「已回补」判定（同上手算）',
+             gs[0].lo === 10 && gs[0].hi === 11.1 && gs[0].filled === true &&
+             gs[1].filled === true && gs[2].lo === 9.8 && gs[2].hi === 11.5 && gs[2].filled === false,
+             JSON.stringify(gs.map(g => [g.dir, g.lo, g.hi, g.filled])));
+
+          /* ① 跳空：向上 low > 昨高 / 向下 high < 昨低，线画在缺口边界、两点同价 */
+          const gw = dbg.dkView(0).gaps;
+          const gOk = gw.every(function (g) {
+            const p = view.bars[g.x1], b = view.bars[g.x2];
+            if (!p || !b) return false;
+            const dirOk = g.dir > 0 ? (b.low > p.high && g.y === p.high) : (b.high < p.low && g.y === p.low);
+            return dirOk && g.x2 - g.x1 === 1;
+          });
+          ok('跳空用策略同源口径（向上 low>昨高 / 向下 high<昨低），线落在缺口边界上',
+             gOk, gw.length + ' 条缺口：' + gw.filter(g => g.dir > 0).length + ' 向上 / '
+             + gw.filter(g => g.dir < 0).length + ' 向下 / '
+             + gw.filter(g => !g.filled).length + ' 条未回补');
+          ok('总有一个缺口判定（含当天那根 —— 今天跳空立刻就会出现）',
+             gw.every(g => g.filled === true || g.filled === false), String(gw.length));
+
+          /* ② 与后端指标引擎对拍：/api/kline 的 ma* / boll_* 就是 core/indicators.py 的输出 */
+          const page0 = cells()[0].querySelector('.mon-code').value;
+          const ts = page0.slice(2) + '.' + ({ sh: 'SH', sz: 'SZ', bj: 'BJ' }[page0.slice(0, 2)] || 'SH');
+          const kj = await (await win.fetch('/api/kline?code=' + ts + '&bars=' + cfg.req,
+                                           { cache: 'no-store' })).json();
+          const krows = (kj && kj.data && kj.data.bars) || [];
+          const kr = krows[krows.length - 1];
+          const dbIdx = view.bars.length - (todayPresent ? 2 : 1);   // 展示窗口里「库里最后一根」的位置
+          ok('拿得到后端指标（/api/kline，同一只票）',
+             !!kr && kr.trade_date === view.bars[dbIdx].date,
+             (kr ? kr.trade_date : 'null') + ' / 页面 ' + view.bars[dbIdx].date);
+          if (kr && kr.trade_date === view.bars[dbIdx].date) {
+            const near = (a, b) => a !== null && b !== null && Math.abs(a - b) < 1e-6;
+            [['MA5', 'ma5'], ['MA10', 'ma10'], ['MA20', 'ma20'], ['MA60', 'ma60']].forEach(function (p) {
+              const n = +p[0].slice(2);
+              ok('前端 ' + p[0] + ' == 后端指标引擎（策略用的就是它）',
+                 near(view.ma[n][dbIdx], kr[p[1]]),
+                 '前端 ' + view.ma[n][dbIdx] + ' / 后端 ' + kr[p[1]]);
+            });
+            ok('前端 BOLL 上轨 == 后端 boll_upper', near(view.boll.up[dbIdx], kr.boll_upper),
+               '前端 ' + view.boll.up[dbIdx] + ' / 后端 ' + kr.boll_upper);
+            ok('前端 BOLL 中轨 == 后端 boll_mid', near(view.boll.mid[dbIdx], kr.boll_mid),
+               '前端 ' + view.boll.mid[dbIdx] + ' / 后端 ' + kr.boll_mid);
+            ok('前端 BOLL 下轨 == 后端 boll_lower', near(view.boll.dn[dbIdx], kr.boll_lower),
+               '前端 ' + view.boll.dn[dbIdx] + ' / 后端 ' + kr.boll_lower);
+          }
+        }
+
+        /* ---- 画出来的东西：均线/布林/跳空都真进了图，图例能开关 ---- */
+        const dkInst2 = win.echarts.getInstanceByDom(doc.getElementById('mon-chart-0'));
+        const opt2 = dkInst2 && dkInst2.getOption();
+        const snames = opt2 ? opt2.series.map(s => s.name) : [];
+        ok('日K 上叠了 5 条均线 + 布林三轨 + 跳空线（共 ' + (2 + cfg.ma.length + 4) + ' 条序列）',
+           cfg.ma.every(n => snames.indexOf('MA' + n) >= 0) &&
+           ['BOLL上轨', 'BOLL中轨', 'BOLL下轨', '跳空'].every(n => snames.indexOf(n) >= 0),
+           snames.join(','));
+        ok('图例里这些线都能开关（不是画上去就动不了）',
+           !!opt2 && opt2.legend[0].data.indexOf('MA30') >= 0 &&
+           opt2.legend[0].data.indexOf('BOLL下轨') >= 0 && opt2.legend[0].data.indexOf('跳空') >= 0 &&
+           opt2.legend[0].data.length === 2 + cfg.ma.length + 4,
+           opt2 ? opt2.legend[0].data.join(',') : 'null');
+        if (opt2) {
+          const nMaxName = 'MA' + cfg.ma[cfg.ma.length - 1];
+          const sMa60 = opt2.series.filter(s => s.name === nMaxName)[0];
+          ok(nMaxName + ' 那条线在窗口第一根就有数据（预热带真的起了作用）',
+             !!sMa60 && sMa60.data[0] !== null && sMa60.data[0] !== '-',
+             sMa60 ? String(sMa60.data[0]) : 'null');
+          const sUp = opt2.series.filter(s => s.name === 'BOLL上轨')[0];
+          ok('布林三轨在展示窗口里**没有断点**（59 根预热垫着，窗口第一根就有值 —— 这正是预热的目的）',
+             !!sUp && sUp.data.length === view.bars.length &&
+             sUp.data.every(v => v !== null && v !== '-' && isFinite(v)),
+             sUp ? sUp.data.length + ' 个点，首值 ' + sUp.data[0] : 'null');
+          const sGap = opt2.series.filter(s => s.name === '跳空')[0];
+          let gSegOk = !!sGap;
+          if (sGap) {
+            const pts = sGap.data.filter(v => v !== null && v !== '-');
+            for (let k = 0; k + 1 < pts.length; k += 2) {
+              if (pts[k][1] !== pts[k + 1][1] || pts[k + 1][0] - pts[k][0] !== 1) gSegOk = false;
+            }
+          }
+          ok('跳空线画成了「两端同价、相邻两根」的横线段（不是贯穿全图的长线）',
+             gSegOk, sGap ? sGap.data.length + ' 个数据点' : 'null');
+          /* 坐标解释别出错：横轴是类别轴，[下标, 价格] 必须落在「蜡烛同一套坐标」上。
+             拿 convertToPixel 把同一个点分别按「跳空系列」和「蜡烛系列」换算，
+             两者像素应该重合 —— 不然就是把 [x, y] 当成了别的含义（比如当成两个数值轴）。
+             缺口不一定每只都有，所以先扫 6 格找一只真带缺口的（找不到就走下面那支兜底断言）。 */
+          let gCell = -1, gReal = null;
+          for (let k = 0; k < cells().length; k++) {
+            const vv = dbg.dkView(k);
+            if (vv && vv.gaps && vv.gaps.length) { gReal = vv.gaps[0]; gCell = k; break; }
+          }
+          const instG = gCell >= 0
+            ? win.echarts.getInstanceByDom(doc.getElementById('mon-chart-' + gCell)) : null;
+          const optG = instG ? instG.getOption() : null;
+          const gIdx = optG ? optG.series.map(s => s.name).indexOf('跳空') : -1;
+          if (gReal && instG && gIdx >= 0) {
+            const ptG = instG.convertToPixel({ seriesIndex: gIdx }, [gReal.x1, gReal.y]);
+            const ptC = instG.convertToPixel({ seriesIndex: 0 }, [gReal.x1, gReal.y]);
+            ok('跳空线的坐标解释正确（同一个 [下标, 价] 在跳空系列与蜡烛系列里像素一致，第 ' +
+               (gCell + 1) + ' 格）',
+               !!ptG && !!ptC && Math.abs(ptG[0] - ptC[0]) < 1 && Math.abs(ptG[1] - ptC[1]) < 1,
+               JSON.stringify(ptG) + ' vs ' + JSON.stringify(ptC));
+            ok('跳空线的两个端点横向错开正好一格（跨在「昨根 → 今根」之间），且画在同一个价上',
+               (function () {
+                 const a = instG.convertToPixel({ seriesIndex: gIdx }, [gReal.x1, gReal.y]);
+                 const b = instG.convertToPixel({ seriesIndex: gIdx }, [gReal.x2, gReal.y]);
+                 const step = instG.convertToPixel({ seriesIndex: gIdx }, [1, gReal.y])[0] -
+                              instG.convertToPixel({ seriesIndex: gIdx }, [0, gReal.y])[0];
+                 return Math.abs(a[1] - b[1]) < 0.01 && Math.abs((b[0] - a[0]) - step) < 0.5;
+               })(), '第 ' + (gCell + 1) + ' 格缺口 #' + gReal.x2 +
+               '：' + (gReal.dir > 0 ? '向上' : '向下') + ' y=' + gReal.y);
+            /* 「option 里有数据」不等于「画到画布上了」—— 直接读 canvas 像素：
+               在缺口线段中点附近应该能读到琥珀色（#ffd166）。
+               判据要能把同样偏橙的 MA5（#f0a020，g/r≈0.67）排除掉，所以卡 g > 0.75r 且 b < 0.6r。 */
+            const cv = doc.querySelector('#mon-chart-' + gCell + ' canvas');
+            const dpr = win.devicePixelRatio || 1;
+            let hitPx = '', hit = false;
+            if (cv) {
+              const ctx = cv.getContext('2d');
+              const pa = instG.convertToPixel({ seriesIndex: gIdx }, [gReal.x1, gReal.y]);
+              const pb = instG.convertToPixel({ seriesIndex: gIdx }, [gReal.x2, gReal.y]);
+              const mx = Math.round((pa[0] + pb[0]) / 2), my = Math.round(pa[1]);
+              for (let dy = -4; dy <= 4 && !hit; dy++) {
+                for (let dx = -8; dx <= 8; dx++) {
+                  const d = ctx.getImageData(Math.round(mx * dpr) + dx, Math.round(my * dpr) + dy, 1, 1).data;
+                  if (d[0] > 90 && d[1] > d[0] * 0.75 && d[2] < d[0] * 0.6) {
+                    hit = true; hitPx = 'rgb(' + d[0] + ',' + d[1] + ',' + d[2] + ')'; break;
+                  }
+                }
+              }
+            }
+            ok('跳空线真的画到画布上了（缺口线段中点附近读到琥珀色像素）', hit,
+               '第 ' + (gCell + 1) + ' 格 (' + Math.round((instG.convertToPixel({ seriesIndex: gIdx }, [gReal.x1, gReal.y])[0] + instG.convertToPixel({ seriesIndex: gIdx }, [gReal.x2, gReal.y])[0]) / 2) + 'px 处) ' + (hitPx || '没读到'));
+          } else {
+            ok('六格窗口里都没有缺口（跳空线数据为空 —— 属于「近期没跳空」的正常情况）',
+               cells().every(function (_, k) {
+                 const vv = dbg.dkView(k);
+                 return !vv || !vv.gaps || !vv.gaps.length;
+               }), cells().length + ' 格');
+          }
+        }
+        /* ---- 日K 视图下行情照常轮询（当天那根要跟着动 → 指标也跟着重算） ---- */
+        await sleep(3200);
+        ok('日K 视图下行情轮询照旧（每 3 秒一轮，当天那根跟着动）',
+           dbg.info().rounds > rounds0, rounds0 + ' → ' + dbg.info().rounds);
+
+        /* ---- 日K 视图下新增 / 删除一格：新格也要有日线 ---- */
+        const uAdd = net.urls.length;
+        delOf(5).click();
+        await sleep(400);
+        add('sh600104');
+        await sleep(3200);
+        ok('日K 视图下能加格子', cells().length === 6 && codeOf(5) === 'sh600104',
+           cells().length + ' 格 / 末格 ' + String(codeOf(5)));
+        ok('新加的格子立刻取到了日线（不是空着）', dbg.dk(5).length >= 60,
+           dbg.dk(5).length + ' 根');
+        ok('新加的格子补日线也只发 1 个请求（并进批量通道）',
+           net.urls.slice(uAdd).filter(u => u.indexOf('/api/monitor/kline') >= 0).length === 1,
+           net.urls.slice(uAdd).filter(u => u.indexOf('/api/monitor/kline') >= 0).length + ' 个');
+        delOf(5).click();
+        await sleep(400);
+        add('sz000858');
+        await sleep(2600);
+        ok('（前置条件）日K 这一段没打乱格子里原有的股票顺序',
+           JSON.stringify(cells().map(c => c.querySelector('.mon-code').value)) === JSON.stringify(SEED),
+           cells().map(c => c.querySelector('.mon-code').value).join(','));
+
+        /* ---- 切回分时：不需要任何请求，用内存里的采样点重画 ---- */
+        const uBack = net.urls.length;
+        doc.getElementById('mon-mode').click();
+        await sleep(1500);
+        ok('再点一次切回分时视图', dbg.mode() === 'intraday', dbg.mode());
+        ok('按钮文案变回「日K」', doc.getElementById('mon-mode').textContent === '日K');
+        ok('切回分时不再请求日线', net.urls.slice(uBack).filter(u => u.indexOf('/api/monitor/kline') >= 0).length === 0);
+        const inInst = win.echarts.getInstanceByDom(doc.getElementById('mon-chart-0'));
+        ok('切回分时后主图恢复三条线（价格/均价/量比）',
+           !!inInst && inInst.getOption().series.map(s => s.name).join(',') === '价格,均价,量比',
+           inInst ? inInst.getOption().series.map(s => s.name).join(',') : 'null');
+        ok('切回分时后状态栏不再写「日K视图」', !/日K视图/.test(dbg.info().status), dbg.info().status.trim());
+      }
+
+      /* ================= 五档盘口 / 量比副图 / 全字段留存 =================
+         这几样都只能用真跑出来的数据验：盘口是接口 f9~f28、量比是 f49、均价是 f51，
+         均价线和量比线画没画只有把 ECharts 实例的 option 掏出来看才知道。 */
+      ok('每格都有盘口容器（图右、格子主体里）',
+         cells().every(c => !!c.querySelector(':scope > .mon-body > .mon-charts > .mon-chartwrap')) &&
+         cells().every(c => !!c.querySelector(':scope > .mon-body > .mon-book')));
+      ok('盘口每格 10 档（共 60 行）',
+         doc.querySelectorAll('.mon-book .mon-bk').length === cells().length * 10,
+         doc.querySelectorAll('.mon-book .mon-bk').length + ' 行');
+      const bkEl0 = doc.querySelectorAll('.mon-book')[0];
+      const bkLabels = Array.from(bkEl0.querySelectorAll('.mon-bkl')).map(e => e.textContent).join(',');
+      ok('盘口排列是 卖5→卖1 再 买1→买5',
+         bkLabels === '卖5,卖4,卖3,卖2,卖1,买1,买2,买3,买4,买5', bkLabels);
+      const bko = dbg.book(0);
+      okLive('盘口来自接口五档（bids/asks 各 5 档且价格 > 0）',
+         !!bko && bko.bids.length === 5 && bko.asks.length === 5 && bko.bids[0][0] > 0 && bko.asks[0][0] > 0,
+         bko ? ('买一 ' + bko.bids[0][0] + '×' + bko.bids[0][1] + ' / 卖一 ' + bko.asks[0][0] + '×' + bko.asks[0][1]) : 'null');
+      okLive('盘口档位关系正确（卖一 ≥ 买一）', !bko || bko.asks[0][0] >= bko.bids[0][0],
+         bko ? (bko.asks[0][0] + ' vs ' + bko.bids[0][0]) : '');
+      const shownPx = Array.from(bkEl0.querySelectorAll('.mon-bk b')).map(e => e.textContent);
+      okLive('盘口显示价与接口一致（第 5 行=卖一、第 6 行=买一）',
+         !!bko && shownPx[4] === bko.asks[0][0].toFixed(2) && shownPx[5] === bko.bids[0][0].toFixed(2),
+         shownPx.join(' '));
+      ok('盘口价格按昨收着色（涨红跌绿）',
+         Array.from(bkEl0.querySelectorAll('.mon-bk b')).every(e => /(^|\s)(up|down|flat)(\s|$)/.test(e.className)),
+         Array.from(bkEl0.querySelectorAll('.mon-bk b')).slice(0, 3).map(e => e.className).join(' | '));
+      const foot0 = Array.from(cells()[0].querySelectorAll('.mon-foot b')).map(e => e.textContent);
+      okLive('底行补了「量比」当前值', foot0.length === 5 && foot0[4] !== '—', foot0.join(' '));
+
+      const inst0 = win.echarts.getInstanceByDom(doc.getElementById('mon-chart-0'));
+      const opt0 = inst0 && inst0.getOption();
+      ok('一个实例两层：主图 + 量比副图 = 两个 grid',
+         !!opt0 && opt0.grid.length === 2, opt0 ? String(opt0.grid.length) : 'null');
+      ok('三条线依次是 价格 / 均价 / 量比',
+         !!opt0 && opt0.series.map(s => s.name).join(',') === '价格,均价,量比',
+         opt0 ? opt0.series.map(s => s.name).join(',') : 'null');
+      ok('量比副图挂在第 2 个 grid、用第 2 根 y 轴',
+         !!opt0 && opt0.series[2].xAxisIndex === 1 && opt0.series[2].yAxisIndex === 1);
+      ok('图例可点开关（价格/均价/量比 都在图例里）',
+         !!opt0 && opt0.legend[0].data.join(',') === '价格,均价,量比',
+         opt0 ? opt0.legend[0].data.join(',') : 'null');
+
+      const st0 = (function () {
+        try { return JSON.parse(win.localStorage.getItem('sm_mon_pts_' + codeOf(0)) || 'null') || {}; }
+        catch (e) { return {}; }
+      })();
+      ok('本地存储升级到 v3', st0.v === 3, String(st0.v));
+      ok('采样点扩成 6 位（多存了 量比 f49 / 量 f6）',
+         Array.isArray(st0.pts) && st0.pts.length > 0 && st0.pts[0].length === 6,
+         Array.isArray(st0.pts) ? (st0.pts.length + ' 点 × ' + (st0.pts[0] || []).length + ' 位') : 'null');
+      const avgS = opt0 ? opt0.series[1].data : [];
+      const vrS = opt0 ? opt0.series[2].data : [];
+      const nAvg = (st0.pts || []).filter(p => p[3] > 0).length;
+      const nVr = (st0.pts || []).filter(p => p[4] > 0).length;
+      okLive('均价线画的就是采样里存的均价（点数一一对应，没自己重算）',
+         avgS.length === nAvg && nAvg > 0, avgS.length + ' vs ' + nAvg);
+      okLive('量比副图有数据且与采样里的量比一一对应',
+         vrS.length === nVr && nVr > 0, vrS.length + ' vs ' + nVr);
+      ok('量比线带 1.0 基准虚线',
+         !!opt0 && JSON.stringify(opt0.series[2].markLine.data[0].yAxis) === '1');
+
+      const fld0 = dbg.fields(0);
+      ok('本地留存接口全部 88 个字段', !!fld0 && fld0.length === 88, fld0 ? fld0.length + ' 项' : 'null');
+      ok('字段表 88 项、可信度标记一一对应',
+         dbg.fieldHelp().length === 88 && dbg.fieldMarks().length === 88);
+      ok('字段表在关键位置对得上（f49=量比 f51=均价 f3=最新价）',
+         dbg.fieldHelp()[49] === '量比' && dbg.fieldHelp()[51] === '均价' &&
+         dbg.fieldHelp()[3] === '最新价',
+         [3, 49, 51].map(i => i + ':' + dbg.fieldHelp()[i]).join(' '));
+      ok('原始字段与页面显示自洽（f3 现价 = 格子上的现价）',
+         !!fld0 && Number(fld0[3]).toFixed(2) === cells()[0].querySelector('.mon-price').textContent,
+         fld0 ? (fld0[3] + ' / ' + cells()[0].querySelector('.mon-price').textContent) : '');
+      ok('全字段快照（含盘口）也落进了 localStorage',
+         !!st0.snap && Array.isArray(st0.snap.raw) && st0.snap.raw.length === 88 &&
+         Array.isArray(st0.snap.bids) && st0.snap.bids.length === 5,
+         st0.snap ? ('raw ' + (st0.snap.raw || []).length + ' 项 / bids ' + (st0.snap.bids || []).length + ' 档') : 'null');
+      ok('每整分钟 1 条全字段存档（首条已写入）', dbg.hist(0) >= 1,
+         dbg.hist(0) + ' 条');
+      ok('存档里也是完整 88 项',
+         Array.isArray(st0.hist) && st0.hist.length > 0 && st0.hist[0][2].length === 88,
+         Array.isArray(st0.hist) && st0.hist.length ? String(st0.hist[0][2].length) : '无');
+
+      /* ---- 点股票名 → 全字段表弹窗 ---- */
+      cells()[0].querySelector('.mon-name').click();
+      await sleep(700);
+      const mdl = doc.querySelector('.modal-bg');
+      ok('点股票名能打开字段表弹窗', !!mdl);
+      const mdlRows = mdl ? mdl.querySelectorAll('.fld-tbl tbody tr').length : 0;
+      ok('弹窗逐行列出 88 个字段', mdlRows === 88, mdlRows + ' 行');
+      ok('弹窗每行都标了可信度',
+         !!mdl && mdl.querySelectorAll('.fld-tbl .fld-mk').length === 88,
+         mdl ? String(mdl.querySelectorAll('.fld-tbl .fld-mk').length) : 'null');
+      ok('弹窗有「复制 JSON」按钮', !!mdl && !!mdl.querySelector('#fld-copy'));
+      const mdlTxt = mdl ? mdl.querySelector('.modal-body').textContent : '';
+      ok('弹窗写明接口地址/行情时间/本地留存条数',
+         /qt\.gtimg\.cn/.test(mdlTxt) && /全字段存档/.test(mdlTxt), mdlTxt.slice(0, 70));
+      mdl.querySelector('.modal-foot [data-close]').click();
+      await sleep(300);
+      ok('关闭后弹窗被移除', !doc.querySelector('.modal-bg'));
+
+      /* ---- 上限 6：满格时拒绝添加 ---- */
+      add('sh601899');
+      await sleep(700);
+      ok('已满 6 格时添加被拒', cells().length === 6, cells().length + ' 格');
+      const t1 = lastToast();
+      ok('满格添加有提示', !!t1 && t1.textContent.indexOf('最多') >= 0, t1 ? t1.textContent : '无 toast');
+
+      /* ---- 删除 ---- */
+      delOf(0).click();
+      await sleep(400);
+      ok('点 × 删掉一格', cells().length === 5, cells().length + ' 格');
+      ok('删的是第一格（sz000001 已消失）', codeOf(0) === 'sh600519', String(codeOf(0)));
+      ok('删格后图表实例跟着回收', canvasN() === 5, canvasN() + ' 个 canvas');
+      delOf(0).click();
+      await sleep(400);
+      ok('可以连续删到 4 格', cells().length === 4, cells().length + ' 格');
+
+      /* ---- 空位上的去重 / 非法输入 ---- */
+      add('sz300750');
+      await sleep(600);
+      ok('重复代码被拒（不占空位）', cells().length === 4, cells().length + ' 格');
+      add('zzz');
+      await sleep(600);
+      ok('非法代码被拒', cells().length === 4, cells().length + ' 格');
+      const t2 = lastToast();
+      ok('非法输入有提示', !!t2 && t2.textContent.indexOf('无法识别') >= 0, t2 ? t2.textContent : '无 toast');
+
+      /* ---- 6 位数字自动补前缀 ---- */
+      add('601988');
+      await sleep(2800);
+      ok('6 位数字自动补 sh 前缀', cells().length === 5 && codeOf(4) === 'sh601988',
+         cells().length + ' 格 / ' + codeOf(4));
+      const nm = cells()[4].querySelector('.mon-name').textContent;
+      ok('新格已拉到股票名', nm && nm !== '—', nm);
+      ok('新格已拉到现价', cells()[4].querySelector('.mon-price').textContent !== '—',
+         cells()[4].querySelector('.mon-price').textContent);
+
+      /* ---- 加回 6 格 ---- */
+      add('sh601899');
+      await sleep(2800);
+      ok('可以加回 6 格', cells().length === 6 && codeOf(5) === 'sh601899',
+         cells().length + ' 格 / ' + codeOf(5));
+      ok('图表实例数跟着格数走', canvasN() === 6, canvasN() + ' 个 canvas');
+
+      /* ---- 逗号一次加多只（需先腾出空位） ---- */
+      add('sh600000, sz002415');
+      await sleep(700);
+      ok('满格时批量添加也被拒', cells().length === 6, cells().length + ' 格');
+      delOf(0).click();
+      await sleep(300);
+      delOf(0).click();
+      await sleep(300);
+      add('sh600000, sz002415');
+      await sleep(3200);
+      ok('逗号可一次加多只', cells().length === 6, cells().length + ' 格');
+      ok('多只代码顺序正确', codeOf(4) === 'sh600000' && codeOf(5) === 'sz002415',
+         codeOf(4) + ',' + codeOf(5));
+      /* 一次加多只时，每只 addCell 都会 gen++；先加的那只若在 addCell 里就发请求，
+         会被后一只的代次丢掉 —— 名字/价格/盘口要等下一整轮（3 秒）才补上。所以这里必须断言
+         「两只都在这一轮内拿到了名字 + 价格 + 盘口」。 */
+      ok('一次加多只时两只都立刻拉到了（没被代次丢掉）',
+         [4, 5].every(k => !!dbg.book(k) && cells()[k].querySelector('.mon-price').textContent !== '—' &&
+                           cells()[k].querySelector('.mon-name').textContent !== '—'),
+         [4, 5].map(k => codeOf(k) + ':' + cells()[k].querySelector('.mon-name').textContent +
+                         ' ' + cells()[k].querySelector('.mon-price').textContent).join(' / '));
+
+      /* ---- 持久化 ---- */
+      const raw = win.localStorage.getItem('sm_mon_codes');
+      let saved = null;
+      try { saved = JSON.parse(raw); } catch (e) { /* ignore */ }
+      ok('代码清单写入 localStorage（v2 结构，6 只）',
+         !!saved && saved.v === 2 && Array.isArray(saved.codes) && saved.codes.length === 6,
+         raw ? raw.slice(0, 60) : 'null');
+
+      /* ================= 拖动排序 =================
+         走原生 HTML5 DnD 的真实事件链：mousedown（决定这一格允不允许拖）→ dragstart
+         → dragover（带 clientX 决定插到目标格左/右）→ drop → dragend。
+         这里全部用 iframe 自己那套构造器（win.MouseEvent / win.DragEvent / win.DataTransfer），
+         跨 realm 派发事件才不会出岔子。 */
+      const order = () => cells().map(c => c.querySelector('.mon-code').value);
+      const gridEl = doc.getElementById('mon-grid');
+      const nameByCode = () => {
+        const m = {};
+        cells().forEach(c => { m[c.querySelector('.mon-code').value] = c.querySelector('.mon-name').textContent; });
+        return m;
+      };
+      /* 走到 drop 为止（dragend 留给各条用例自己决定要不要发） */
+      function dnd(from, to, rightHalf) {
+        const src = cells()[from], dst = cells()[to];
+        src.querySelector('.mon-chartwrap')
+           .dispatchEvent(new win.MouseEvent('mousedown', { bubbles: true }));
+        const dt = new win.DataTransfer();
+        src.dispatchEvent(new win.DragEvent('dragstart', { bubbles: true, dataTransfer: dt }));
+        const r = dst.getBoundingClientRect();
+        const x = rightHalf === false ? r.left + 3 : r.left + r.width * 0.78;
+        const init = { bubbles: true, dataTransfer: dt, clientX: x, clientY: r.top + 12 };
+        dst.dispatchEvent(new win.DragEvent('dragover', init));
+        dst.dispatchEvent(new win.DragEvent('drop', init));
+        return { src: src, dt: dt };
+      }
+
+      ok('每格头行有拖拽把手 ⠿', cells().every(c => !!c.querySelector(':scope > .mon-top > .mon-grip')));
+      ok('平时不可拖（draggable=false，先把输入框的选字让出来）',
+         cells().every(c => c.draggable === false));
+      const codeInp0 = cells()[0].querySelector('.mon-code');
+      codeInp0.dispatchEvent(new win.MouseEvent('mousedown', { bubbles: true }));
+      ok('在代码框上按下不开启拖拽（不会抢走选字）', cells()[0].draggable === false);
+      cells()[0].querySelector('.mon-chartwrap')
+        .dispatchEvent(new win.MouseEvent('mousedown', { bubbles: true }));
+      ok('在图表空白区按下才开启拖拽', cells()[0].draggable === true);
+
+      const before = order();
+      const namesBefore = nameByCode();
+
+      /* ---- 中间态：dragstart 后原件半透明、网格进入拖拽态；dragover 右半区亮插入线 ---- */
+      const s0 = cells()[0];
+      s0.querySelector('.mon-chartwrap').dispatchEvent(new win.MouseEvent('mousedown', { bubbles: true }));
+      const dtA = new win.DataTransfer();
+      s0.dispatchEvent(new win.DragEvent('dragstart', { bubbles: true, dataTransfer: dtA }));
+      ok('dragstart 后原件标记为拖拽中', s0.classList.contains('dragging'));
+      ok('dragstart 后网格进入拖拽态', gridEl.classList.contains('dragmode'));
+      const dst2 = cells()[2], r2 = dst2.getBoundingClientRect();
+      dst2.dispatchEvent(new win.DragEvent('dragover',
+        { bubbles: true, dataTransfer: dtA, clientX: r2.left + r2.width * 0.8, clientY: r2.top + 12 }));
+      ok('拖到目标格右半区 → 右侧插入线', dst2.classList.contains('drop-r'));
+      const dst4 = cells()[4], r4 = dst4.getBoundingClientRect();
+      dst4.dispatchEvent(new win.DragEvent('dragover',
+        { bubbles: true, dataTransfer: dtA, clientX: r4.left + 3, clientY: r4.top + 12 }));
+      ok('移到另一格左半区 → 左侧插入线', dst4.classList.contains('drop-l'));
+      ok('插入线同一时刻只有一条',
+         doc.querySelectorAll('.mon-cell.drop-l,.mon-cell.drop-r').length === 1,
+         doc.querySelectorAll('.mon-cell.drop-l,.mon-cell.drop-r').length + ' 条');
+      ok('dragover 时顺序还没变（松手才落位）', JSON.stringify(order()) === JSON.stringify(before));
+
+      /* ---- 落位：第 1 格拖到第 3 格右半区 → 插到它后面 ---- */
+      const used = { from: 0, to: 2, right: true };
+      dnd(used.from, used.to, used.right);
+      await sleep(400);
+      const want = before.slice();
+      const moved = want.splice(used.from, 1)[0];
+      want.splice(used.to, 0, moved);          // to=2 右半区 → 在原第 2 格之后，等价于插到原下标 2
+      ok('拖到右半区 → 落在目标格之后',
+         JSON.stringify(order()) === JSON.stringify(want), order().join(','));
+      ok('拖完把 draggable 关回去', cells().every(c => c.draggable === false));
+      ok('拖完不留插入线',
+         doc.querySelectorAll('.mon-cell.drop-l,.mon-cell.drop-r').length === 0);
+      ok('拖完网格退出拖拽态（没有残留 dragging）',
+         !gridEl.classList.contains('dragmode') &&
+         doc.querySelectorAll('.mon-cell.dragging').length === 0);
+      ok('顺序写进 localStorage',
+         JSON.stringify((JSON.parse(win.localStorage.getItem('sm_mon_codes')) || {}).codes) ===
+         JSON.stringify(order()), win.localStorage.getItem('sm_mon_codes'));
+      ok('顺序与内存里的 codes 一致（不只改了 DOM）',
+         JSON.stringify(dbg.info().codes) === JSON.stringify(order()), dbg.info().codes.join(','));
+      ok('图表实例随重建后仍然完好（6 个都没被 dispose）',
+         canvasN() === 6 && Array.from(doc.querySelectorAll('.mon-chart')).every(el => {
+           const inst = win.echarts.getInstanceByDom(el);
+           return inst && !inst.isDisposed();
+         }), canvasN() + ' 个 canvas');
+      const bkCnt = Array.from(doc.querySelectorAll('.mon-book'))
+        .map(e => e.querySelectorAll('.mon-bk').length);
+      ok('重建后宫格仍有完整盘口（每格 10 档）',
+         bkCnt.length === cells().length && bkCnt.every(n => n === 10),
+         '每格 ' + bkCnt.join(',') + ' 档 / ' + cells().length + ' 格');
+      const inst2 = win.echarts.getInstanceByDom(doc.getElementById('mon-chart-0'));
+      ok('重建后主图仍是双 grid（量比副图没被丢掉）',
+         !!inst2 && inst2.getOption().grid.length === 2,
+         inst2 ? String(inst2.getOption().grid.length) : 'null');
+      const namesAfter = nameByCode();
+      /* '—' 表示那一格当时还没拉到名字（新加的票可能还在飞），拿它当「未知」放行；
+         真实的串格一定是「两个不同的真名字对调」，这条挡得住。 */
+      const knownBefore = order().filter(c => namesBefore[c] !== '—').length;
+      ok('（前置条件）比较前多数格子已有股票名', knownBefore >= 4, knownBefore + '/6');
+      ok('行情跟着代码走（没串格）',
+         order().every(c => namesBefore[c] === namesAfter[c] || namesBefore[c] === '—'),
+         order().map(c => c + ':' + namesAfter[c]).join(' '));
+
+      /* ---- 拖到左半区 → 插到目标格之前 ---- */
+      const cur = order();
+      dnd(5, 1, false);
+      await sleep(400);
+      const want2 = cur.slice();
+      const moved2 = want2.splice(5, 1)[0];
+      want2.splice(1, 0, moved2);
+      ok('拖到左半区 → 落在目标格之前',
+         JSON.stringify(order()) === JSON.stringify(want2), order().join(','));
+
+      /* ---- 拖回原位 / 拖到自己身上：不应该有任何变化 ---- */
+      const cur2 = order();
+      dnd(3, 3, true);
+      await sleep(300);
+      ok('拖到自己身上顺序不变', JSON.stringify(order()) === JSON.stringify(cur2), order().join(','));
+      dnd(0, 1, false);                        // 左半区 = 插到第 2 格之前 = 原地
+      await sleep(300);
+      ok('拖到紧邻位置（等价于原地）顺序不变',
+         JSON.stringify(order()) === JSON.stringify(cur2), order().join(','));
+
+      /* ---- 拖完轮询照常（在途请求按代次丢弃，不会写错格子） ---- */
+      await sleep(2500);
+      ok('拖动之后轮询仍在跑',
+         dbg.info().status.indexOf('运行中') >= 0, dbg.info().status.trim());
+
+      /* ---- 下限：可以一路删到 1 格（页面不内置任何股票，删光也算正常状态） ---- */
+      let guard = 0;
+      while (cells().length > 1 && guard++ < 12) {
+        delOf(0).click();
+        await sleep(150);
+      }
+      ok('可以删到只剩 1 格', cells().length === 1, cells().length + ' 格');
+      ok('删格后图表实例跟着回收（剩 1）', canvasN() === 1, canvasN() + ' 个 canvas');
+      ok('删到只剩 1 格时盘口仍是完整 10 档',
+         doc.querySelectorAll('.mon-book .mon-bk').length === 10,
+         doc.querySelectorAll('.mon-book .mon-bk').length + ' 行');
+      ok('删到只剩 1 格时清单里也就这 1 只（不会悄悄补默认票）',
+         JSON.parse(codesRaw() || '{}').codes.length === 1,
+         codesRaw());
+
+      /* ---- 轮询仍在跑 ---- */
+      await sleep(3000);
+      const st = doc.getElementById('mon-state').textContent;
+      const m = st.match(/成功 (\d+) \/ 失败 (\d+)/);
+      ok('增删之后轮询照常运行', st.indexOf('运行中') >= 0, st.trim());
+      ok('成功率达标（3 秒节拍没崩）', !!m && +m[1] > 0 && +m[1] >= +m[2] * 5, st.trim());
+
+      /* ========== 非交易时段：只整轮请求一次，而且不写本地存储 ========== */
+      /* 剩下的这一格就是最后还在监控的票（前面删到只剩 1 格），直接用它做对象 */
+      const KEY = 'sm_mon_pts_' + codeOf(0);
+      const rd = () => {
+        try { return JSON.parse(win.localStorage.getItem(KEY) || 'null') || {}; }
+        catch (e) { return {}; }
+      };
+      const nPts = () => (Array.isArray(rd().pts) ? rd().pts.length : -1);
+
+      const nBefore = net.qt;                     // 腾讯请求数（net.qt）——用来算「新增几次」
+      const uBefore = net.urls.length;            // urls 长度另算：它还包含日历请求，下标不能混用
+      const tOpen = rd().t || 0;                  // 进入非交易时段前，本地记录的时间戳
+      dbg.force('closed');                        // 进入非交易时段 → 应自动取一次快照
+      await sleep(2200);
+      const info0 = dbg.info();
+      const cellsNow = info0.cells;
+      ok('非交易时段判定为非盘中',
+         info0.open === false && info0.phase !== 'am' && info0.phase !== 'pm', info0.phase);
+      ok('刚进入非交易时段只取一次快照（1 个请求覆盖全部格，不是每格一个）',
+         net.qt - nBefore === 1, '新增 ' + (net.qt - nBefore) + ' 次 / ' + cellsNow + ' 格');
+      ok('这一个请求确实打到腾讯接口且带上了全部代码',
+         (function () {
+           const urls = net.urls.slice(uBefore).filter(u => u.indexOf('qt.gtimg.cn') >= 0);
+           if (urls.length !== 1) return false;
+           return urls[0].slice(urls[0].indexOf('q=') + 2).split(',').length === cellsNow;
+         })(),
+         net.urls.slice(uBefore).map(u => u.slice(0, 70)).join(' | ') || '没抓到');
+      ok('状态栏提示「仅取一次快照」', info0.status.indexOf('仅取一次快照') >= 0, info0.status.trim());
+      ok('记下了已请求过的时段（同一时段不重复请求）', info0.shot === 'closed', String(info0.shot));
+      ok('非交易时段的一次性请求不写本地存储（记录时间戳没动）',
+         (rd().t || 0) === tOpen, tOpen + ' → ' + (rd().t || 0));
+
+      /* 给 localStorage.setItem 装计数器：同一时段内推多少次调度都不该有写入。
+         记录的是**具体 key**，好把「行情数据（sm_mon_pts_*）」和「配置（sm_mon_codes）」分开 ——
+         否则后面加一只股票时写配置会把计数搅浑。
+         setItem 被接管没成功的话计数是假的，所以另用「原文一字未动」兜底。 */
+      const lsKeys = [];
+      const origSet = win.localStorage.setItem;
+      let hooked = false;
+      try {
+        win.localStorage.setItem = function (k, v) { lsKeys.push(String(k)); return origSet.call(win.localStorage, k, v); };
+        hooked = win.localStorage.setItem !== origSet;
+      } catch (e) { hooked = false; }
+      const ptsWrites = () => lsKeys.filter(k => k.indexOf('sm_mon_pts_') === 0).length;
+      const raw0 = win.localStorage.getItem(KEY);
+      const n0 = nPts();
+      const sync = net.qt;
+      for (let k = 0; k < 3; k++) { dbg.tick(); await sleep(500); }   // 模拟计时器到点 3 次
+      ok('同一时段内连推 3 次调度，不再发请求', net.qt === sync,
+         '新增 ' + (net.qt - sync) + ' 次 / 分时点 ' + n0 + ' → ' + nPts());
+      ok('非交易时段不新增分时点', nPts() === n0, n0 + ' → ' + nPts());
+      ok('非交易时段一次都没写 localStorage（连配置都没动）', hooked && lsKeys.length === 0,
+         hooked ? (lsKeys.length + ' 次写入 ' + JSON.stringify(lsKeys.slice(0, 4))) : 'setItem 未被接管，计数无效');
+      ok('该股本地的记录原文一字未动', win.localStorage.getItem(KEY) === raw0);
+
+      /* ---- 非交易时段添加股票：也要立刻取一次（不落盘），不能空着 ---- */
+      /* 挑一只当前不在监控里的代码（前面删到只剩 1 格，但剩的是哪只不固定）。
+         注意它**可能在更早的盘中阶段被存过**，所以断言要比「加之前那份原文」，
+         而不是「等于 null」—— 否则会拿一份盘中的旧数据把自己冤成失败。 */
+      const curCodes = dbg.info().codes;
+      const newCode = ['sh601899', 'sh601988', 'sz002415', 'sh600000', 'sz000651']
+        .find(c => curCodes.indexOf(c) < 0);
+      const rawNew0 = win.localStorage.getItem('sm_mon_pts_' + newCode);
+      const addSync = net.qt;
+      add(newCode);
+      await sleep(1800);
+      ok('非交易时段能添加股票', cells().length === 2 && codeOf(1) === newCode,
+         cells().length + ' 格 / 第 2 格 ' + String(codeOf(1)));
+      ok('非交易时段新加的股票也立刻取了一次行情', net.qt === addSync + 1,
+         '新增 ' + (net.qt - addSync) + ' 次');
+      ok('新加的股票也没写本地存储（记录原文一字未动）',
+         win.localStorage.getItem('sm_mon_pts_' + newCode) === rawNew0 && ptsWrites() === 0,
+         (rawNew0 === null ? '原本无记录' : '原本已有记录')
+         + ' / 非交易时段行情写入 ' + ptsWrites() + ' 次');
+
+      /* ---- 手动「全部刷新」：非交易时段仍可再取一次，但同样不写本地 ---- */
+      doc.getElementById('mon-refresh').click();
+      await sleep(1600);                                   // toast 只挂 3.2 秒，得及时抓
+      const tRefresh = (lastToast() && lastToast().textContent) || '';
+      await sleep(2400);
+      ok('手动刷新在非交易时段仍能取到快照', net.qt > sync, '新增 ' + (net.qt - sync) + ' 次请求');
+      ok('手动刷新不新增分时点（快照可以更新）', nPts() === n0, n0 + ' → ' + nPts());
+      ok('手动刷新取到的快照也不写本地存储',
+         win.localStorage.getItem(KEY) === raw0 && ptsWrites() === 0, ptsWrites() + ' 次行情写入');
+      ok('非交易时段刷新写明「不写入本地存储」', /不写入本地存储/.test(tRefresh), tRefresh || '无 toast');
+
+      /* ---- 回到盘中：立刻恢复请求与缓存写入 ---- */
+      dbg.force('open');
+      await sleep(3000);
+      ok('回到盘中后自动恢复请求', net.qt > sync && dbg.info().open === true,
+         dbg.info().status.trim());
+      ok('回到盘中后缓存写入恢复（顺带证明 setItem 计数是有效的）',
+         ptsWrites() > 0 && (rd().t || 0) > tOpen,
+         '行情写入 ' + ptsWrites() + ' 次 / 时间戳 ' + tOpen + ' → ' + (rd().t || 0));
+      try { win.localStorage.setItem = origSet; } catch (e) { /* ignore */ }
+
+      /* ========== 「清空本地缓存」只清行情，不能把代码清单一起清掉 ==========
+         这是之前的真 bug：storeClearAll 按 `sm_mon_` 前缀一刀切，而代码清单
+         `sm_mon_codes` 正好也在这个前缀下 —— 点一下按钮，用户加的自选就全没了，
+         重开页面还会冒出默认票，看着像「我加的丢了」。 */
+      /* 先补一只（挑一只确定不在清单里的），确保清空前有多格 + 有分时数据可清 */
+      const curAll = dbg.info().codes;
+      const extra = ['sh601336', 'sh600030', 'sz002594', 'sh600887', 'sz000333', 'sh600276']
+        .find(c => curAll.indexOf(c) < 0);
+      const nBeforeAdd = cells().length;
+      add(extra);
+      await sleep(1500);
+      const beforeCodes = JSON.parse(codesRaw() || '{}').codes || [];
+      const ptsKeys = () => {
+        const out = [];
+        for (let i = 0; i < win.localStorage.length; i++) {
+          const k = win.localStorage.key(i);
+          if (k && k.indexOf('sm_mon_pts_') === 0) out.push(k);
+        }
+        return out;
+      };
+      const nPtsKeys = ptsKeys().length;
+      ok('（前置条件）补的票加上了、清空前确实存有分时数据',
+         cells().length === nBeforeAdd + 1 && codeOf(cells().length - 1) === extra && nPtsKeys > 0,
+         cells().length + ' 格（末格 ' + codeOf(cells().length - 1) + '）/ ' + nPtsKeys + ' 个 sm_mon_pts_*');
+      /* 清空前**先暂停轮询**：清完之后下一秒的采样又会把 sm_mon_pts_* 写回来，
+         不暂停的话「清掉了」这条断言就是在跟轮询赛跑（会随机红，但不是产品问题）。 */
+      doc.getElementById('mon-pause').click();
+      await sleep(300);
+      ok('（前置条件）轮询已暂停（否则断言会和采样写入赛跑）', dbg.info().paused === true,
+         'paused=' + dbg.info().paused);
+      /* confirm() 在无头 Chrome 里会直接返回 false（不弹窗），得先顶掉它，否则按钮等于没点 */
+      const origConfirm = win.confirm;
+      win.confirm = function () { return true; };
+      doc.getElementById('mon-clear').click();
+      await sleep(500);
+      const tClear = (lastToast() && lastToast().textContent) || '';
+      win.confirm = origConfirm;
+      ok('清空缓存跑到了（弹出「已清空 N 项」提示）', /已清空/.test(tClear), tClear || '无 toast');
+      ok('清空本地缓存把分时数据清掉了', ptsKeys().length === 0,
+         ptsKeys().length + ' 个残留：' + ptsKeys().slice(0, 3).join(','));
+      ok('清空本地缓存**没有**动代码清单（加过的股票还在）',
+         JSON.stringify((JSON.parse(codesRaw() || '{}').codes || [])) === JSON.stringify(beforeCodes),
+         codesRaw());
+      ok('清空后宫格还在（清单没丢，页面自然还是那几只）',
+         cells().length === beforeCodes.length && codeOf(cells().length - 1) === extra,
+         cells().length + ' 格 / ' + cells().map(c => c.querySelector('.mon-code').value).join(','));
+      doc.getElementById('mon-pause').click();      // 恢复轮询（下面还要验「空态不发请求」）
+      await sleep(900);
+
+      /* ========== 全删光 → 回到空态（页面本来就不内置任何股票） ========== */
+      let guard2 = 0;
+      while (cells().length && guard2++ < 12) {
+        delOf(0).click();
+        await sleep(180);
+      }
+      ok('最后 1 格也允许删掉（没有「至少保留 1 格」的限制）', cells().length === 0,
+         cells().length + ' 格');
+      ok('删空后回到空态引导（不是白屏、也不是自动补默认票）',
+         !!doc.querySelector('.mon-empty') && doc.querySelectorAll('.mon-code').length === 0);
+      ok('删空后清单存成空数组（下次打开还是空，不会塞回默认票）',
+         /"codes":\s*\[\s*\]/.test(codesRaw() || ''), codesRaw());
+      ok('删空后状态栏提示还没添加股票',
+         (doc.getElementById('mon-state').textContent || '').indexOf('还没有添加股票') >= 0,
+         doc.getElementById('mon-state').textContent);
+      ok('删空后宫格数为 0（探针状态自洽）', dbg.info().cells === 0, '格数 ' + dbg.info().cells);
+      const qtZ = net.qt;
+      await sleep(2500);
+      ok('空态下轮询空转、一次行情请求都不发', net.qt === qtZ,
+         '新增 ' + (net.qt - qtZ) + ' 次');
+
+      log.push('---');
+      log.push('PROBE_PASS ' + pass + ' PROBE_FAIL ' + fail + ' PROBE_SKIP ' + skip);
+      flush('DONE');
+    } catch (e) {
+      log.push('EXCEPTION ' + (e && e.message));
+      log.push('PROBE_PASS ' + pass + ' PROBE_FAIL ' + (fail + 1) + ' PROBE_SKIP ' + skip);
+      flush('DONE');
+    }
+  })();
+})();
+</script>
+</body>
+</html>
